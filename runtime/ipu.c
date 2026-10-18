@@ -291,7 +291,7 @@ static int get_intra_block(void) {
             i += run;
             if (i >= 64) return 0;
             if (!dec.mpeg1) {
-                val = (speek(12) * qs * iq[i]) >> 4;
+                val = speek(12) * qs * iq[i] / 16;   /* the standard's division truncates toward zero */
                 skip(12);
             } else {
                 val = speek(8); skip(8);
@@ -329,7 +329,7 @@ static int get_non_intra_block(void) {
             if (i >= 64) return 0;
             if (!dec.mpeg1) {
                 int lv = speek(12);
-                val = ((2 * (lv + (lv >> 31)) + 1) * qs * nq[i]) >> 5;
+                val = (2 * lv + (lv < 0 ? -1 : 1)) * qs * nq[i] / 32;
                 skip(12);
             } else {
                 val = speek(8); skip(8);
