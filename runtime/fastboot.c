@@ -140,22 +140,15 @@ void hle_runtime_get(EE *c) {
 void fastboot_note(const char *event);
 void hle_fscommand(EE *c) {
     fb_init();
-    if (fs_log || ui_script) {
+    if (fs_log || ui_script || fb_mode) {
         char name[64], arg[64], ev[132];
         guest_cstr(RW(4), name, sizeof name);
         guest_cstr(RW(5), arg, sizeof arg);
         if (fs_log) LOG("[fscmd v%llu] %s(%s)\n", g_vsyncs, name, arg);
-        snprintf(ev, sizeof ev, "%s(%s)", name, arg);
-        fastboot_note(ev);
-    }
-    if (fb_mode) {   /* when the in-game UI and then the HUD (player control) come up */
-        char name[24], arg[16];
-        guest_cstr(RW(4), name, sizeof name);
-        if (!strcmp(name, "SetTraceControlMode")) {
-            guest_cstr(RW(5), arg, sizeof arg);
-            if (!strcmp(arg, "pre_ig") || !strcmp(arg, "ig"))
-                LOG("[fastboot %.1fs v%llu] %s\n", fastboot_wall(), g_vsyncs, arg[0] == 'p' ? "in-game UI starting (pre_ig)" : "in-game HUD, player control (ig)");
-        }
+        if (ui_script) { snprintf(ev, sizeof ev, "%s(%s)", name, arg); fastboot_note(ev); }
+        /* when the in-game UI and then the HUD (player control) come up */
+        if (fb_mode && !strcmp(name, "SetTraceControlMode") && (!strcmp(arg, "pre_ig") || !strcmp(arg, "ig")))
+            LOG("[fastboot %.1fs v%llu] %s\n", fastboot_wall(), g_vsyncs, arg[0] == 'p' ? "in-game UI starting (pre_ig)" : "in-game HUD, player control (ig)");
     }
     f_0010d2e0_orig(c);
 }
@@ -267,7 +260,7 @@ static uint16_t ui_buttons(void) {
     static const char *pc;                 /* current step */
     static unsigned cursor;                /* events from here on count */
     static unsigned long long t0;          /* vsync the step (or its current press) began */
-    static int pressing, started;
+    static int started;
     if (!ui_script) return 0;
     if (!pc) { pc = ui_script; t0 = g_vsyncs; }
     for (;;) {
@@ -276,7 +269,7 @@ static uint16_t ui_buttons(void) {
         const char *end = pc; while (*end && *end != ' ' && *end != '\t' && *end != '\n') end++;
         const char *colon = memchr(pc, ':', (size_t)(end - pc));
         const char *arg = colon ? colon + 1 : end;
-        if (!started) { LOG("[ui %.1fs v%llu] %.*s\n", fastboot_wall(), g_vsyncs, (int)(end - pc), pc); started = 1; t0 = g_vsyncs; pressing = 0; }
+        if (!started) { LOG("[ui %.1fs v%llu] %.*s\n", fastboot_wall(), g_vsyncs, (int)(end - pc), pc); started = 1; t0 = g_vsyncs; }
 #define NEXT() do { pc = end; started = 0; } while (0)
         if (!strncmp(pc, "wait:", 5)) {
             long hit = ev_find(cursor, arg, (size_t)(end - arg));
