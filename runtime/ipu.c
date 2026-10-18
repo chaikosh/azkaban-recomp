@@ -275,11 +275,14 @@ static uint32_t get_mb_modes(void) {
 
 static inline int16_t sat12(int v) { return v > 2047 ? 2047 : v < -2048 ? -2048 : (int16_t)v; }
 
+/* The coefficient loops run until end_of_block: a block whose last coefficient sits at scan
+   position 63 still ends with an EOB code, which must be consumed too (otherwise the next block
+   starts on it: a stray first coefficient, or a misread DC size in intra macroblocks). */
 static int get_intra_block(void) {
     const uint8_t *scan = dec.as ? altscan : zigzag;
     const uint16_t (*tab)[2] = (dec.ivf && !dec.mpeg1) ? vlc_b15 : vlc_b14;
     int qs = dec.qscale;
-    for (int i = 1; i < 64;) {
+    for (int i = 1;;) {
         int k = vlc_lookup(tab, NB_RL + 2);
         if (k < 0 || k == NB_RL + 1) return 0;   /* EOB or an unknown code */
         int run, val;
@@ -313,7 +316,7 @@ static int get_intra_block(void) {
 static int get_non_intra_block(void) {
     const uint8_t *scan = dec.as ? altscan : zigzag;
     int qs = dec.qscale;
-    for (int i = 0; i < 64;) {
+    for (int i = 0;;) {
         int k, run, val;
         if (i == 0 && peek(1) == 1) { skip(1); k = 0; }   /* first coefficient: "1" = run 0 level 1 */
         else {
