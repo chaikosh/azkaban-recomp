@@ -1082,9 +1082,65 @@ static void gif_packed(GifPath *p, int reg, const U128 *d) {
     }
 }
 
+/* GPU mode: the GPU renderer parses the packets; here only SIGNAL/FINISH/LABEL (A+D in PACKED
+   mode) matter, so whole packets without A+D and IMAGE data are skipped. */
+static void gif_scan(GifPath *p, const U128 *q, uint32_t n) {
+    uint32_t i = 0;
+    while (i < n) {
+        if (!p->active) {
+            uint64_t tag = q[i].d[0];
+            p->nloop = bits(tag, 0, 15);
+            p->flg = bits(tag, 58, 2);
+            p->nreg = bits(tag, 60, 4);
+            if (!p->nreg) p->nreg = 16;
+            p->regs = q[i].d[1];
+            p->reg_i = 0;
+            p->q = 0;   /* reused here: the packet has an A+D register */
+            if (p->flg == 0)
+                for (int r = 0; r < p->nreg; r++) if (((p->regs >> (4 * r)) & 15) == 0xe) p->q = 1;
+            p->active = p->nloop > 0;
+            i++;
+            continue;
+        }
+        if (p->flg == 0 && p->q) {
+            for (; i < n && p->active; i++) {
+                if (((p->regs >> (4 * p->reg_i)) & 15) == 0xe) {
+                    int reg = (int)(q[i].d[1] & 0xff);
+                    if (reg >= 0x60 && reg <= 0x62) gs_write_reg(reg, q[i].d[0]);
+                }
+                if (++p->reg_i >= p->nreg) { p->reg_i = 0; if (--p->nloop == 0) p->active = 0; }
+            }
+            continue;
+        }
+        /* PACKED without A+D: nloop*nreg qwords; REGLIST: two registers per qword; IMAGE: nloop qwords */
+        uint64_t left = p->flg == 0 ? (uint64_t)p->nloop * p->nreg - p->reg_i
+                      : p->flg == 1 ? ((uint64_t)p->nloop * p->nreg - p->reg_i + 1) / 2 : (uint64_t)p->nloop;
+        uint64_t take = left < n - i ? left : n - i;
+        if (p->flg == 0) {
+            uint64_t total = p->reg_i + take;
+            p->nloop -= (int)(total / p->nreg);
+            p->reg_i = (int)(total % p->nreg);
+        } else if (p->flg == 1) {
+            uint64_t regs = take * 2, total = p->reg_i + regs;
+            uint64_t loops = total / p->nreg;
+            if (loops >= (uint64_t)p->nloop) { p->nloop = 0; p->reg_i = 0; }
+            else { p->nloop -= (int)loops; p->reg_i = (int)(total % p->nreg); }
+        } else {
+            p->nloop -= (int)take;
+        }
+        if (p->nloop <= 0) { p->active = 0; p->nloop = 0; }
+        i += (uint32_t)take;
+    }
+}
+
 /* Feed `n` quadwords of GIF data on path `pi` (0 = PATH1, 1 = PATH2, 2 = PATH3). */
 void gif_feed(int pi, const U128 *q, uint32_t n) {
-    if (g_gs_gpu) gsb_gif(pi, q, n);
+    if (g_gs_gpu) {
+        static int full = -1;
+        if (full < 0) full = getenv("HP_GSPARSE") != NULL;   /* keep the full register parse (debug logs) */
+        gsb_gif(pi, q, n);
+        if (!full) { cur_path = pi; gif_scan(&paths[pi], q, n); return; }
+    }
     GifPath *p = &paths[pi];
     cur_path = pi;
     for (uint32_t i = 0; i < n; i++) {

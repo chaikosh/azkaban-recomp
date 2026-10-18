@@ -55,7 +55,16 @@ $(GEN)/funcs.h: recomp/*.py
 $(OUT)/hp: $(GEN)/funcs.h FORCE
 	@$(MAKE) --no-print-directory link
 
-link: $(RT_OBJ) $(GEN_OBJ) $(IOP_OBJ)
+# VU1 microprograms: code images saved by HP_VUCOLLECT=build/recomp/vu1 -> C (empty table if none)
+VU1_GEN  := $(REC)/vu1_gen.c
+VU1_OBJ  := $(OBJDIR)/obj/vu1_gen.o
+$(VU1_GEN): recomp/vu1rec.py $(wildcard $(REC)/vu1/*)
+	$(PY) recomp/vu1rec.py $(REC)/vu1 $@
+$(VU1_OBJ): $(VU1_GEN) runtime/vu1_core.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -O2 -c $< -o $@
+
+link: $(RT_OBJ) $(GEN_OBJ) $(IOP_OBJ) $(VU1_OBJ) | $(WGPU_LIB)
 	$(CXX) $(CFLAGS) $(LDFLAGS) -o $(OBJDIR)/hp $^
 
 $(OBJDIR)/obj/%.o: %.cpp $(IOP_DIR)/src/iop/*.hpp $(GS_DIR)/src/gs/*.hpp

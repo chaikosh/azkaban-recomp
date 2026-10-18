@@ -33,7 +33,8 @@ void hle_log_done(EE *c) {
 void hle_log_gifkick(EE *c) {
     static int n;
     uint32_t obj = RW(4), tadr = ld32(obj + 4);
-    if (getenv("HP_GIFLOG") && n++ < 400)
+    static int on = -1; if (on < 0) on = getenv("HP_GIFLOG") != NULL;
+    if (on && n++ < 400)
         LOG("[gifkick %.3f] obj %08x tadr %08x tag %08x %08x | %08x %08x\n", tnow(), obj, tadr, ld32(tadr), ld32(tadr + 4), ld32(tadr + 8), ld32(tadr + 12));
     f_00143608_orig(c);
 }
@@ -42,7 +43,8 @@ void hle_log_gifkick(EE *c) {
 void hle_log_vifirq(EE *c) {
     static int n;
     extern uint32_t vif1_reg_read(uint32_t off);
-    if (getenv("HP_VIFLOG") && n++ < 300)
+    static int on = -1; if (on < 0) on = getenv("HP_VIFLOG") != NULL;
+    if (on && n++ < 300)
         LOG("[vifirq %.3f] mark %04x stat %03x\n", tnow(), vif1_reg_read(0x30), vif1_reg_read(0));
     f_0013d9f8_orig(c);
 }

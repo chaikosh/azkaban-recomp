@@ -115,6 +115,8 @@ void dma_stats(void) {
     { extern unsigned long long g_fifo1_qw, g_fifo1_nz; LOG("[stats] vif1 fifo qwords %llu nonzero %llu\n", g_fifo1_qw, g_fifo1_nz); }
     extern void vif_stats(void), gs_fb_stats(void), ipu_stats(void);
     vif_stats();
+    if (getenv("HP_VUSTATS")) { extern void vu1_stats(void); vu1_stats(); }
+    { extern void vu1rec_stats(void); vu1rec_stats(); }
     gs_fb_stats();
     ipu_stats();
 }
@@ -165,9 +167,28 @@ static void *render_thread(void *arg) {
         int ch = rq[rq_head];
         rq_head = (rq_head + 1) % 32;
         pthread_mutex_unlock(&rq_m);
+        if (ch == 16) { extern void vif1_drain_job(void); vif1_drain_job(); continue; }
         render_channel(ch);
     }
     return NULL;
+}
+
+/* Queue work for the render thread: a DMA channel (1, 2) or a job (16 = resume VIF1 after STC). */
+void render_post(int job) {
+    pthread_mutex_lock(&rq_m);
+    if (!rthread_started) {
+        pthread_t t;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setstacksize(&at, 16u << 20);
+        pthread_create(&t, &at, render_thread, NULL);
+        rthread_started = 1;
+    }
+    if ((rq_tail + 1) % 32 == rq_head) LOG("[dma] render queue full\n");
+    rq[rq_tail] = job;
+    rq_tail = (rq_tail + 1) % 32;
+    pthread_cond_signal(&rq_cv);
+    pthread_mutex_unlock(&rq_m);
 }
 
 static int d4_end;
@@ -182,22 +203,7 @@ void dma_start(int ch) {
         LOG("[ipu] dma %s CHCR %08x MADR %08x QWC %u data %02x%02x%02x%02x %02x%02x%02x%02x\n", chname[ch], mmio_r32(base[ch]), madr, qwc,
             p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
     }
-    if (ch == 1 || ch == 2) {
-        pthread_mutex_lock(&rq_m);
-        if (!rthread_started) {
-            pthread_t t;
-            pthread_attr_t at;
-            pthread_attr_init(&at);
-            pthread_attr_setstacksize(&at, 16u << 20);
-            pthread_create(&t, &at, render_thread, NULL);
-            rthread_started = 1;
-        }
-        rq[rq_tail] = ch;
-        rq_tail = (rq_tail + 1) % 32;
-        pthread_cond_signal(&rq_cv);
-        pthread_mutex_unlock(&rq_m);
-        return;
-    }
+    if (ch == 1 || ch == 2) { render_post(ch); return; }
     g_dma_qwords = 0;
     if (ch == 8 || ch == 9) spr_transfer(ch);
     if (ch == 4) {   /* toIPU is pulled by the IPU as its input FIFO drains */

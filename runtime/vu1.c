@@ -6,35 +6,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-typedef union { float f[4]; uint32_t u[4]; int32_t i[4]; } V4;
-
-typedef struct {
-    V4 vf[32], acc;
-    uint16_t vi[16];
-    float q, p, i;
-    uint32_t r;
-    uint32_t mac, status, clip;
-    uint32_t pc;          /* in instruction pairs */
-    uint32_t top, itop;
-} VU1;
+#include "vu1_core.h"
 
 static VU1 vu;
 uint8_t *g_vu1_code;   /* 16 KiB micro memory */
 uint8_t *g_vu1_data;   /* 16 KiB data memory */
 unsigned long long g_vu1_insns;
-
-static inline float vclampf(float x) {
-    union { float f; uint32_t u; } c = {x};
-    if ((c.u & 0x7f800000u) == 0x7f800000u) c.u = (c.u & 0x80000000u) | 0x7f7fffffu;
-    return c.f;
-}
-static inline float vin(float x) {   /* VU treats denormals as zero and Inf/NaN as max */
-    union { float f; uint32_t u; } c = {x};
-    uint32_t e = c.u & 0x7f800000u;
-    if (e == 0) c.u &= 0x80000000u;
-    else if (e == 0x7f800000u) c.u = (c.u & 0x80000000u) | 0x7f7fffffu;
-    return c.f;
-}
 
 /* MAC flags of the last FMAC result (per written component) */
 static inline void set_mac(const V4 *r, int dest) {
@@ -181,6 +158,8 @@ static void upper(uint32_t op, V4 *out_fd, int *out_reg, int *out_dest, int *out
 }
 
 /* ---- lower ----------------------------------------------------------------- */
+static int collect_jr;   /* HP_VUCOLLECT: record JR/JALR targets for the recompiler */
+static void note_jr(uint32_t target);
 static int xgkick_pending = -1, xgkick_due = -1;
 
 static uint32_t gif_packet_size(uint32_t qaddr) {
@@ -202,11 +181,21 @@ static uint32_t gif_packet_size(uint32_t qaddr) {
 }
 
 double g_vu1_kick_time;
+/* HP_VURECCHECK: kicks are captured while the recompiled and the interpreted run are compared */
+static U128 *cap;
+static uint32_t cap_n, cap_max;
+static int capturing;
 void vu1_xgkick(uint32_t qaddr) {
     struct timespec ka, kb; clock_gettime(CLOCK_MONOTONIC, &ka);
     { extern uint32_t g_last_xgkick; g_last_xgkick = qaddr & 0x3ff; }
     uint32_t n = gif_packet_size(qaddr);
     if (n > 1024) n = 1024;   /* a kick never reads more than the 16 KiB of VU1 data memory (addresses wrap) */
+    if (capturing) {
+        if (cap_n + n > cap_max) { cap_max = (cap_n + n) * 2; cap = realloc(cap, cap_max * sizeof *cap); }
+        for (uint32_t k = 0; k < n; k++) memcpy(&cap[cap_n + k], dmem(qaddr + k), 16);
+        cap_n += n;
+        return;
+    }
     U128 buf[1024];
     for (uint32_t k = 0; k < n; k++) memcpy(&buf[k], dmem(qaddr + k), 16);
     gif_feed(0, buf, n);
@@ -361,8 +350,8 @@ static int lower(uint32_t op, uint32_t pc, uint32_t *target, V4 *lout, int *lreg
     case 0x1c: *vi_reg = it; *vi_val = (uint16_t)(vu.clip & 0xfff); return 0;              /* FCGET */
     case 0x20: *target = pc + 1 + imm11; return 1;                                         /* B */
     case 0x21: *vi_reg = it; *vi_val = (uint16_t)(pc + 2); *target = pc + 1 + imm11; return 1;   /* BAL */
-    case 0x24: *target = VI_IS; return 1;                                                  /* JR */
-    case 0x25: *vi_reg = it; *vi_val = (uint16_t)(pc + 2); *target = VI_IS; return 1;      /* JALR */
+    case 0x24: *target = VI_IS; if (collect_jr) note_jr(VI_IS); return 1;                 /* JR */
+    case 0x25: *vi_reg = it; *vi_val = (uint16_t)(pc + 2); *target = VI_IS; if (collect_jr) note_jr(VI_IS); return 1;   /* JALR */
     case 0x28: if (VI_IT == VI_IS) { *target = pc + 1 + imm11; return 1; } return 0;
     case 0x29: if (VI_IT != VI_IS) { *target = pc + 1 + imm11; return 1; } return 0;
     case 0x2c: if ((int16_t)VI_IS < 0) { *target = pc + 1 + imm11; return 1; } return 0;
@@ -395,6 +384,184 @@ void vu1_snapshot_save(void) {
     snprintf(path, sizeof path, "%s/regs.bin", dir); f = fopen(path, "wb"); if (f) { fwrite(snap_regs, 1, sizeof snap_regs, f); fclose(f); }
     LOG("[vu1] snapshot of the run at %04x (top %04x itop %04x) saved to %s\n", snap_start, snap_top, snap_itop, dir);
 }
+/* HP_VUSTATS: which microprograms run (code image hash, entry); HP_VUCOLLECT=dir also saves each
+   code image (code_<hash>.bin) and its entries (entries.txt) for the VU1 recompiler. */
+unsigned g_vu1_code_gen = 1, g_vu1_mpg_words;
+static unsigned code_gen_seen;
+static uint64_t code_hash;
+typedef struct { uint64_t hash; uint32_t start; unsigned long long runs, pairs; } VuProg;
+static VuProg progs[512];
+static int nprogs;
+uint64_t vu1_code_hash(void) {
+    if (code_gen_seen != g_vu1_code_gen) {
+        uint64_t h = 1469598103934665603ull;
+        for (int k = 0; k < 16384; k++) { h ^= g_vu1_code[k]; h *= 1099511628211ull; }
+        code_hash = h;
+        code_gen_seen = g_vu1_code_gen;
+    }
+    return code_hash;
+}
+static VuProg *prog_note(uint32_t start) {
+    uint64_t h = vu1_code_hash();
+    for (int k = 0; k < nprogs; k++) if (progs[k].hash == h && progs[k].start == start) { progs[k].runs++; return &progs[k]; }
+    if (nprogs >= 512) return NULL;
+    VuProg *p = &progs[nprogs++];
+    p->hash = h; p->start = start; p->runs = 1; p->pairs = 0;
+    static const char *dir = (const char *)1;
+    if (dir == (const char *)1) dir = getenv("HP_VUCOLLECT");
+    if (dir) {
+        char path[1100];
+        snprintf(path, sizeof path, "%s/code_%016llx.bin", dir, (unsigned long long)h);
+        FILE *f = fopen(path, "rb");
+        if (f) fclose(f);
+        else if ((f = fopen(path, "wb"))) { fwrite(g_vu1_code, 1, 16384, f); fclose(f); }
+        snprintf(path, sizeof path, "%s/entries.txt", dir);
+        if ((f = fopen(path, "a"))) { fprintf(f, "%016llx %04x\n", (unsigned long long)h, start); fclose(f); }
+    }
+    return p;
+}
+static void note_jr(uint32_t target) {
+    static struct { uint64_t hash; uint8_t seen[2048]; } tab[16];
+    static int n;
+    uint64_t h = vu1_code_hash();
+    int k;
+    for (k = 0; k < n && tab[k].hash != h; k++) ;
+    if (k == n) { if (n == 16) return; tab[n].hash = h; memset(tab[n].seen, 0, 2048); n++; }
+    target &= 0x7ff;
+    if (tab[k].seen[target]) return;
+    tab[k].seen[target] = 1;
+    const char *dir = getenv("HP_VUCOLLECT");
+    char path[1100];
+    snprintf(path, sizeof path, "%s/entries.txt", dir);
+    FILE *f = fopen(path, "a");
+    if (f) { fprintf(f, "%016llx %04x jr\n", (unsigned long long)h, target); fclose(f); }
+}
+void vu1_stats(void) {
+    static unsigned last_gen, last_words;
+    LOG("[vu1] %d programs seen, code changed %u times, %u MPG words since last report\n", nprogs, g_vu1_code_gen - last_gen, g_vu1_mpg_words - last_words);
+    last_gen = g_vu1_code_gen; last_words = g_vu1_mpg_words;
+    for (int k = 0; k < nprogs; k++)
+        if (progs[k].runs) LOG("[vu1]   %016llx @%04x runs %llu pairs %llu\n", (unsigned long long)progs[k].hash, progs[k].start, progs[k].runs, progs[k].pairs);
+    for (int k = 0; k < nprogs; k++) progs[k].runs = progs[k].pairs = 0;
+}
+
+/* ---- recompiled microprograms (recomp/vu1rec.py -> build/recomp/vu1_gen.c) ------------------ */
+static void interp(int ending, int branch_pending, uint32_t branch_target);
+static int rec_on = -1, rec_check;
+static unsigned long long rec_runs, rec_bails, rec_misses, rec_bad;
+static int rec_enabled(void) {
+    if (rec_on < 0) {
+        const char *e = getenv("HP_VUREC");
+        rec_on = !e || strcmp(e, "0") != 0;
+        rec_check = getenv("HP_VURECCHECK") != NULL;
+        int n = 0;
+        while (g_vu1rec_table[n].fn) n++;
+        LOG("[vu1rec] %d recompiled code images%s%s\n", n, rec_on ? "" : " (disabled by HP_VUREC=0)", rec_check ? ", checking every run" : "");
+    }
+    return rec_on;
+}
+/* Compiled programs are matched against the pairs they were compiled from, not the whole
+   micro memory: the game's uploads leave different leftovers around the same renderer. */
+static const VuRecEntry *rec_valid[64];
+static int rec_nvalid;
+static void rec_revalidate(void) {
+    rec_nvalid = 0;
+    for (int k = 0; g_vu1rec_table[k].fn && rec_nvalid < 64; k++) {
+        const VuRecEntry *e = &g_vu1rec_table[k];
+        uint64_t h = 1469598103934665603ull;
+        for (const uint16_t *r = e->ranges; *r != 0xffff; r += 2)
+            for (uint32_t n = r[0]; n < r[1]; n++)
+                for (int b = 0; b < 8; b++) {
+                    int byte = g_vu1_code[(n & 0x7ff) * 8 + b];
+                    h ^= (uint8_t)byte; h *= 1099511628211ull;
+                }
+        if (h == e->key) rec_valid[rec_nvalid++] = e;
+    }
+}
+static const VuRecEntry *rec_lookup(uint32_t start) {
+    static unsigned gen_seen;
+    extern unsigned g_vu1_code_gen;
+    if (gen_seen != g_vu1_code_gen) { rec_revalidate(); gen_seen = g_vu1_code_gen; }
+    for (int k = 0; k < rec_nvalid; k++)
+        if (rec_valid[k]->labels[start >> 3] & (1u << (start & 7))) return rec_valid[k];
+    static uint32_t missed[64]; static int nmissed;
+    uint32_t key = (g_vu1_code_gen << 11) | start;
+    int seen = 0;
+    for (int k = 0; k < nmissed; k++) seen |= missed[k] == key;
+    if (!seen && nmissed < 64) {
+        missed[nmissed++] = key;
+        extern unsigned long long g_vsyncs;
+        LOG("[vu1rec] no recompiled program for %04x in code image %016llx (vsync %llu); collect with HP_VUCOLLECT=build/recomp/vu1\n",
+            start, (unsigned long long)vu1_code_hash(), g_vsyncs);
+    }
+    return NULL;
+}
+static void rec_run(const VuRecEntry *e, uint32_t start) {
+    VuResume r;
+    rec_runs++;
+    if (!e->fn(&vu, start, &r)) return;
+    rec_bails++;
+    if (r.jr_miss) {
+        rec_misses++;
+        static int n;
+        if (n++ < 20) LOG("[vu1rec] %016llx: no compiled code at %04x (start %04x), interpreting\n", (unsigned long long)e->hash, r.pc, start);
+    }
+    vu.pc = r.pc;
+    xgkick_due = r.due;
+    interp(r.ending, r.branch_pending, r.branch_target);
+}
+static int same32(const void *a, const void *b) { return !memcmp(a, b, 4); }
+static void rec_run_checked(const VuRecEntry *e, uint32_t start) {
+    static uint8_t data0[16384], data1[16384];
+    static U128 *kicks1;
+    static uint32_t kicks1_max;
+    VU1 vu0 = vu;
+    memcpy(data0, g_vu1_data, 16384);
+    capturing = 1; cap_n = 0;
+    rec_run(e, start);
+    VU1 vu1 = vu;
+    memcpy(data1, g_vu1_data, 16384);
+    uint32_t n1 = cap_n;
+    if (n1 > kicks1_max) { kicks1_max = n1 * 2; kicks1 = realloc(kicks1, kicks1_max * sizeof *kicks1); }
+    if (n1) memcpy(kicks1, cap, n1 * sizeof *cap);
+    vu = vu0;
+    memcpy(g_vu1_data, data0, 16384);
+    xgkick_due = -1;
+    cap_n = 0;
+    interp(0, 0, 0);
+    capturing = 0;
+    char what[256] = "";
+    for (int k = 1; k < 32 && !what[0]; k++)
+        for (int c = 0; c < 4; c++)
+            if (vu1.vf[k].u[c] != vu.vf[k].u[c]) { snprintf(what, sizeof what, "vf%d.%c %08x vs %08x", k, "xyzw"[c], vu1.vf[k].u[c], vu.vf[k].u[c]); break; }
+    for (int c = 0; c < 4 && !what[0]; c++)
+        if (vu1.acc.u[c] != vu.acc.u[c]) snprintf(what, sizeof what, "acc.%c %08x vs %08x", "xyzw"[c], vu1.acc.u[c], vu.acc.u[c]);
+    for (int k = 1; k < 16 && !what[0]; k++)
+        if (vu1.vi[k] != vu.vi[k]) snprintf(what, sizeof what, "vi%d %04x vs %04x", k, vu1.vi[k], vu.vi[k]);
+    if (!what[0] && !same32(&vu1.q, &vu.q)) snprintf(what, sizeof what, "Q");
+    if (!what[0] && !same32(&vu1.p, &vu.p)) snprintf(what, sizeof what, "P");
+    if (!what[0] && !same32(&vu1.i, &vu.i)) snprintf(what, sizeof what, "I");
+    if (!what[0] && vu1.r != vu.r) snprintf(what, sizeof what, "R");
+    if (!what[0] && vu1.clip != vu.clip) snprintf(what, sizeof what, "clip %06x vs %06x", vu1.clip, vu.clip);
+    if (!what[0] && vu1.pc != vu.pc) snprintf(what, sizeof what, "tpc %04x vs %04x", vu1.pc, vu.pc);
+    /* MAC/status are not compared: recompiled code computes them only where a later instruction
+       reads them, and any such read shows up in VI registers or memory */
+    if (!what[0] && memcmp(data1, g_vu1_data, 16384)) {
+        int k = 0; while (data1[k] == g_vu1_data[k]) k++;
+        snprintf(what, sizeof what, "data memory at qword %03x", k / 16);
+    }
+    if (!what[0] && (n1 != cap_n || memcmp(kicks1, cap, n1 * sizeof *cap))) snprintf(what, sizeof what, "kicks: %u vs %u qwords", n1, cap_n);
+    if (what[0]) {
+        rec_bad++;
+        static int n;
+        if (n++ < 20) LOG("[vu1rec] MISMATCH %016llx start %04x: %s\n", (unsigned long long)e->hash, start, what);
+    }
+    if (cap_n) gif_feed(0, cap, cap_n);   /* the interpreter's result is the one that counts */
+}
+void vu1rec_stats(void) {
+    LOG("[vu1rec] runs %llu, handed to the interpreter %llu (unknown jump targets %llu), check mismatches %llu\n", rec_runs, rec_bails, rec_misses, rec_bad);
+}
+
 /* TPC: where the last microprogram stopped (the pair after its E-bit delay slot); MSCNT resumes here */
 uint32_t vu1_tpc(void) { return vu.pc; }
 void vu1_run(uint32_t start, uint32_t top, uint32_t itop) {
@@ -415,11 +582,29 @@ void vu1_run(uint32_t start, uint32_t top, uint32_t itop) {
         f = fopen(path, "wb"); if (f) { fwrite(g_vu1_data, 1, 16384, f); fclose(f); }
         LOG("[vu1] dumped micro/data memory at run start %04x top %04x itop %04x\n", start, top, itop);
     }
+    static int stats_on = -1;
+    if (stats_on < 0) { stats_on = getenv("HP_VUSTATS") || getenv("HP_VUCOLLECT"); collect_jr = getenv("HP_VUCOLLECT") != NULL; }
+    VuProg *prog = stats_on ? prog_note(start & 0x7ff) : NULL;
+    unsigned long long insns0 = g_vu1_insns;
     vu.pc = start & 0x7ff;
     vu.top = top; vu.itop = itop;
     vu.vf[0].f[0] = vu.vf[0].f[1] = vu.vf[0].f[2] = 0; vu.vf[0].f[3] = 1.0f;
-    int ending = 0, branch_pending = 0;
-    uint32_t branch_target = 0;
+    if (rec_enabled()) {
+        const VuRecEntry *e = rec_lookup(start & 0x7ff);
+        if (e) {
+            if (rec_check) rec_run_checked(e, start & 0x7ff);
+            else rec_run(e, start & 0x7ff);
+            if (prog) prog->pairs += g_vu1_insns - insns0;
+            return;
+        }
+    }
+    interp(0, 0, 0);
+    if (prog) prog->pairs += g_vu1_insns - insns0;
+}
+
+/* The interpreter loop, from vu.pc with the given sequencing state (a fresh run, or where a
+   recompiled program handed over). */
+static void interp(int ending, int branch_pending, uint32_t branch_target) {
     for (long steps = 0; steps < 5000000; steps++) {
         uint32_t pc = vu.pc;
         uint64_t pair;
@@ -455,7 +640,7 @@ void vu1_run(uint32_t start, uint32_t top, uint32_t itop) {
         }
         if (up & 0x40000000u) ending = 1;   /* E bit: one more pair runs */
     }
-    LOG("[vu1] program at %04x did not finish\n", start);
+    LOG("[vu1] program did not finish (pc %04x)\n", vu.pc);
 }
 
 void vu1_init(uint8_t *vumem_page) {

@@ -58,14 +58,29 @@ uint32_t vif1_reg_read(uint32_t off) {
 
 static void vif1_drain_locked(void);
 extern pthread_mutex_t g_gs_lock;
+#define RENDER_JOB_VIF1_DRAIN 16
+/* STC runs the queued VIF1 data right away on the EE thread: the game waits for it anyway, and
+   that is faster than handing it to the render thread.  HP_VIFASYNC=1 resumes it there instead. */
+static int sync_drain(void) { static int s = -1; if (s < 0) s = getenv("HP_VIFASYNC") == NULL; return s; }
+void vif1_drain_job(void) {   /* render thread */
+    pthread_mutex_lock(&g_gs_lock);
+    vif1_drain_locked();
+    pthread_mutex_unlock(&g_gs_lock);
+}
 
 void vif1_reg_write(uint32_t off, uint32_t val) {
     if (off == 0x30) { v1.mark = val; v1.mark_seen = 0; }   /* writing MARK clears MRK */
     else if (off == 0x10) {
         pthread_mutex_lock(&g_gs_lock);
         if (val & 1) { v1.need = 0; v1.cmd = 0; stalled = stall_next = 0; vq_head = vq_tail = 0; }   /* RST */
-        if (val & 8) { stalled = 0; vif1_drain_locked(); }                                          /* STC */
+        int resume = 0;
+        if (val & 8) {   /* STC: the VIF goes on with the queued data */
+            stalled = 0;
+            resume = vq_head != vq_tail || dma1_deferred;
+            if (sync_drain() && resume) { vif1_drain_locked(); resume = 0; }
+        }
         pthread_mutex_unlock(&g_gs_lock);
+        if (resume) { extern void render_post(int job); render_post(RENDER_JOB_VIF1_DRAIN); }
     }
 }
 
@@ -229,9 +244,13 @@ static void vif1_data(uint32_t w) {
     case 0x20: v1.mask = w; break;
     case 0x30: v1.row[v1.got] = w; break;
     case 0x31: v1.col[v1.got] = w; break;
-    case 0x4a:
-        memcpy(g_vu1_code + ((v1.mpg_addr + 4 * v1.got) & 0x3fff), &w, 4);
+    case 0x4a: {
+        extern unsigned g_vu1_code_gen, g_vu1_mpg_words;
+        uint8_t *dst = g_vu1_code + ((v1.mpg_addr + 4 * v1.got) & 0x3fff);
+        if (memcmp(dst, &w, 4)) { memcpy(dst, &w, 4); g_vu1_code_gen++; }
+        g_vu1_mpg_words++;
         break;
+    }
     case 0x50: case 0x51:
         v1.dq.w[v1.dq_n++] = w;
         if (v1.dq_n == 4) { gif_feed(1, &v1.dq, 1); v1.dq_n = 0; }
