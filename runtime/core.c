@@ -80,6 +80,33 @@ const char *rt_func_name(uint32_t addr) {
 
 static uint32_t g_calltrace_ra;
 uint32_t g_watch = 0xffffffffu;
+/* HP_WRANGE=lo,hi[,vsync]: histogram of the functions storing into [lo,hi) (dumped on SIGUSR1) */
+uint32_t g_wrange_lo, g_wrange_len;
+static long g_wrange_from;
+static struct { uint32_t fn; unsigned long long n; uint32_t lo, hi; } wrh[1024];
+void rt_wrange_hit(uint32_t a, int size) {
+    extern unsigned long long g_vsyncs;
+    if ((long)g_vsyncs < g_wrange_from) return;
+    EE *c = kern_current_ctx();
+    uint32_t pc = c ? c->pc : 0, lo = 0, hi = g_func_count;
+    while (hi - lo > 1) { uint32_t m = (lo + hi) / 2; if (g_func_table[m].addr <= pc) lo = m; else hi = m; }
+    uint32_t fn = g_func_table[lo].addr, k = (fn >> 2) & 1023;
+    a &= 0x1fffffffu;
+    for (int i = 0; i < 1024; i++, k = (k + 1) & 1023) {
+        if (!wrh[k].n) { wrh[k].fn = fn; wrh[k].n = 1; wrh[k].lo = a; wrh[k].hi = a + size; return; }
+        if (wrh[k].fn == fn) { wrh[k].n++; if (a < wrh[k].lo) wrh[k].lo = a; if (a + size > wrh[k].hi) wrh[k].hi = a + size; return; }
+    }
+    (void)size;
+}
+static void wrange_dump(void) {
+    for (int pass = 0; pass < 30; pass++) {
+        int best = -1;
+        for (int k = 0; k < 1024; k++) if (wrh[k].n && (best < 0 || wrh[k].n > wrh[best].n)) best = k;
+        if (best < 0) break;
+        LOG("[wrange] %10llu stores  f_%08x  [%08x..%08x)\n", wrh[best].n, wrh[best].fn, wrh[best].lo, wrh[best].hi);
+        wrh[best].n = 0;
+    }
+}
 
 extern unsigned long long g_vsyncs;
 void rt_watch_hit(uint32_t a, uint64_t v, int size) {
@@ -186,6 +213,7 @@ volatile int g_usr1_req;
 static void on_usr1(int sig) { (void)sig; g_usr1_req = 1; }   /* the work runs on the vblank thread (LOG is not async-signal-safe) */
 void rt_usr1_work(void) {
     kern_dump_threads();
+    if (g_wrange_len) wrange_dump();
     rt_callhist_dump();
     const char *vd = getenv("HP_VRAMDUMP");
     if (vd) {
@@ -229,6 +257,12 @@ int main(int argc, char **argv) {
     if (argc > 2) snprintf(g_disc_dir, sizeof g_disc_dir, "%s", argv[2]);
     g_trace = getenv("HP_TRACE") ? atoi(getenv("HP_TRACE")) : 0;
     if (getenv("HP_WATCH")) g_watch = (uint32_t)strtoul(getenv("HP_WATCH"), NULL, 16) & 0x1ffffff0u;
+    if (getenv("HP_WRANGE")) {
+        char *e; uint32_t lo = (uint32_t)strtoul(getenv("HP_WRANGE"), &e, 16), hi = lo + 16;
+        if (*e == ',') hi = (uint32_t)strtoul(e + 1, &e, 16);
+        if (*e == ',') g_wrange_from = atol(e + 1);
+        g_wrange_lo = lo; g_wrange_len = hi - lo;
+    }
     g_callhist_start = getenv("HP_CALLHIST") ? atol(getenv("HP_CALLHIST")) : -1;
     g_calltrace_ra = getenv("HP_CALLTRACE") ? (uint32_t)strtoul(getenv("HP_CALLTRACE"), NULL, 16) : 0;
     signal(SIGSEGV, on_signal);

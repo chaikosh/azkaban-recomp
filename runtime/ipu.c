@@ -147,6 +147,23 @@ static void in_append(const uint8_t *p, uint32_t n) {
     memcpy(in + in_len, p, n);
     in_len += n;
 }
+
+/* Input FIFO: the toIPU DMA is pulled so that at most FIFO_QW unread quadwords sit in front of
+   the decoder (8 in the FIFO + 2 in the bit-unit register), as on hardware.  Games that switch
+   to CSC mid-stream rewind D4_MADR by IFC+FP and restore BP afterwards, which only works if the
+   DMA position is honest. */
+#define FIFO_QW 10
+int dma_ipu_pull(U128 *q);
+static uint32_t unread_qw(void) {
+    uint32_t used = (uint32_t)(bitpos >> 7), have = in_len / 16;
+    return have > used ? have - used : 0;
+}
+static int pull_qw(uint32_t want) {   /* pull until `want` unread quadwords; returns how many were added */
+    int got = 0;
+    U128 q;
+    while (unread_qw() < want && dma_ipu_pull(&q)) { in_append((const uint8_t *)&q, 16); got++; }
+    return got;
+}
 static void out_push(const void *p, uint32_t nq) {
     if (out_len + nq > out_cap) { out_cap = (out_len + nq) * 2 + 1024; out = realloc(out, out_cap * sizeof(U128)); }
     memcpy(out + out_len, p, nq * sizeof(U128));
@@ -628,11 +645,12 @@ static void restore(void) {
     memcpy(iq, snap.iq, 64); memcpy(nq, snap.nq, 64); memcpy(vqclut, snap.vqclut, sizeof vqclut);
 }
 
+static unsigned pic_bdec, pic_err;
 static void exec_cmd(uint32_t v) {
     switch (v >> 28) {
-    case 0: in_len = 0; bitpos = v & 127; out_len = out_rd = 0; break;   /* BCLR */
+    case 0: in_len = 0; bitpos = v & 127; break;   /* BCLR: clears the input FIFO, BP = v */
     case 1: cmd_idec(v); break;
-    case 2: { uint32_t before = out_len; cmd_bdec(v); if (!underflow && out_len == before) g_ipu_bdec_nooutput++; bdec_count++; break; }
+    case 2: { uint32_t before = out_len; cmd_bdec(v); if (!underflow) { if (out_len == before) g_ipu_bdec_nooutput++; bdec_count++; pic_bdec++; } break; }
     case 3: cmd_vdec(v); break;
     case 4: skip(v & 63); cmd_result = peek(32); top = cmd_result; break;   /* FDEC */
     case 5: {   /* SETIQ: 64 bytes in scan order, IQM bit 27 selects non-intra */
@@ -642,7 +660,9 @@ static void exec_cmd(uint32_t v) {
         break;
     }
     case 6: for (int k = 0; k < 16; k++) { uint32_t lo = getb(8), hi = getb(8); vqclut[k] = (uint16_t)(lo | (hi << 8)); } break;   /* SETVQ */
-    case 7: csc_count++; cmd_csc(v); break;
+    case 7: cmd_csc(v); if (!underflow) { csc_count++;
+        if (getenv("HP_IPUPIC")) LOG("[ipu] CSC %u MBs after %u BDEC, %u VLC errors, ctrl %08x\n", v & 0x7ff, pic_bdec, g_ipu_vlc_errors - pic_err, ctrl);
+        pic_bdec = 0; pic_err = g_ipu_vlc_errors; } break;
     case 8: pack_count++; cmd_pack(v); break;
     case 9: th0 = v & 0x1ff; th1 = (v >> 16) & 0x1ff; break;                       /* SETTH */
     default: {
@@ -655,17 +675,28 @@ static void exec_cmd(uint32_t v) {
 
 /* Run (or re-run) the command; it stays pending while the input runs dry. */
 static void run_cmd(void) {
-    bitpos = cmd_bitpos;
-    out_len = cmd_outlen;
-    restore();
-    underflow = 0;
-    exec_cmd(pend_cmd);
-    if (underflow) { pending = 1; busy = 1; return; }
+    for (;;) {
+        bitpos = cmd_bitpos;
+        out_len = cmd_outlen;
+        restore();
+        if ((pend_cmd >> 28) != 0) pull_qw(FIFO_QW);   /* the FIFO is kept full while the DMA runs */
+        underflow = 0;
+        exec_cmd(pend_cmd);
+        if (!underflow) break;
+        /* the command needs more than the FIFO holds: the hardware would have consumed
+           bits meanwhile, so pull further and re-run from the snapshot */
+        bitpos = cmd_bitpos;
+        if (!pull_qw(unread_qw() + 8)) { pending = 1; busy = 1; return; }
+    }
     pending = 0; busy = 0;
+    pull_qw(FIFO_QW);
     from_drain();
 }
 
+static void compact_in(void);
 void ipu_write_cmd(uint32_t v) {
+    if (g_trace && (v >> 28) == 7) LOG("[ipu] CSC %08x\n", v);
+    compact_in();
     last_cmd = v;
     pend_cmd = v;
     cmd_bitpos = bitpos;
@@ -676,6 +707,7 @@ void ipu_write_cmd(uint32_t v) {
 }
 
 void ipu_write_ctrl(uint32_t v) {
+    if (g_trace > 1 || getenv("HP_IPUCTRL")) { static uint32_t last = ~0u; if (v != last) { LOG("[ipu] CTRL <- %08x\n", v); last = v; } }
     if (v & 0x40000000u) {   /* RST */
         in_len = 0; bitpos = 0; out_len = out_rd = 0; pending = 0; busy = 0; underflow = 0;
         ecd = scd = cbp_reg = 0;
@@ -690,8 +722,8 @@ void ipu_stats(void) {
 
 uint32_t ipu_read(uint32_t off) {
     uint32_t cmdtype = last_cmd >> 28;
-    uint64_t avail = (uint64_t)in_len * 8 > bitpos ? (uint64_t)in_len * 8 - bitpos : 0;
-    uint32_t ifc = (uint32_t)(avail / 128);
+    uint32_t un = unread_qw(), fp = un < 2 ? un : 2, ifc = un - fp;
+    if (ifc > 8) ifc = 8;
     switch (off) {
     case 0x00: {                                                               /* CMD.DATA */
         if (cmdtype == 3 || cmdtype == 4) return cmd_result;
@@ -700,11 +732,11 @@ uint32_t ipu_read(uint32_t off) {
     case 0x04: return busy ? 0x80000000u : 0;                                  /* CMD.BUSY */
     case 0x10: {                                                               /* CTRL */
         uint32_t ofc = out_len - out_rd;
-        return ctrl | (ifc > 8 ? 8 : ifc) | ((ofc > 8 ? 8 : ofc) << 4) | ((uint32_t)cbp_reg << 8) |
+        return ctrl | ifc | ((ofc > 8 ? 8 : ofc) << 4) | ((uint32_t)cbp_reg << 8) |
                (ecd ? 1u << 14 : 0) | (scd ? 1u << 15 : 0) | (busy ? 0x80000000u : 0);
     }
     case 0x20:                                                                 /* BP: BP, IFC, FP */
-        return (uint32_t)(bitpos & 127) | ((ifc > 8 ? 8 : ifc) << 8) | (avail >= 128 ? (1u << 16) : 0);
+        return (uint32_t)(bitpos & 127) | (ifc << 8) | (fp << 16);
     case 0x30: { int u = underflow; uint32_t t = peek(32); underflow = u; return t; }   /* TOP */
     case 0x34: return busy ? 0x80000000u : 0;
     }
@@ -737,16 +769,24 @@ void ipu_from_dma_start(uint32_t madr, uint32_t qwc) {
     from_drain();
 }
 
-void ipu_in_qwords(const uint8_t *p, uint32_t nq) {
-    /* drop input already consumed by completed commands */
-    if (!pending && (bitpos >> 3) >= 65536) {
-        uint32_t drop = (uint32_t)(bitpos >> 3) & ~15u;
-        memmove(in, in + drop, in_len - drop);
-        in_len -= drop;
-        bitpos -= (uint64_t)drop * 8;
-    }
+/* drop input already consumed by completed commands */
+static void compact_in(void) {
+    if (pending || (bitpos >> 3) < 65536) return;
+    uint32_t drop = (uint32_t)(bitpos >> 3) & ~15u;
+    if (drop > in_len) drop = in_len & ~15u;
+    memmove(in, in + drop, in_len - drop);
+    in_len -= drop;
+    bitpos -= (uint64_t)drop * 8;
+}
+void ipu_in_qwords(const uint8_t *p, uint32_t nq) {   /* EE writes to the IPU input FIFO */
+    compact_in();
     in_append(p, nq * 16);
     if (pending) run_cmd();
+}
+void ipu_in_kick(void) {   /* toIPU DMA started */
+    if (pending) { run_cmd(); return; }
+    compact_in();
+    pull_qw(FIFO_QW);
 }
 uint32_t ipu_out_qwords(uint8_t *dst, uint32_t nq) {
     uint32_t avail = out_len - out_rd, n = nq < avail ? nq : avail;

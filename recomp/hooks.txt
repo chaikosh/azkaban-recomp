@@ -12,3 +12,7 @@
 002c0ef8          hle_log_lssusp    debug: loading screen: suspend
 002c0f48          hle_log_lsresume  debug: loading screen: resume
 00467230          hle_loader_idle   package loader "may open": wait only while a load can still progress (state 3)
+002c8640          hle_log_mpout1    debug: movie: output frame (single field/progressive)
+002c8750          hle_log_mpout2    debug: movie: output frame (two fields)
+002c9008          hle_log_mpcsc     debug: movie: convert frame (IPU CSC)
+002c9468          hle_log_mprest    debug: movie: restore bitstream DMA after CSC

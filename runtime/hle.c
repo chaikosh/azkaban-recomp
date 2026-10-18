@@ -112,3 +112,38 @@ void hle_loader_idle(EE *c) {
     uint32_t st = ld32(RW(4) + 12);
     R(2) = SX(st != 3 ? 1u : 0u);
 }
+
+static void log_pic(const char *tag, uint32_t p) {
+    extern unsigned long long g_vsyncs;
+    if (!g_trace) return;
+    LOG("[mp v%llu] %s pic %08x:", g_vsyncs, tag, p);
+    for (int k = 0; k < 26 && p; k++) LOG(" %x", ld32(p + 4 * k));
+    LOG("\n");
+}
+void hle_log_mpout1(EE *c) { log_pic("out1", RW(5)); if (g_trace) LOG("[mp] dec %08x +8=%u +176=%u +372=%u +336=%u\n", RW(4), ld32(RW(4) + 8), ld32(RW(4) + 176), ld32(RW(4) + 372), ld32(RW(4) + 336)); f_002c8640_orig(c); }
+void hle_log_mpout2(EE *c) { log_pic("out2a", RW(5)); log_pic("out2b", RW(6)); f_002c8750_orig(c); }
+void hle_log_mpcsc(EE *c) {
+    log_pic("csc", RW(5));
+    /* HP_MPDUMP=dir: save the raw8 YUV macroblocks of the first pictures handed to CSC */
+    static int n;
+    const char *dir = getenv("HP_MPDUMP");
+    uint32_t p = RW(5), src = ld32(p) & 0x01fffff0u, mbs = ld32(p + 12) * ld32(p + 16);
+    if (dir && mbs && n < 8) {
+        char path[512]; snprintf(path, sizeof path, "%s/pic%d_%ux%u.yuv", dir, n++, ld32(p + 12), ld32(p + 16));
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(g_ram + src, 1, mbs * 384, f); fclose(f); LOG("[mp] dumped %s from %08x\n", path, src); }
+    }
+    f_002c9008_orig(c);
+}
+
+void hle_log_mprest(EE *c) {
+    extern unsigned long long g_vsyncs;
+    uint32_t s = RW(4);
+    static int n;
+    if (g_trace && n++ < 60) {
+        uint32_t bp = ld32(s + 28);
+        LOG("[mp v%llu] restore: madr %08x tadr %08x qwc %u chcr %08x | d3 %08x %u %08x | bp %u ifc %u fp %u\n", g_vsyncs,
+            ld32(s), ld32(s + 4), ld32(s + 8), ld32(s + 12), ld32(s + 16), ld32(s + 20), ld32(s + 24), bp & 127, (bp >> 8) & 15, (bp >> 16) & 3);
+    }
+    f_002c9468_orig(c);
+}

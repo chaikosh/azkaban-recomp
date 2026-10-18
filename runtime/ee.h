@@ -56,9 +56,11 @@ void mmio_w128(uint32_t a, U128 v);
 static inline uint8_t *HP(uint32_t a) { uint8_t *b = g_pt[a >> 16]; return b ? b + (a & 0xFFFF) : 0; }
 
 #ifdef WATCH
-extern uint32_t g_watch;
+extern uint32_t g_watch, g_wrange_lo, g_wrange_len;
 void rt_watch_hit(uint32_t a, uint64_t v, int size);
-#define WATCHED(a, v, sz) do { if (UNLIKELY(((a) & 0x1ffffff0u) == g_watch)) rt_watch_hit(a, (uint64_t)(v), sz); } while (0)
+void rt_wrange_hit(uint32_t a, int size);
+#define WATCHED(a, v, sz) do { if (UNLIKELY(((a) & 0x1ffffff0u) == g_watch)) rt_watch_hit(a, (uint64_t)(v), sz); \
+                               if (UNLIKELY(((a) & 0x1fffffffu) - g_wrange_lo < g_wrange_len)) rt_wrange_hit(a, sz); } while (0)
 #else
 #define WATCHED(a, v, sz) ((void)0)
 #endif

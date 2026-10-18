@@ -135,6 +135,7 @@ static void *render_thread(void *arg) {
     return NULL;
 }
 
+static int d4_end;
 void dma_start(int ch) {
     static int seen[10];
     g_dma_count[ch]++;
@@ -164,13 +165,57 @@ void dma_start(int ch) {
     }
     g_dma_qwords = 0;
     if (ch == 8 || ch == 9) spr_transfer(ch);
-    if (ch == 4) dma_run(4, ipu_sink, 0);
+    if (ch == 4) {   /* toIPU is pulled by the IPU as its input FIFO drains */
+        extern void ipu_in_kick(void);
+        d4_end = 0;
+        ipu_in_kick();
+        return;
+    }
     if (ch == 3) {   /* fromIPU completes when the decoder has produced QWC quadwords */
         extern void ipu_from_dma_start(uint32_t madr, uint32_t qwc);
         ipu_from_dma_start(mmio_r32(base[3] + 0x10), mmio_r32(base[3] + 0x20) & 0xffff);
         return;
     }
     kern_after(20000 + (uint64_t)g_dma_qwords * 8, dma_finish, ch);
+}
+
+/* toIPU pull: hand the IPU one quadword, advancing MADR/QWC/TADR like the DMAC would.
+   Returns 0 when the channel is idle or its chain has ended (the channel is then finished). */
+int dma_ipu_pull(U128 *q) {
+    extern void mmio_w32_raw(uint32_t a, uint32_t v);
+    uint32_t b = base[4];
+    for (int guard = 0; guard < 4096; guard++) {
+        uint32_t chcr = mmio_r32(b);
+        if (!(chcr & 0x100)) return 0;
+        uint32_t madr = mmio_r32(b + 0x10), qwc = mmio_r32(b + 0x20) & 0xffff;
+        int mode = (chcr >> 2) & 3;
+        if (qwc) {
+            *q = *dma_ptr(madr);
+            mmio_w32_raw(b + 0x10, madr + 16);
+            mmio_w32_raw(b + 0x20, qwc - 1);
+            g_dma_qwords++;
+            if (qwc == 1 && (mode == 0 || d4_end)) dma_finish(4);
+            return 1;
+        }
+        if (mode == 0 || d4_end) { dma_finish(4); return 0; }
+        /* source chain: fetch the next tag */
+        uint32_t tadr = mmio_r32(b + 0x30);
+        uint64_t tag = dma_ptr(tadr)->d[0];
+        uint32_t n = tag & 0xffff, id = (tag >> 28) & 7, addr = (uint32_t)(tag >> 32) & 0xfffffff0u, data, next;
+        switch (id) {
+        case 0: data = addr; next = tadr + 16; d4_end = 1; break;          /* refe */
+        case 1: data = tadr + 16; next = tadr + 16 + 16 * n; break;        /* cnt */
+        case 2: data = tadr + 16; next = addr; break;                      /* next */
+        case 3: case 4: data = addr; next = tadr + 16; break;              /* ref, refs */
+        default: data = tadr + 16; next = tadr + 16 + 16 * n; d4_end = 1; break;   /* end (call/ret unused here) */
+        }
+        if (((tag >> 31) & 1) && (chcr & 0x80)) d4_end = 1;               /* IRQ with TIE */
+        mmio_w32_raw(b, (chcr & 0xffff) | (uint32_t)(tag & 0xffff0000u));
+        mmio_w32_raw(b + 0x10, data);
+        mmio_w32_raw(b + 0x20, n);
+        mmio_w32_raw(b + 0x30, next);
+    }
+    return 0;
 }
 
 void dma_finish(int ch) {

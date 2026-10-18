@@ -556,6 +556,9 @@ class FuncEmitter:
             body.append(self.goto_or_fall(prev_ft))
         out.append(f"void {fname(f.start)}(EE *c) {{")
         out.append("  RA_ENTER();")
+        if pcs and pcs[0] != f.start:
+            # code below the entry (a jump target shared with a neighbour) is emitted first
+            out.append(f"  goto L_{f.start:08x};")
         out.extend(body)
         out.append("}")
         return out

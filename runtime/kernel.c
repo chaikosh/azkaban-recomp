@@ -7,6 +7,7 @@
  * delivered at safe points: syscalls and POLL() on backward branches.
  */
 #include "rt.h"
+#include "ee_gen.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -189,6 +190,7 @@ static void deliver_locked(void) {
         } else {
             dmac_cis &= ~(1u << ch);
             if (g_trace > 1 && ch == 5) LOG("[kern] dmac5 interrupt -> handlers\n");
+            if (g_trace && (ch == 3 || ch == 4)) LOG("[kern] dmac%d interrupt -> handlers\n", ch);
             for (int k = 0; k < MAX_HANDLERS; k++)
                 if (dmac_h[k].used && dmac_h[k].enabled && dmac_h[k].cause == ch) call_handler(&dmac_h[k], ch);
             if (ch == 5) {   /* SIF0 packet consumed: let the IOP send the next one */
@@ -599,11 +601,13 @@ void rt_syscall(EE *c, uint32_t pc) {
     case 16: r = add_handler(intc_h, A0, A1, A3, RW(28)); if (g_trace) LOG("[kern] AddIntcHandler(%d, %08x) = %d\n", A0, A1, (int)r); break;
     case 17: if (A1 < MAX_HANDLERS) intc_h[A1].used = 0; break;
     case 18: r = add_handler(dmac_h, A0, A1, A3, RW(28)); if (g_trace) LOG("[kern] AddDmacHandler(%d, %08x) = %d\n", A0, A1, (int)r); break;
-    case 19: if (A1 < MAX_HANDLERS) dmac_h[A1].used = 0; break;
+    case 19: if (A1 < MAX_HANDLERS) dmac_h[A1].used = 0; if (g_trace) LOG("[kern] RemoveDmacHandler(%d, %d)\n", A0, A1); break;
     case 20: case 26: r = !(intc_mask >> A0 & 1); intc_mask |= 1u << A0; if (intc_stat & intc_mask) g_irq_pending = 1; break;
     case 21: case 27: r = intc_mask >> A0 & 1; intc_mask &= ~(1u << A0); break;
-    case 22: case 28: r = !(dmac_cim >> A0 & 1); dmac_cim |= 1u << A0; if (dmac_cis & dmac_cim) g_irq_pending = 1; break;
-    case 23: case 29: r = dmac_cim >> A0 & 1; dmac_cim &= ~(1u << A0); break;
+    case 22: case 28: r = !(dmac_cim >> A0 & 1); dmac_cim |= 1u << A0; if (dmac_cis & dmac_cim) g_irq_pending = 1;
+        if (g_trace && A0 != 1 && A0 != 5) LOG("[kern] EnableDmac(%d) cis %03x cim %03x\n", A0, dmac_cis, dmac_cim); break;
+    case 23: case 29: r = dmac_cim >> A0 & 1; dmac_cim &= ~(1u << A0);
+        if (g_trace && A0 != 1 && A0 != 5) LOG("[kern] DisableDmac(%d) cis %03x cim %03x\n", A0, dmac_cis, dmac_cim); break;
     case 32: case 33: case 34: case 35: case 36: case 37: case 38: case 41: case 42: case 43: case 44:
     case 45: case 46: case 47: case 48: case 49: case 50: case 51: case 52: case 53: case 54: case 55:
     case 56: case 57: case 58:
@@ -801,6 +805,45 @@ static void *alarm_thread(void *arg) {
     return NULL;
 }
 
+/* HP_PROF=start_vsync,count: sample the running guest thread's pc every 200 us during
+   `count` vsyncs and print the hottest functions (per thread). */
+static void *prof_thread(void *arg) {
+    (void)arg;
+    extern unsigned long long g_vsyncs;
+    const char *e = getenv("HP_PROF");
+    long start = atol(e), dur = 300;
+    const char *q = strchr(e, ','); if (q) dur = atol(q + 1);
+    enum { NB = 8192 };
+    static struct { uint32_t fn; int t; unsigned n; } h[NB];
+    unsigned total = 0;
+    while ((long)g_vsyncs < start) usleep(2000);
+    while ((long)g_vsyncs < start + dur) {
+        int t = cur;
+        if (t > 0 && t < MAX_THREADS && th[t].c) {
+            uint32_t pc = th[t].c->pc;
+            /* function start = nearest table entry at or below pc */
+            uint32_t lo = 0, hi = g_func_count;
+            while (hi - lo > 1) { uint32_t m = (lo + hi) / 2; if (g_func_table[m].addr <= pc) lo = m; else hi = m; }
+            uint32_t fn = g_func_table[lo].addr, k = ((fn >> 2) * 31u + (uint32_t)t) & (NB - 1);
+            for (int i = 0; i < NB; i++, k = (k + 1) & (NB - 1)) {
+                if (!h[k].n) { h[k].fn = fn; h[k].t = t; h[k].n = 1; break; }
+                if (h[k].fn == fn && h[k].t == t) { h[k].n++; break; }
+            }
+            total++;
+        }
+        usleep(200);
+    }
+    LOG("[prof] %u samples, vsyncs %ld..%ld\n", total, start, start + dur);
+    for (int pass = 0; pass < 60; pass++) {
+        int best = -1;
+        for (int k = 0; k < NB; k++) if (h[k].n && (best < 0 || h[k].n > h[best].n)) best = k;
+        if (best < 0) break;
+        LOG("[prof] %6u %5.1f%%  t%d f_%08x\n", h[best].n, 100.0 * h[best].n / (total ? total : 1), h[best].t, h[best].fn);
+        h[best].n = 0;
+    }
+    return NULL;
+}
+
 void kern_run_main(uint32_t entry) {
     t0_ns = virt_ns();
     for (int n = 0; n < 256; n++) st32(KSYSCALL_TAB + 4u * (uint32_t)n, KFAKE_FN(n));
@@ -819,6 +862,7 @@ void kern_run_main(uint32_t entry) {
     pthread_create(&vb, NULL, vblank_thread, NULL);
     pthread_create(&at, NULL, alarm_thread, NULL);
     if (getenv("HP_CLOCK")) { pthread_t cm; pthread_create(&cm, NULL, clock_monitor, NULL); }
+    if (getenv("HP_PROF")) { pthread_t pt; pthread_create(&pt, NULL, prof_thread, NULL); }
     GuestFn fn = rt_lookup(entry);
     if (!fn) rt_fatal(c, "entry point is not code");
     fn(c);
