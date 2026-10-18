@@ -67,6 +67,13 @@ static const uint8_t zigzag[64] = {
 static const uint8_t altscan[64] = {
     0, 8, 16, 24, 1, 9, 2, 10, 17, 25, 32, 40, 48, 56, 57, 49, 41, 33, 26, 18, 3, 11, 4, 12, 19, 27, 34, 42, 50, 58, 35, 43,
     51, 59, 20, 28, 5, 13, 6, 14, 21, 29, 36, 44, 52, 60, 37, 45, 53, 61, 22, 30, 7, 15, 23, 31, 38, 46, 54, 62, 39, 47, 55, 63};
+/* The mpeg2dec/PCSX2 integer IDCT reads its inputs in butterfly order: frequency u of a row (and v of a
+   column) lives at slot ((u & 6) >> 1) | ((u & 1) << 2).  mpeg2dec permutes its scan tables the same way
+   at init (mpeg2_idct_init). */
+#define IDCT_SLOT(j) ((((j) & 0x36) >> 1) | (((j) & 0x09) << 2))
+static uint8_t idct_perm[64];
+__attribute__((constructor)) static void idct_perm_init(void) { for (int j = 0; j < 64; j++) idct_perm[j] = (uint8_t)IDCT_SLOT(j); }
+
 /* default intra matrix in scan (zigzag) order, like the matrices SETIQ delivers */
 static const uint8_t default_intra_scan[64] = {
     8, 16, 16, 19, 16, 19, 22, 22, 22, 22, 22, 22, 26, 24, 26, 27, 27, 27, 26, 26, 26, 26, 27, 27, 27, 29, 29, 29, 34, 34, 34, 29,
@@ -297,7 +304,7 @@ static int get_intra_block(void) {
             int s = -(int)getb(1);
             val = (val ^ s) - s;
         }
-        dec.block[scan[i]] = sat12(val);
+        dec.block[idct_perm[scan[i]]] = sat12(val);
         i++;
     }
     return 0;
@@ -335,7 +342,7 @@ static int get_non_intra_block(void) {
             int s = -(int)getb(1);
             val = (val ^ s) - s;
         }
-        dec.block[scan[i]] = sat12(val);
+        dec.block[idct_perm[scan[i]]] = sat12(val);
         i++;
     }
     return 0;
@@ -580,6 +587,7 @@ static void cmd_vdec(uint32_t v) {
     top = peek(32);
 }
 
+static void cmd_checkpoint(uint32_t remaining);
 static void cmd_csc(uint32_t v) {
     uint32_t mbc = v & 0x7ff;
     int ofm = (v >> 27) & 1;
@@ -588,6 +596,7 @@ static void cmd_csc(uint32_t v) {
         if (underflow) return;
         yuv_to_rgb32(dec.mb8, dec.rgb32, 0);
         emit_rgb(ofm);
+        cmd_checkpoint(mbc - m - 1);   /* macroblocks are independent: a retry resumes here */
     }
 }
 
@@ -603,7 +612,7 @@ static void cmd_pack(uint32_t v) {
         if (underflow) return;
         uint16_t p16[256];
         rgb32_to_rgb16(dec.rgb32, p16);
-        if (ofm) { out_push(p16, 32); continue; }
+        if (ofm) { out_push(p16, 32); cmd_checkpoint(mbc - m - 1); continue; }
         uint8_t idx[128];
         for (int y = 0; y < 16; y++)
             for (int x = 0; x < 8; x++) {
@@ -621,6 +630,7 @@ static void cmd_pack(uint32_t v) {
                 idx[y * 8 + x] = (uint8_t)((best[1] << 4) | best[0]);
             }
         out_push(idx, 8);
+        cmd_checkpoint(mbc - m - 1);
     }
 }
 
@@ -673,6 +683,14 @@ static void exec_cmd(uint32_t v) {
     }
 }
 
+/* CSC/PACK work macroblock by macroblock without decoder state: record progress so that an input
+   underflow re-runs only the unfinished part (a full restart is quadratic for a 1023-MB CSC). */
+static void cmd_checkpoint(uint32_t remaining) {
+    cmd_bitpos = bitpos;
+    cmd_outlen = out_len;
+    pend_cmd = (pend_cmd & ~0x7ffu) | remaining;
+}
+
 /* Run (or re-run) the command; it stays pending while the input runs dry. */
 static void run_cmd(void) {
     for (;;) {
@@ -686,7 +704,8 @@ static void run_cmd(void) {
         /* the command needs more than the FIFO holds: the hardware would have consumed
            bits meanwhile, so pull further and re-run from the snapshot */
         bitpos = cmd_bitpos;
-        if (!pull_qw(unread_qw() + 8)) { pending = 1; busy = 1; return; }
+        uint32_t extra = ((pend_cmd >> 28) == 7 || (pend_cmd >> 28) == 8) ? 64 : 8;   /* CSC/PACK stream large inputs */
+        if (!pull_qw(unread_qw() + extra)) { pending = 1; busy = 1; return; }
     }
     pending = 0; busy = 0;
     pull_qw(FIFO_QW);
@@ -696,6 +715,7 @@ static void run_cmd(void) {
 static void compact_in(void);
 void ipu_write_cmd(uint32_t v) {
     if (g_trace && (v >> 28) == 7) LOG("[ipu] CSC %08x\n", v);
+    { static int n; if (getenv("HP_IPUCMDS") && n < 300) { n++; LOG("[ipu] cmd %08x (unread %u qw, bitpos %llu, in %u)\n", v, unread_qw(), (unsigned long long)bitpos, in_len); } }
     compact_in();
     last_cmd = v;
     pend_cmd = v;
@@ -784,9 +804,16 @@ void ipu_in_qwords(const uint8_t *p, uint32_t nq) {   /* EE writes to the IPU in
     if (pending) run_cmd();
 }
 void ipu_in_kick(void) {   /* toIPU DMA started */
-    if (pending) { run_cmd(); return; }
-    compact_in();
-    pull_qw(FIFO_QW);
+    uint32_t before = in_len;
+    if (pending) run_cmd();
+    else { compact_in(); before = in_len; pull_qw(FIFO_QW); }
+    static int n;
+    if (getenv("HP_IPUCMDS") && n < 100) {
+        n++;
+        LOG("[ipu] toIPU kick (unread %u, pending %d) new data:", unread_qw(), pending);
+        for (uint32_t k = before; k < in_len && k < before + 32; k++) LOG(" %02x", in[k]);
+        LOG("\n");
+    }
 }
 uint32_t ipu_out_qwords(uint8_t *dst, uint32_t nq) {
     uint32_t avail = out_len - out_rd, n = nq < avail ? nq : avail;

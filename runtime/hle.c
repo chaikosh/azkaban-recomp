@@ -124,6 +124,16 @@ void hle_log_mpout1(EE *c) { log_pic("out1", RW(5)); if (g_trace) LOG("[mp] dec 
 void hle_log_mpout2(EE *c) { log_pic("out2a", RW(5)); log_pic("out2b", RW(6)); f_002c8750_orig(c); }
 void hle_log_mpcsc(EE *c) {
     log_pic("csc", RW(5));
+    {   /* HP_MPDUMP: also save the RGB output of the previous conversion (destination = dec+216) */
+        static uint32_t last_dst; static int k;
+        const char *dir = getenv("HP_MPDUMP");
+        if (dir && last_dst && k < 6) {
+            char path[512]; snprintf(path, sizeof path, "%s/rgb%d.bin", dir, k++);
+            FILE *f = fopen(path, "wb");
+            if (f) { fwrite(g_ram + (last_dst & 0x01fffff0u), 1, 1024 * 1024, f); fclose(f); LOG("[mp] rgb dump %s from %08x\n", path, last_dst); }
+        }
+        last_dst = ld32(RW(4) + 216) & 0x0fffffffu;
+    }
     /* HP_MPDUMP=dir: save the raw8 YUV macroblocks of the first pictures handed to CSC */
     static int n;
     const char *dir = getenv("HP_MPDUMP");
@@ -132,6 +142,11 @@ void hle_log_mpcsc(EE *c) {
         char path[512]; snprintf(path, sizeof path, "%s/pic%d_%ux%u.yuv", dir, n++, ld32(p + 12), ld32(p + 16));
         FILE *f = fopen(path, "wb");
         if (f) { fwrite(g_ram + src, 1, mbs * 384, f); fclose(f); LOG("[mp] dumped %s from %08x\n", path, src); }
+        for (int b = 0; b < 3 && n == 2; b++) {   /* all three frame stores at the second conversion */
+            snprintf(path, sizeof path, "%s/buf%d_32x32.yuv", dir, b);
+            f = fopen(path, "wb");
+            if (f) { fwrite(g_ram + 0x119b440 + b * 0x60000, 1, 0x60000, f); fclose(f); }
+        }
     }
     f_002c9008_orig(c);
 }
@@ -146,4 +161,27 @@ void hle_log_mprest(EE *c) {
             ld32(s), ld32(s + 4), ld32(s + 8), ld32(s + 12), ld32(s + 16), ld32(s + 20), ld32(s + 24), bp & 127, (bp >> 8) & 15, (bp >> 16) & 3);
     }
     f_002c9468_orig(c);
+}
+
+void hle_log_mpbits(EE *c) {
+    static int n;
+    uint32_t want = RW(5), ra = RW(31);
+    f_002c7268_orig(c);
+    if (getenv("HP_MPBITS") && n < 600) { n++; LOG("[mpbits] %2u bits -> %x (ra %08x)\n", want, RW(2), ra); }
+}
+
+void hle_log_mppic(EE *c) {
+    static int n;
+    const char *dir = getenv("HP_MPDUMP");
+    uint32_t d = RW(4);
+    if (dir && n < 4) {
+        LOG("[mp] picture %d: refs 440=%08x 444=%08x 452=%08x\n", n, ld32(d + 440), ld32(d + 444), ld32(d + 452));
+        for (int b = 0; b < 3; b++) {
+            char path[512]; snprintf(path, sizeof path, "%s/p%d_buf%d_32x32.yuv", dir, n, b);
+            FILE *f = fopen(path, "wb");
+            if (f) { fwrite(g_ram + 0x119b440 + b * 0x60000, 1, 0x60000, f); fclose(f); }
+        }
+        n++;
+    }
+    f_002c75b0_orig(c);
 }

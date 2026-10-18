@@ -16,3 +16,5 @@
 002c8750          hle_log_mpout2    debug: movie: output frame (two fields)
 002c9008          hle_log_mpcsc     debug: movie: convert frame (IPU CSC)
 002c9468          hle_log_mprest    debug: movie: restore bitstream DMA after CSC
+002c7268          hle_log_mpbits    debug: movie: get bits from the IPU
+002c75b0          hle_log_mppic     debug: movie: picture decode entry (dump frame stores)

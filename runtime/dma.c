@@ -53,6 +53,7 @@ static void spr_transfer(int ch) {
         uint64_t tag;
         memcpy(&tag, ram_or_spr(tadr), 8);
         uint32_t n = tag & 0xffff, id = (tag >> 28) & 7, addr = (uint32_t)(tag >> 32) & 0x7ffffff0u;
+        { static int nl; if (getenv("HP_SPRTAGS") && nl < 400) { nl++; LOG("[spr9 tag] chcr %08x tadr %08x id %u n %u addr %08x irq %u sadr %04x\n", chcr, tadr, id, n, addr, (unsigned)((tag >> 31) & 1), sadr); } }
         uint32_t src = (id == 1 || id == 2 || id == 7 || id == 0) ? (id == 0 || id == 7 ? addr : tadr + 16) : addr;
         if (id == 3 || id == 4) src = addr;
         for (uint32_t k = 0; k < n; k++) { memcpy(g_spr + (sadr & 0x3ff0), ram_or_spr(src + 16 * k), 16); sadr += 16; }

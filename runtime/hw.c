@@ -157,7 +157,7 @@ uint32_t mmio_r32(uint32_t a) {
         case 0x3020: return 0;                       /* GIF_STAT: idle */
         case 0x3c00: return 0;                       /* VIF1_STAT: idle */
         case 0x3800: return 0;                       /* VIF0_STAT */
-        case 0x2000: case 0x2010: case 0x2020: case 0x2030: { extern uint32_t ipu_read(uint32_t); return ipu_read(off - 0x2000); }
+        case 0x2000: case 0x2004: case 0x2010: case 0x2020: case 0x2030: case 0x2034: { extern uint32_t ipu_read(uint32_t); return ipu_read(off - 0x2000); }
         }
         uint32_t v = sh32(eeregs, off);
         if (g_trace) note("read", p, v);

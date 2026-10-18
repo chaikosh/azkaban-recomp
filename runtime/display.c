@@ -42,7 +42,7 @@ void display_vsync(void) {
     /* HP_SHOT=dir: write frame_<vsync>.ppm every 60 vsyncs */
     static const char *shot = (const char *)1;
     if (shot == (const char *)1) shot = getenv("HP_SHOT");
-    if (shot && g_vsyncs % 60 == 0) {
+    if (shot && g_vsyncs % (getenv("HP_SHOTEVERY") ? atoi(getenv("HP_SHOTEVERY")) : 60) == 0) {
         char path[1100];
         snprintf(path, sizeof path, "%s/frame_%05llu.ppm", shot, g_vsyncs);
         FILE *f = fopen(path, "wb");
