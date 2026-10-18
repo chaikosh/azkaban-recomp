@@ -62,6 +62,7 @@ std::mutex g_q_lock;
 std::condition_variable g_q_cv, g_q_done_cv;
 std::deque<Item> g_queue;
 std::size_t g_queued_bytes = 0;
+int g_shows_queued = 0;   // frame requests not yet run by the GS thread (g_q_lock)
 bool g_gs_busy = false, g_threaded = false;
 std::vector<Batch> g_free;   // rendered batches with their capacity kept (g_q_lock)
 
@@ -127,6 +128,7 @@ void gs_thread() {
         Item it = std::move(g_queue.front());
         g_queue.pop_front();
         g_queued_bytes -= it.batch.data.size();
+        if (it.show) --g_shows_queued;
         g_gs_busy = true;
         ql.unlock();
         {
@@ -154,14 +156,21 @@ void post_locked(bool show, const Show *regs) {
     Item it;
     if (show) { it.show = true; it.regs = *regs; }
     std::unique_lock<std::mutex> ql(g_q_lock);
+    // Latency: the GS may run at most ~2 frames behind (the controls felt late with 16 MB of
+    // queued GIF data), and a frame request waits while an earlier one is still queued.
+    if (it.show && g_shows_queued > 0) {
+        it.show = false;
+        if (g_pend.data.empty()) return;
+    }
     std::swap(it.batch, g_pend);
     if (!g_free.empty()) {   // gather the next batch into a buffer that is already mapped
         g_pend = std::move(g_free.back());
         g_free.pop_back();
     }
     // a GS far behind holds up the producers, like a full GIF FIFO
-    g_q_done_cv.wait(ql, [] { return g_queued_bytes < (16u << 20); });
+    g_q_done_cv.wait(ql, [] { return g_queued_bytes < (4u << 20); });
     g_queued_bytes += it.batch.data.size();
+    if (it.show) ++g_shows_queued;
     g_queue.push_back(std::move(it));
     g_q_cv.notify_one();
 }

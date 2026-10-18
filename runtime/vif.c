@@ -26,8 +26,12 @@ static Vif v1;
 unsigned long long g_vif1_words;
 #include <pthread.h>
 /* Words arriving while the VIF is stalled (or behind stalled data) wait here. */
-#define VQ_SIZE (1u << 20)
+/* The queue grows instead of dropping words: a lost word desyncs the VIF command stream (the
+   iPhone hung after "queue overflow": unknown VIF commands, then garbage VU1 code). */
+static uint32_t vq_cap;   /* a power of two */
+#define VQ_SIZE vq_cap
 static uint32_t *vq;
+static void vq_reserve(uint32_t more);
 static uint32_t vq_head, vq_tail;
 static int dma1_deferred;
 static uint32_t dma1_qwords;
@@ -447,10 +451,24 @@ void vif1_path3_idle(void) {
     vif1_drain_locked();
 }
 
+static void vq_reserve(uint32_t more) {
+    uint32_t used = vq_tail - vq_head;
+    if (vq && used + more <= vq_cap) return;
+    uint32_t cap = vq_cap ? vq_cap : 1u << 20;
+    while (used + more > cap) cap <<= 1;
+    uint32_t *n = malloc((size_t)cap * sizeof *n);
+    for (uint32_t k = 0; k < used; k++) n[k] = vq[(vq_head + k) & (vq_cap - 1)];
+    free(vq);
+    vq = n;
+    vq_cap = cap;
+    vq_head = 0;
+    vq_tail = used;
+    if (cap > (1u << 20)) LOG("[vif1] queue grown to %u words (%u queued)\n", cap, used + more);
+}
+
 void vif1_word(uint32_t w) {
-    if (!vq) vq = malloc(VQ_SIZE * sizeof(uint32_t));
     if (stalled || path3_wait || vq_head != vq_tail) {
-        if (vq_tail - vq_head >= VQ_SIZE) { LOG("[vif1] queue overflow\n"); return; }
+        vq_reserve(1);
         vq[vq_tail & (VQ_SIZE - 1)] = w;
         vq_tail++;
         return;
@@ -468,12 +486,11 @@ int vif1_dma_done(uint32_t qwords) {
 
 /* Data words straight from the DMA engine (lock held). */
 void vif1_words(const uint32_t *w, uint32_t n) {
-    if (!vq) vq = malloc(VQ_SIZE * sizeof(uint32_t));
     uint32_t i = 0;
     if (!stalled && !path3_wait && vq_head == vq_tail) i = vif1_exec_block(w, n);   /* timed by the DMA caller (g_prof[0]) */
     if (i < n) {   /* the rest waits in the queue */
         uint32_t left = n - i;
-        if (vq_tail - vq_head + left > VQ_SIZE) { LOG("[vif1] queue overflow\n"); left = VQ_SIZE - (vq_tail - vq_head); }
+        vq_reserve(left);
         while (left) {
             uint32_t at = vq_tail & (VQ_SIZE - 1), run = VQ_SIZE - at < left ? VQ_SIZE - at : left;
             memcpy(&vq[at], w + i, run * 4);
