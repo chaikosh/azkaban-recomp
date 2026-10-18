@@ -91,11 +91,11 @@ void rt_watch_hit(uint32_t a, uint64_t v, int size) {
     if (c && *wr_val && v == strtoull(wr_val, NULL, 16)) {   /* call chain leading here: last ring entries, function changes only */
         char line[4096]; int k = 0; char last[64] = "";
         uint32_t end = c->pcidx;
-        for (uint32_t i = end > 400 ? end - 400 : 0; i < end; i++) {
-            char fn[64]; snprintf(fn, sizeof fn, "%s", rt_func_name(c->pcring[i & 511])); char *pl = strchr(fn, '+'); if (pl) *pl = 0;
+        for (uint32_t i = end > 4000 ? end - 4000 : 0; i < end; i++) {
+            char fn[64]; snprintf(fn, sizeof fn, "%s", rt_func_name(c->pcring[i & 4095])); char *pl = strchr(fn, '+'); if (pl) *pl = 0;
             if (!strcmp(fn, last)) continue;
             snprintf(last, sizeof last, "%s", fn);
-            k += snprintf(line + k, sizeof line - k, " %s", rt_func_name(c->pcring[i & 511]));
+            k += snprintf(line + k, sizeof line - k, " %s", rt_func_name(c->pcring[i & 4095]));
             if (k > 3800) { LOG("[watchring]%s\n", line); k = 0; }
         }
         LOG("[watchring]%s\n", line);
@@ -193,6 +193,8 @@ void rt_usr1_work(void) {
         FILE *f = fopen(vd, "wb");
         if (f) { fwrite(g_vram, 1, 4u << 20, f); fclose(f); LOG("[gs] VRAM dumped to %s\n", vd); }
     }
+    const char *rd = getenv("HP_RAMDUMP");
+    if (rd) { FILE *f = fopen(rd, "wb"); if (f) { fwrite(g_ram, 1, RAM_SIZE, f); fclose(f); LOG("[mem] RAM dumped to %s\n", rd); } }
     const char *peek = getenv("HP_PEEK");   /* "addr:len,addr:len" (hex) */
     while (peek && *peek) {
         char *end;

@@ -528,7 +528,8 @@ static void cmd_bdec(uint32_t v) {
     cbp_reg = dec.cbp;
     out_push(dec.mb16, 48);
 }
-static unsigned bdec_count, vdec_count;
+static unsigned bdec_count, vdec_count, csc_count, pack_count, idec_count;
+static unsigned long long out_qw_total, out_qw_nonzero;
 
 static void cmd_vdec(uint32_t v) {
     skip(v & 63);
@@ -641,8 +642,8 @@ static void exec_cmd(uint32_t v) {
         break;
     }
     case 6: for (int k = 0; k < 16; k++) { uint32_t lo = getb(8), hi = getb(8); vqclut[k] = (uint16_t)(lo | (hi << 8)); } break;   /* SETVQ */
-    case 7: cmd_csc(v); break;
-    case 8: cmd_pack(v); break;
+    case 7: csc_count++; cmd_csc(v); break;
+    case 8: pack_count++; cmd_pack(v); break;
     case 9: th0 = v & 0x1ff; th1 = (v >> 16) & 0x1ff; break;                       /* SETTH */
     default: {
         static int n;
@@ -683,8 +684,8 @@ void ipu_write_ctrl(uint32_t v) {
 }
 
 void ipu_stats(void) {
-    LOG("[stats] ipu: bdec %u vlc errors %u bdec without output %u, in %u bytes bitpos %llu pending %d\n", bdec_count,
-        g_ipu_vlc_errors, g_ipu_bdec_nooutput, in_len, (unsigned long long)bitpos, pending);
+    LOG("[stats] ipu: bdec %u csc %u pack %u vlc errors %u bdec without output %u, in %u bytes bitpos %llu pending %d, out qw %llu nonzero %llu\n", bdec_count, csc_count, pack_count,
+        g_ipu_vlc_errors, g_ipu_bdec_nooutput, in_len, (unsigned long long)bitpos, pending, out_qw_total, out_qw_nonzero);
 }
 
 uint32_t ipu_read(uint32_t off) {
@@ -720,6 +721,7 @@ static void from_drain(void) {
     while (from_active && from_qwc && out_rd < out_len) {
         uint32_t a = from_madr;
         uint8_t *dst = ((a & 0x80000000u) || (a >> 28) == 7) ? g_spr + (a & 0x3ff0) : g_ram + (a & 0x01fffff0u);
+        out_qw_total++; if (out[out_rd].d[0] | out[out_rd].d[1]) out_qw_nonzero++;
         memcpy(dst, &out[out_rd++], 16);
         from_madr += 16;
         from_qwc--;
@@ -728,6 +730,9 @@ static void from_drain(void) {
     if (from_active && !from_qwc) { from_active = 0; dma_finish(3); }
 }
 void ipu_from_dma_start(uint32_t madr, uint32_t qwc) {
+    { static long tl = -2; if (tl == -2) tl = getenv("HP_TAGLOG") ? atol(getenv("HP_TAGLOG")) : -1;
+      extern unsigned long long g_vsyncs;
+      if (tl >= 0 && (long)g_vsyncs >= tl && (long)g_vsyncs < tl + 60) LOG("[fromipu v%llu] madr %08x qwc %u (out avail %u)\n", g_vsyncs, madr, qwc, out_len - out_rd); }
     from_madr = madr; from_qwc = qwc; from_active = 1;
     from_drain();
 }
@@ -746,6 +751,7 @@ void ipu_in_qwords(const uint8_t *p, uint32_t nq) {
 uint32_t ipu_out_qwords(uint8_t *dst, uint32_t nq) {
     uint32_t avail = out_len - out_rd, n = nq < avail ? nq : avail;
     memcpy(dst, out + out_rd, n * sizeof(U128));
+    for (uint32_t k = 0; k < n; k++) { out_qw_total++; if (((U128 *)(out + out_rd))[k].d[0] | ((U128 *)(out + out_rd))[k].d[1]) out_qw_nonzero++; }
     out_rd += n;
     if (out_rd == out_len) out_rd = out_len = 0;
     return n;

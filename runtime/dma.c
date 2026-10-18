@@ -1,5 +1,6 @@
 /* DMA controller channels and the VIF/GIF/IPU FIFOs (stubs until the GS work). */
 #include "rt.h"
+#include <stdlib.h>
 #include <pthread.h>
 #include "gs.h"
 #include <time.h>
@@ -30,6 +31,15 @@ static void spr_transfer(int ch) {
     uint32_t chcr = mmio_r32(base[ch]), madr = mmio_r32(base[ch] + 0x10), qwc = mmio_r32(base[ch] + 0x20) & 0xffff;
     uint32_t sadr = mmio_r32(base[ch] + 0x80) & 0x3ff0;
     int mode = (chcr >> 2) & 3;
+    {
+        static long tl = -2; if (tl == -2) tl = getenv("HP_TAGLOG") ? atol(getenv("HP_TAGLOG")) : -1;
+        extern unsigned long long g_vsyncs;
+        if (tl >= 0 && (long)g_vsyncs >= tl && (long)g_vsyncs < tl + 60) {
+            uint32_t nz = 0;
+            for (uint32_t k = 0; k < qwc; k++) { const uint8_t *q = ch == 8 ? g_spr + ((sadr + 16 * k) & 0x3ff0) : ram_or_spr(madr + 16 * k); uint64_t a, b; memcpy(&a, q, 8); memcpy(&b, q + 8, 8); if (a | b) nz++; }
+            LOG("[spr%d v%llu] mode %d madr %08x sadr %04x qwc %u nonzero %u sqwc %08x\n", ch, g_vsyncs, mode, madr, sadr, qwc, nz, mmio_r32(0x1000e030u));
+        }
+    }
     if (ch == 8 || mode == 0) {
         for (uint32_t k = 0; k < qwc; k++) {
             uint8_t *mem = ram_or_spr(madr + 16 * k), *spr = g_spr + ((sadr + 16 * k) & 0x3ff0);
@@ -78,6 +88,7 @@ void dma_stats(void) {
     lp = g_gs_prims; lpx = g_gs_pixels; lvu = g_vu1_insns; lvw = g_vif1_words;
     extern unsigned g_snd_acks, g_snd_updates;
     LOG("[stats] snd updates %u acks %u\n", g_snd_updates, g_snd_acks);
+    { extern unsigned long long g_fifo1_qw, g_fifo1_nz; LOG("[stats] vif1 fifo qwords %llu nonzero %llu\n", g_fifo1_qw, g_fifo1_nz); }
     extern void vif_stats(void), gs_fb_stats(void), ipu_stats(void);
     vif_stats();
     gs_fb_stats();
@@ -184,6 +195,16 @@ static void dma_run(int ch, DmaSink sink, int tte) {
     int mode = (chcr >> 2) & 3;
     if (mode == 0 || qwc) {
         /* normal transfer, also the pending QWC of a chain before its tags */
+        {
+            static long tl = -2; if (tl == -2) tl = getenv("HP_TAGLOG") ? atol(getenv("HP_TAGLOG")) : -1;
+            extern unsigned long long g_vsyncs;
+            if (ch == 1 && tl >= 0 && (long)g_vsyncs >= tl && (long)g_vsyncs < tl + 60) {
+                uint32_t nz = 0;
+                for (uint32_t k = 0; k < qwc; k++) { const U128 *q = dma_ptr(madr + 16 * k); if (q->d[0] | q->d[1]) nz++; }
+                LOG("[dma1n v%llu] mode %d madr %08x qwc %u nonzero %u first %016llx %016llx\n", g_vsyncs, mode, madr, qwc, nz,
+                    (unsigned long long)dma_ptr(madr)->d[0], (unsigned long long)dma_ptr(madr)->d[1]);
+            }
+        }
         for (uint32_t k = 0; k < qwc; k++) sink(dma_ptr(madr + 16 * k), 1, 0);
         if (mode == 0) return;
     }
@@ -212,6 +233,17 @@ static void dma_run(int ch, DmaSink sink, int tte) {
             if (asp > 0) next = asr[--asp]; else { next = 0; end = 1; }
             break;
         default: data = tadr + 16; next = 0; end = 1; break;                 /* end */
+        }
+        {   /* HP_TAGLOG=<vsync>: log channel-1 chain tags for 60 vsyncs from there */
+            static long tl = -2; if (tl == -2) tl = getenv("HP_TAGLOG") ? atol(getenv("HP_TAGLOG")) : -1;
+            extern unsigned long long g_vsyncs;
+            if ((ch == 1 || ch == 2) && tl >= 0 && (long)g_vsyncs >= tl && (long)g_vsyncs < tl + 60) {
+                const U128 *d0 = n ? dma_ptr(data) : NULL;
+                uint32_t nz = 0;
+                for (uint32_t k = 0; k < n; k++) { const U128 *q = dma_ptr(data + 16 * k); if (q->d[0] | q->d[1]) nz++; }
+                LOG("[tag%d v%llu] tadr %08x id %u n %u addr %08x data %08x nonzero %u first %016llx\n", ch, g_vsyncs, tadr, id, n, addr, data, nz,
+                    d0 ? (unsigned long long)d0->d[0] : 0ull);
+            }
         }
         for (uint32_t k = 0; k < n; k++) sink(dma_ptr(data + 16 * k), 1, 0);
         if (end) break;
@@ -245,7 +277,9 @@ static void gif_sink(const U128 *q, uint32_t n, int is_tag) {
     if (!is_tag) gif_feed(2, q, n);
 }
 
+unsigned long long g_fifo1_qw, g_fifo1_nz;
 void fifo_write(int which, U128 v) {
+    if (which == 1) { g_fifo1_qw++; if (v.d[0] | v.d[1]) g_fifo1_nz++; }
     extern void gif_feed(int path, const U128 *q, uint32_t n);
     if (which == 2) { pthread_mutex_lock(&g_gs_lock); gif_feed(2, &v, 1); pthread_mutex_unlock(&g_gs_lock); return; }
     if (which == 1) { pthread_mutex_lock(&g_gs_lock); vif1_qword(&v, 0); pthread_mutex_unlock(&g_gs_lock); return; }

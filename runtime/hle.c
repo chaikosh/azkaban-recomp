@@ -83,3 +83,32 @@ void hle_log_stream(EE *c) {
     if (g_trace && n < 300 && (memcmp(v, last, sizeof v) || calls % 50 == 0)) { n++; memcpy(last, v, sizeof v);
         LOG("[stream v%llu] handle %08x obj %08x +56=%08x aux %08x +8=%08x -> %u\n", g_vsyncs, h, obj, v[0], aux, v[1], (unsigned)RW(2)); }
 }
+
+static void guest_str(uint32_t a, char *out, int n) { for (int i = 0; i < n - 1; i++) { out[i] = (char)ld8(a + i); if (!out[i]) return; } out[n - 1] = 0; }
+void hle_log_lsload(EE *c) {
+    extern unsigned long long g_vsyncs;
+    char name[96]; guest_str(RW(5), name, sizeof name);
+    uint32_t obj = RW(4), st0 = ld32(obj + 12);
+    f_002c06f0_orig(c);
+    if (g_trace) LOG("[ls v%llu tick %u] load '%s' arg %08x: state %u -> %u\n", g_vsyncs, ld32(0x483390u), name, RW(6), st0, ld32(obj + 12));
+}
+void hle_log_lssusp(EE *c) {
+    extern unsigned long long g_vsyncs;
+    uint32_t obj = RW(4), st0 = ld32(obj + 12), ra = RW(31);
+    f_002c0ef8_orig(c);
+    if (g_trace) LOG("[ls v%llu tick %u] suspend (ra %08x): state %u -> %u\n", g_vsyncs, ld32(0x483390u), ra, st0, ld32(obj + 12));
+}
+void hle_log_lsresume(EE *c) {
+    extern unsigned long long g_vsyncs;
+    uint32_t obj = RW(4), st0 = ld32(obj + 12), ra = RW(31);
+    f_002c0f48_orig(c);
+    if (g_trace) LOG("[ls v%llu tick %u] resume (ra %08x): state %u -> %u\n", g_vsyncs, ld32(0x483390u), ra, st0, ld32(obj + 12));
+}
+
+/* f_00467230: "no package load pending" (state < 2).  f_002bd678 spins on it before opening a file
+   from disc.  When the loader is suspended mid-load (state 2) nothing can change while the caller
+   spins, so treat that as "not pending" too; the real console never seems to hit this ordering. */
+void hle_loader_idle(EE *c) {
+    uint32_t st = ld32(RW(4) + 12);
+    R(2) = SX(st != 3 ? 1u : 0u);
+}

@@ -843,7 +843,8 @@ static void xfer_start(void) {
     if (xl < 0) xl = getenv("HP_XFERLOG") ? atoi(getenv("HP_XFERLOG")) : 0;
     if (xl > 0) {
         xl--;
-        LOG("[gs xfer] path %d dir %d src bp %llx bw %llu psm %llx -> dst bp %llx bw %llu psm %llx, %ux%u at %llu,%llu\n", cur_path, dir,
+        extern unsigned long long g_vsyncs;
+        LOG("[gs xfer v%llu] path %d dir %d src bp %llx bw %llu psm %llx -> dst bp %llx bw %llu psm %llx, %ux%u at %llu,%llu\n", g_vsyncs, cur_path, dir,
             (unsigned long long)bits(bb, 0, 14), (unsigned long long)bits(bb, 16, 6), (unsigned long long)bits(bb, 24, 6),
             (unsigned long long)bits(bb, 32, 14), (unsigned long long)bits(bb, 48, 6), (unsigned long long)bits(bb, 56, 6), w, h,
             (unsigned long long)bits(gs.trxpos, 32, 11), (unsigned long long)bits(gs.trxpos, 48, 11));
@@ -875,8 +876,10 @@ static void xfer_start(void) {
 }
 
 /* IMAGE data for a host->local transfer, 64 bits at a time */
+static unsigned long long xfer_words, xfer_nonzero;
 static void xfer_data(uint64_t v) {
     if (!xfer.active) return;
+    xfer_words++; if (v) xfer_nonzero++;
     switch (xfer.dpsm) {
     case PSMCT32: case PSMZ32:
         xfer_put_pixel((uint32_t)v); xfer_put_pixel((uint32_t)(v >> 32)); break;
@@ -899,7 +902,11 @@ static void xfer_data(uint64_t v) {
         for (int k = 0; k < 16; k++) xfer_put_pixel((uint32_t)(v >> (4 * k)) & 0xf);
         break;
     }
-    if (xfer.y >= xfer.h) xfer.active = 0;
+    if (xfer.y >= xfer.h) {
+        xfer.active = 0;
+        if (getenv("HP_XFERLOG")) { extern unsigned long long g_vsyncs; LOG("[gs xfer v%llu] done dst bp %x: %llu words, %llu nonzero\n", g_vsyncs, xfer.dbp, xfer_words, xfer_nonzero); }
+        xfer_words = xfer_nonzero = 0;
+    }
 }
 
 /* ---- register writes ----------------------------------------------------------------- */

@@ -202,7 +202,16 @@ static int cd_ncmd(uint32_t fno, uint8_t *in, uint32_t n, uint8_t *out, uint32_t
            completion deadlocks them.  HP_CDLAT=base_us,per_sector_us (default 1500,600). */
         static int64_t base_us = -1, per_us;
         if (base_us < 0) { base_us = 1500; per_us = 600; const char *e = getenv("HP_CDLAT"); if (e) { base_us = atoll(e); const char *q = strchr(e, ','); if (q) per_us = atoll(q + 1); } }
-        g_rpc_latency_ns = (uint64_t)(base_us + per_us * (int64_t)cnt) * 1000u;
+        /* plus a seek when the head is not already there: ~8 ms + up to ~120 ms full stroke (HP_CDSEEK=base_us,full_us) */
+        static int64_t seek_us = -1, full_us, last_end = -1;
+        if (seek_us < 0) { seek_us = 8000; full_us = 120000; const char *e = getenv("HP_CDSEEK"); if (e) { seek_us = atoll(e); const char *q = strchr(e, ','); if (q) full_us = atoll(q + 1); } }
+        int64_t lat_us = base_us + per_us * (int64_t)cnt;
+        if (last_end >= 0 && (int64_t)lsn != last_end) {
+            int64_t d = (int64_t)lsn - last_end; if (d < 0) d = -d;
+            lat_us += seek_us + full_us * d / 2200000;
+        }
+        last_end = (int64_t)lsn + cnt;
+        g_rpc_latency_ns = (uint64_t)lat_us * 1000u;
         ret1(out, cap, len, 1);
         return 0;
     }

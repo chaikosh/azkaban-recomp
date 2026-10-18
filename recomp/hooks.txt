@@ -8,3 +8,7 @@
 0044b210          hle_log_addcmd    debug: sceSifAddCmdHandler
 0032d120          hle_log_sndcmd    debug: EA snd SIF cmd 3 handler
 002bd678          hle_log_fopen     debug: file open by name
+002c06f0          hle_log_lsload    debug: loading screen: start content load
+002c0ef8          hle_log_lssusp    debug: loading screen: suspend
+002c0f48          hle_log_lsresume  debug: loading screen: resume
+00467230          hle_loader_idle   package loader "may open": wait only while a load can still progress (state 3)

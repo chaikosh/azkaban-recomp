@@ -349,8 +349,8 @@ void kern_dump_threads(void) {
             char last[96] = "";
             char line[4096]; int n = 0;
             uint32_t end = c->pcidx;   /* snapshot: the thread may still be running */
-            for (uint32_t k = end > 512 ? end - 512 : 0; k < end; k++) {
-                const char *nm = rt_func_name(c->pcring[k & 511]);
+            for (uint32_t k = end > 4096 ? end - 4096 : 0; k < end; k++) {
+                const char *nm = rt_func_name(c->pcring[k & 4095]);
                 char fn[96]; snprintf(fn, sizeof fn, "%s", nm); char *pl = strchr(fn, '+'); if (pl) *pl = 0;
                 if (!strcmp(fn, last)) continue;
                 snprintf(last, sizeof last, "%s", fn);

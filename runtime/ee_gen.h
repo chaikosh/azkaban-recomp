@@ -16,7 +16,7 @@ extern const uint32_t g_entry_point;
 #endif
 
 #ifdef TRACE_PC
-#define BB(a) (c->pc = (a), c->pcring[c->pcidx++ & 511] = (a))
+#define BB(a) (c->pc = (a), c->pcring[c->pcidx++ & 4095] = (a))
 #else
 #define BB(a) ((void)0)
 #endif
