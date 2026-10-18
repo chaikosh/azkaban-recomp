@@ -140,7 +140,9 @@ void dma_stats(void) {
 pthread_mutex_t g_gs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t rq_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t rq_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t rq_idle_cv = PTHREAD_COND_INITIALIZER;
 static int rq[32], rq_head, rq_tail, rthread_started;
+static int r_busy;   /* the render thread is running a job it has taken off the queue */
 
 static void render_channel(int ch) {
     extern double g_prof[8];
@@ -180,11 +182,33 @@ static void *render_thread(void *arg) {
         while (rq_head == rq_tail) pthread_cond_wait(&rq_cv, &rq_m);
         int ch = rq[rq_head];
         rq_head = (rq_head + 1) % 32;
+        r_busy = 1;
         pthread_mutex_unlock(&rq_m);
-        if (ch == 16) { extern void vif1_drain_job(void); vif1_drain_job(); continue; }
-        render_channel(ch);
+        if (ch == 16) { extern void vif1_drain_job(void); vif1_drain_job(); }
+        else render_channel(ch);
+        pthread_mutex_lock(&rq_m);
+        r_busy = 0;
+        if (rq_head == rq_tail) pthread_cond_broadcast(&rq_idle_cv);
+        pthread_mutex_unlock(&rq_m);
     }
     return NULL;
+}
+
+/* GS work has to reach the GS in the order the EE issued it, like one GIF would see it.  Work
+   that the EE thread does itself (VIF1 resumed by STC, FIFO writes) may only run right away
+   when the render thread has nothing queued or running; otherwise it would overtake a DMA
+   kicked earlier, e.g. draw with textures whose PATH3 upload is still waiting in the queue. */
+int render_idle(void) {
+    pthread_mutex_lock(&rq_m);
+    int idle = rq_head == rq_tail && !r_busy;
+    pthread_mutex_unlock(&rq_m);
+    return idle;
+}
+
+void render_wait_idle(void) {
+    pthread_mutex_lock(&rq_m);
+    while (rq_head != rq_tail || r_busy) pthread_cond_wait(&rq_idle_cv, &rq_m);
+    pthread_mutex_unlock(&rq_m);
 }
 
 /* Queue work for the render thread: a DMA channel (1, 2) or a job (16 = resume VIF1 after STC). */
@@ -383,8 +407,8 @@ unsigned long long g_fifo1_qw, g_fifo1_nz;
 void fifo_write(int which, U128 v) {
     if (which == 1) { g_fifo1_qw++; if (v.d[0] | v.d[1]) g_fifo1_nz++; }
     extern void gif_feed(int path, const U128 *q, uint32_t n);
-    if (which == 2) { pthread_mutex_lock(&g_gs_lock); gif_feed(2, &v, 1); pthread_mutex_unlock(&g_gs_lock); return; }
-    if (which == 1) { pthread_mutex_lock(&g_gs_lock); vif1_qword(&v, 0); pthread_mutex_unlock(&g_gs_lock); return; }
+    if (which == 2) { render_wait_idle(); pthread_mutex_lock(&g_gs_lock); gif_feed(2, &v, 1); pthread_mutex_unlock(&g_gs_lock); return; }
+    if (which == 1) { render_wait_idle(); pthread_mutex_lock(&g_gs_lock); vif1_qword(&v, 0); pthread_mutex_unlock(&g_gs_lock); return; }
     if (which == 3) { extern void ipu_in_qwords(const uint8_t *p, uint32_t nq); ipu_in_qwords((const uint8_t *)&v, 1); return; }
     static int seen[4];
     if (!seen[which]++) LOG("[fifo] first write to FIFO %d\n", which);

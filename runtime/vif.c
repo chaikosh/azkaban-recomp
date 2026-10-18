@@ -78,7 +78,10 @@ void vif1_reg_write(uint32_t off, uint32_t val) {
             { extern void synclog(const char *, ...); synclog("vif1 STC (queued %u words)", vq_tail - vq_head); }
             stalled = 0;
             resume = vq_head != vq_tail || dma1_deferred;
-            if (sync_drain() && resume) { vif1_drain_locked(); resume = 0; }
+            /* only when no earlier DMA (e.g. the PATH3 texture upload the interrupt handler has just
+               kicked) is still waiting for the render thread; otherwise resume behind it */
+            extern int render_idle(void);
+            if (sync_drain() && resume && render_idle()) { vif1_drain_locked(); resume = 0; }
         }
         pthread_mutex_unlock(&g_gs_lock);
         if (resume) { extern void render_post(int job); render_post(RENDER_JOB_VIF1_DRAIN); }
