@@ -15,7 +15,25 @@ typedef struct {
     uint32_t mac, status, clip;
     uint32_t pc;          /* in instruction pairs */
     uint32_t top, itop;
+    float qn;             /* FDIV result on its way to Q ... */
+    int qw;               /* ... arriving after this many more pairs (0: none pending) */
 } VU1;
+
+/* FDIV latency: DIV and SQRT write Q 7 cycles after they issue, RSQRT 13; until then Q keeps its
+   old value.  Software-pipelined loops depend on it, e.g. the 3D renderer's clipper starts the
+   next vertex's DIV and multiplies the current vertex by Q in the following pair; reading the new
+   Q there projects the vertex with the wrong 1/w (huge stretched triangles).  One pair counts as
+   one cycle.  WAITQ, or another FDIV instruction, waits for the pending result first. */
+#define VU_QLAT_DIV 7
+#define VU_QLAT_RSQRT 13
+static inline int vu_lower_waits_q(uint32_t lo) {   /* WAITQ, DIV, SQRT, RSQRT */
+    if ((lo >> 25) != 0x40 || (lo & 63) < 0x3c) return 0;
+    uint32_t code = (((lo >> 6) & 31) << 2) | (lo & 3);
+    return code >= 56 && code <= 59;
+}
+static inline void vu_q_flush(VU1 *v) { if (v->qw) { v->q = v->qn; v->qw = 0; } }
+static inline void vu_q_start(VU1 *v, float x, int lat) { v->qn = x; v->qw = lat; }
+static inline void vu_q_tick(VU1 *v) { if (v->qw && !--v->qw) v->q = v->qn; }
 
 /* Where a recompiled program hands over to the interpreter (a case it does not compile). */
 typedef struct {

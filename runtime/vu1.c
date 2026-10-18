@@ -245,19 +245,16 @@ static int lower(uint32_t op, uint32_t pc, uint32_t *target, V4 *lout, int *lreg
             *vi_reg = it; *vi_val = a;
             return 0;
         }
-        case 56: {   /* DIV */
-            float a = vin(s.f[fsf]), b = vin(t.f[ftf]);
-            if (b == 0.0f) { union { float f; uint32_t u; } c = {a}, d = {b}; c.u = ((c.u ^ d.u) & 0x80000000u) | 0x7f7fffffu; vu.q = c.f; }
-            else vu.q = vclampf(a / b);
+        case 56:   /* DIV */
+            vu_q_start(&vu, vdiv(vin(s.f[fsf]), vin(t.f[ftf])), VU_QLAT_DIV);
             return 0;
-        }
-        case 57: vu.q = sqrtf(fabsf(vin(t.f[ftf]))); return 0;
-        case 58: {
+        case 57: vu_q_start(&vu, sqrtf(fabsf(vin(t.f[ftf]))), VU_QLAT_DIV); return 0;   /* SQRT */
+        case 58: {   /* RSQRT */
             float d = sqrtf(fabsf(vin(t.f[ftf])));
-            vu.q = d == 0.0f ? 3.402823e38f : vclampf(vin(s.f[fsf]) / d);
+            vu_q_start(&vu, d == 0.0f ? 3.402823e38f : vclampf(vin(s.f[fsf]) / d), VU_QLAT_RSQRT);
             return 0;
         }
-        case 59: return 0;   /* WAITQ */
+        case 59: return 0;   /* WAITQ: the pair waited for Q before it issued (interp) */
         case 60: *vi_reg = it; *vi_val = (uint16_t)s.u[fsf]; return 0;              /* MTIR */
         case 61: for (int k = 0; k < 4; k++) r.i[k] = (int16_t)VI_IS; *lout = r; *lreg = ft; return 0;   /* MFIR */
         case 62: {   /* ILWR */
@@ -621,6 +618,7 @@ static void interp(int ending, int branch_pending, uint32_t branch_target) {
         uint32_t tgt = 0;
         int br = 0;
         xgkick_pending = -1;
+        if (!(up & 0x80000000u) && vu_lower_waits_q(lo)) vu_q_flush(&vu);   /* WAITQ / busy FDIV stall the pair */
         upper(up, &ures, &ureg, &udest, &uacc);
         if (!(up & 0x80000000u)) br = lower(lo, pc, &tgt, &lres, &lreg, &ldest, &vireg, &vival);
         else { lreg = -1; }
@@ -630,6 +628,7 @@ static void interp(int ending, int branch_pending, uint32_t branch_target) {
         if (uacc) for (int k = 0; k < 4; k++) if (udest & (8 >> k)) vu.acc.u[k] = ures.u[k];
         if (vireg > 0) vu.vi[vireg] = vival;
         if (up & 0x80000000u) { union { uint32_t u; float f; } c = {lo}; vu.i = c.f; }
+        vu_q_tick(&vu);
         /* XGKICK: the GIF starts reading the packet a little later, so the pair after the kick can
            still finish its tag (games write NLOOP right after XGKICK); kick one pair late */
         if (xgkick_due >= 0) { vu1_xgkick((uint32_t)xgkick_due); xgkick_due = -1; }
@@ -641,6 +640,7 @@ static void interp(int ending, int branch_pending, uint32_t branch_target) {
         vu.pc = next & 0x7ff;
         if (ending) {
             if (xgkick_due >= 0) { vu1_xgkick((uint32_t)xgkick_due); xgkick_due = -1; }
+            vu_q_flush(&vu);   /* the FDIV finishes after the program; the next one sees its Q */
             return;
         }
         if (up & 0x40000000u) ending = 1;   /* E bit: one more pair runs */

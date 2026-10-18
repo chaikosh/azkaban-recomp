@@ -148,6 +148,7 @@ struct Batch {
 
 struct SetupCache {
     std::uint32_t generation = ~0u, clut = ~0u;
+    int level = 0;
     std::uint64_t attr = ~0ull;
     std::uint32_t setup[kSetupWords] = {};
     std::uint32_t flags = 0;
@@ -970,7 +971,29 @@ void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t 
     wgpuBufferUnmap(g_readback);
 }
 
-std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) {
+/* GS level of detail for a whole primitive (this renderer samples one mip level per primitive):
+   the finest level any of its vertices needs, LOD = log2(1/|Q|) * 2^L + K (K with LCM).  Games
+   stream only the coarse levels of distant objects and leave TBP0 = 0, so level 0 must not be
+   sampled when TEX1 says otherwise.  UV (FST) primitives have no Q and stay on level 0. */
+int mip_level(const Context &c, std::uint64_t attr, const Vertex *v, int count) {
+    if (!(attr & 0x10u) || (attr & 0x100u)) return 0;
+    const std::uint64_t t1 = c.tex1;
+    const int mxl = std::min(static_cast<int>(t1 >> 2) & 7, 6), mmin = static_cast<int>(t1 >> 6) & 7;
+    if (mmin < 2 || mmin > 5 || mxl == 0) return 0;
+    const float k = static_cast<float>(static_cast<std::int32_t>(static_cast<std::uint32_t>((t1 >> 32) & 0xFFFu) << 20) >> 20) / 16.0f;
+    float lod = k;
+    if (!(t1 & 1u)) {
+        float qmax = 0.0f;
+        for (int i = 0; i < count; ++i) qmax = std::max(qmax, std::fabs(v[i].q));
+        if (!(qmax > 0.0f) || !std::isfinite(qmax)) return 0;
+        lod = std::log2(1.0f / qmax) * static_cast<float>(1 << ((t1 >> 19) & 3u)) + k;
+    }
+    if (!(lod > 0.0f)) return 0;
+    const int lv = (mmin == 2 || mmin == 4) ? static_cast<int>(lod + 0.5f) : static_cast<int>(lod);
+    return std::min(lv, mxl);
+}
+
+std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w, int level = 0) {
     const Context &c = st.ctx[(attr >> 9) & 1u];
     std::uint32_t flags = 0;
     if (attr & 0x8u) flags |= 1u;
@@ -1018,6 +1041,30 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) 
     w[22] = g_clut_slot;
     w[23] = z_max(zpsm);
     w[24] = 0xFFFFFFFFu;
+    if (level > 0) {   /* mip level `level`: base and width from MIPTBP1/2 (or MTBA), halved size and region */
+        std::uint32_t tbp = 0, tbw = 0;
+        if (((c.tex1 >> 9) & 1u) && level <= 3) {
+            static const std::uint32_t bpp[64] = {32, 32, 16, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 8, 4, 0, 0, 0, 0, 0, 0, 32,
+                                                  0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32};
+            std::uint32_t bp = w[12], bw = w[13], tw = 1u << (w[15] & 0xFFu), th = 1u << (w[15] >> 8), b = bpp[w[14] & 63] ? bpp[w[14] & 63] : 32;
+            for (int k = 1; k <= level; ++k) {
+                bp += (tw * th * b / 8) >> 8;
+                tw = std::max(tw >> 1, 1u); th = std::max(th >> 1, 1u); bw = std::max(bw >> 1, 1u);
+            }
+            tbp = bp; tbw = bw;
+        } else {
+            const std::uint64_t m = level <= 3 ? c.miptbp1 : c.miptbp2;
+            const int sh = 20 * ((level - 1) % 3);
+            tbp = static_cast<std::uint32_t>(m >> sh) & 0x3FFFu;
+            tbw = static_cast<std::uint32_t>(m >> (sh + 14)) & 0x3Fu;
+        }
+        const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+        w[12] = tbp;
+        w[13] = tbw;
+        w[15] = (tw > static_cast<std::uint32_t>(level) ? tw - level : 0u) | ((th > static_cast<std::uint32_t>(level) ? th - level : 0u) << 8);
+        w[18] = ((w[18] & 0xFFFFu) >> level) | (((w[18] >> 16) >> level) << 16);
+        w[19] = ((w[19] & 0xFFFFu) >> level) | (((w[19] >> 16) >> level) << 16);
+    }
     return flags;
 }
 
@@ -1257,12 +1304,14 @@ void draw(const State &st, const Vertex *v, int count) {
     const std::uint32_t prim = static_cast<std::uint32_t>(st.prim) & 7u;
     const Context &c = st.ctx[(attr >> 9) & 1u];
     SetupCache &cache = g_setup_cache;
-    if (cache.generation != g_setup_generation || cache.attr != attr || cache.clut != g_clut_slot) {
+    const int level = mip_level(c, attr, v, count);
+    if (cache.generation != g_setup_generation || cache.attr != attr || cache.clut != g_clut_slot || cache.level != level) {
         cache.generation = g_setup_generation;
         cache.attr = attr;
         cache.clut = g_clut_slot;
+        cache.level = level;
         const std::uint32_t *w = cache.setup;
-        cache.flags = make_setup(st, attr, cache.setup);
+        cache.flags = make_setup(st, attr, cache.setup, level);
         cache.key = static_cast<std::uint64_t>(w[1]) | (static_cast<std::uint64_t>(w[2]) << 14) | (static_cast<std::uint64_t>(w[3]) << 20) |
                     (static_cast<std::uint64_t>(w[5]) << 26) | (static_cast<std::uint64_t>(w[6]) << 40);
         if (cache.flags & 2u) {

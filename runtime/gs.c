@@ -254,6 +254,10 @@ typedef struct {
     int ta0, ta1, aem;
     int linear;
     RdFn rd;
+    /* mipmapping (TEX1, MIPTBP1/2): mip is set when MMIN selects a mipmap filter and MXL > 0 */
+    int mip, mxl, mmin, lcm, lsh, minlin;
+    float k;
+    uint32_t mtbp[7], mtbw[7];
 } TexState;
 
 static inline uint32_t tex_texel(const TexState *t, int x, int y) {
@@ -314,6 +318,39 @@ static uint32_t tex_sample(const TexState *t, float u, float v) {
     return lerp_rgba(lerp_rgba(c00, c10, fu), lerp_rgba(c01, c11, fu), fv);
 }
 
+/* Sample mip level `lv` (base pointers from MIPTBP1/2, size and coordinates halved per level). */
+static uint32_t tex_sample_level(const TexState *t, int lv, float u, float v, int linear) {
+    TexState l = *t;
+    l.linear = linear;
+    if (lv > 0) {
+        l.tbp = t->mtbp[lv]; l.tbw = t->mtbw[lv];
+        l.tw = t->tw > (uint32_t)lv ? t->tw - lv : 0; l.th = t->th > (uint32_t)lv ? t->th - lv : 0;
+        l.minu >>= lv; l.maxu >>= lv; l.minv >>= lv; l.maxv >>= lv;
+        float sc = 1.0f / (float)(1 << lv);
+        u *= sc; v *= sc;
+    }
+    return tex_sample(&l, u, v);
+}
+
+/* Texture lookup with the GS level-of-detail rules: LOD = log2(1/|Q|) * 2^L + K (or K with LCM),
+   LOD < 0 magnifies level 0 (MMAG), otherwise MMIN picks and filters the levels up to MXL.  Games
+   stream only the levels a distant object needs and leave TBP0 pointing at nothing (0), so level 0
+   must not be sampled when the LOD says otherwise. */
+static uint32_t tex_sample_mip(const TexState *t, float u, float v, float q) {
+    float lod = t->lcm ? t->k : log2f(1.0f / fmaxf(fabsf(q), 1e-30f)) * (float)(1 << t->lsh) + t->k;
+    if (lod < 0.0f) return tex_sample_level(t, 0, u, v, t->linear);
+    if (t->mmin == 2 || t->mmin == 4) {
+        int lv = (int)(lod + 0.5f);
+        return tex_sample_level(t, lv > t->mxl ? t->mxl : lv, u, v, t->minlin);
+    }
+    int l0 = (int)lod;
+    if (l0 >= t->mxl) return tex_sample_level(t, t->mxl, u, v, t->minlin);
+    int f = (int)((lod - (float)l0) * 256.0f);
+    uint32_t a = tex_sample_level(t, l0, u, v, t->minlin);
+    if (f <= 0) return a;
+    return lerp_rgba(a, tex_sample_level(t, l0 + 1, u, v, t->minlin), f);
+}
+
 /* ---- drawing context ---------------------------------------------------------- */
 typedef struct {
     /* frame / z */
@@ -357,6 +394,29 @@ static void setup_ctx(DrawCtx *d) {
     t->ta0 = bits(gs.texa, 0, 8); t->aem = bits(gs.texa, 15, 1); t->ta1 = bits(gs.texa, 32, 8);
     t->linear = bits(t1, 5, 1);   /* MMAG */
     t->rd = rd_for(t->psm);
+    t->lcm = bits(t1, 0, 1); t->mxl = bits(t1, 2, 3); t->mmin = bits(t1, 6, 3); t->lsh = bits(t1, 19, 2);
+    t->k = (float)((int32_t)((uint32_t)bits(t1, 32, 12) << 20) >> 20) / 16.0f;
+    t->minlin = t->mmin == 1 || t->mmin == 4 || t->mmin == 5;
+    t->mip = t->mmin >= 2 && t->mmin <= 5 && t->mxl > 0;
+    if (t->mxl > 6) t->mxl = 6;
+    if (t->mip) {
+        t->mtbp[0] = t->tbp; t->mtbw[0] = t->tbw;
+        uint64_t m1 = gs.miptbp1[ctxt], m2 = gs.miptbp2[ctxt];
+        for (int k = 0; k < 3; k++) {
+            t->mtbp[1 + k] = bits(m1, 20 * k, 14); t->mtbw[1 + k] = bits(m1, 20 * k + 14, 6);
+            t->mtbp[4 + k] = bits(m2, 20 * k, 14); t->mtbw[4 + k] = bits(m2, 20 * k + 14, 6);
+        }
+        if (bits(t1, 9, 1)) {   /* MTBA: levels 1-3 follow level 0 in memory */
+            static const int bpp[64] = {[PSMCT32] = 32, [PSMCT24] = 32, [PSMCT16] = 16, [PSMCT16S] = 16, [PSMT8] = 8, [PSMT4] = 4,
+                                        [PSMT8H] = 32, [PSMT4HL] = 32, [PSMT4HH] = 32};
+            uint32_t bp = t->tbp, bw = t->tbw, w = 1u << t->tw, h = 1u << t->th, b = bpp[t->psm & 63] ? bpp[t->psm & 63] : 32;
+            for (int k = 1; k <= 3; k++) {
+                bp += (w * h * b / 8) >> 8;
+                w = w > 1 ? w >> 1 : 1; h = h > 1 ? h >> 1 : 1; bw = bw > 1 ? bw >> 1 : 1;
+                t->mtbp[k] = bp; t->mtbw[k] = bw;
+            }
+        }
+    }
     d->fbrd = rd_for(d->fpsm); d->fbwr = wr_for(d->fpsm);
     d->zrd = rd_for(d->zpsm); d->zwr = wr_for(d->zpsm);
 }
@@ -378,11 +438,11 @@ static inline uint32_t fb_to_rgba(const DrawCtx *d, uint32_t v) {
 }
 
 /* Draw one pixel with interpolated color c (RGBA), depth z, fog f, and texture coords. */
-static void put_pixel(const DrawCtx *d, int x, int y, uint32_t z, uint32_t col, int fog, float u, float v) {
+static void put_pixel(const DrawCtx *d, int x, int y, uint32_t z, uint32_t col, int fog, float u, float v, float q) {
     if (x < d->scx0 || x > d->scx1 || y < d->scy0 || y > d->scy1) return;
     int r = col & 0xff, g = (col >> 8) & 0xff, b = (col >> 16) & 0xff, a = col >> 24;
     if (d->tme) {
-        uint32_t t = tex_sample(&d->tex, u, v);
+        uint32_t t = d->tex.mip ? tex_sample_mip(&d->tex, u, v, q) : tex_sample(&d->tex, u, v);
         int tr = t & 0xff, tg = (t >> 8) & 0xff, tb = (t >> 16) & 0xff, ta = t >> 24;
         switch (d->tex.tfx) {
         case 0: r = (r * tr) >> 7; g = (g * tg) >> 7; b = (b * tb) >> 7; if (d->tex.tcc) a = (a * ta) >> 7; break;
@@ -608,7 +668,7 @@ void gs_fb_stats(void) {
 
 typedef struct {
     const DrawCtx *d;
-    float x0, y0, dx, dy, ua, ub, va, vb;
+    float x0, y0, dx, dy, ua, ub, va, vb, q;
     int ix0, ix1;
     uint32_t col, z, packed;
     int fog, simple;
@@ -625,7 +685,7 @@ static void sprite_row(void *ctx, int y) {
     float vv = j->va + (j->vb - j->va) * ty;
     float du = j->dx > 0 ? (j->ub - j->ua) / j->dx : 0;
     float uu = j->ua + du * (j->ix0 - j->x0);
-    for (int x = j->ix0; x <= j->ix1; x++, uu += du) put_pixel(d, x, y, j->z, j->col, j->fog, uu, vv);
+    for (int x = j->ix0; x <= j->ix1; x++, uu += du) put_pixel(d, x, y, j->z, j->col, j->fog, uu, vv, j->q);
 }
 
 static void draw_sprite(const DrawCtx *d, const Vtx *v0, const Vtx *v1) {
@@ -649,6 +709,7 @@ static void draw_sprite(const DrawCtx *d, const Vtx *v0, const Vtx *v1) {
     j.col = pack_color(v1->r, v1->g, v1->b, v1->a);
     j.z = v1->z > 4294967295.0 ? 0xffffffffu : (uint32_t)v1->z;
     j.fog = (int)v1->f;
+    j.q = d->fst ? 1.0f : v1->q;
     /* plain fills: no texture, test, blend, fog, mask or depth work */
     j.simple = !d->tme && !d->abe && !d->ate && !d->date && !d->fge && !d->fbmsk && !d->fba &&
                (!d->zte || (d->ztst == 1 && d->zmsk)) &&
@@ -699,17 +760,17 @@ static void tri_row(void *ctx, int y) {
             col = flatcol;
             fog = (int)v2->f;
         }
-        float uu = 0, vv = 0;
+        float uu = 0, vv = 0, qq = 1.0f;
         if (d->tme) {
             float s = j->s0 * w0 + j->s1 * w1 + j->s2 * w2, t = j->t0 * w0 + j->t1 * w1 + j->t2 * w2;
             if (d->fst) { uu = s; vv = t; }
             else {
                 float q = j->q0 * w0 + j->q1 * w1 + j->q2 * w2;
                 if (q == 0) q = 1e-6f;
-                uu = s / q * j->tws; vv = t / q * j->ths;
+                uu = s / q * j->tws; vv = t / q * j->ths; qq = q;
             }
         }
-        put_pixel(d, x, y, zi, col, fog, uu, vv);
+        put_pixel(d, x, y, zi, col, fog, uu, vv, qq);
     }
 }
 
@@ -753,8 +814,50 @@ static void draw_line(const DrawCtx *d, const Vtx *v0, const Vtx *v1) {
         double z = v0->z + (v1->z - v0->z) * t;
         float u0, w0, u1, w1;
         tex_coords(d, v0, &u0, &w0); tex_coords(d, v1, &u1, &w1);
-        put_pixel(d, x, y, (uint32_t)z, col, (int)(v0->f + (v1->f - v0->f) * t), u0 + (u1 - u0) * t, w0 + (w1 - w0) * t);
+        put_pixel(d, x, y, (uint32_t)z, col, (int)(v0->f + (v1->f - v0->f) * t), u0 + (u1 - u0) * t, w0 + (w1 - w0) * t,
+                  d->fst ? 1.0f : v0->q + (v1->q - v0->q) * t);
     }
+}
+
+/* debug: last host->local upload per destination base pointer (for HP_TEXDUMP) */
+static struct { uint32_t pkt, data, psm, w, h, bw; unsigned long long vs; } upl[16384];
+static int upl_first;
+/* HP_TEXDUMP=dir [HP_TEXDUMPAT=vsync]: write every distinct texture (TEX0 + CLUT contents) the
+   primitives sample from that vsync on as dir/tex_<n>.ppm, with a log line naming its last upload. */
+static void tex_dump_check(void) {
+    static const char *dir = (const char *)1;
+    static long long at; static int count;
+    static uint64_t seen[1024];
+    extern unsigned long long g_vsyncs;
+    if (dir == (const char *)1) { dir = getenv("HP_TEXDUMP"); at = getenv("HP_TEXDUMPAT") ? atoll(getenv("HP_TEXDUMPAT")) : 0; }
+    if (!dir || (long long)g_vsyncs < at || count >= 1024) return;
+    DrawCtx d; setup_ctx(&d);
+    if (!d.tme) return;
+    uint64_t t0 = gs.tex0[bits((gs.prmodecont & 1) ? gs.prim : gs.prmode, 9, 1)];
+    uint64_t key = t0 & ~(7ull << 61) & ~(3ull << 35) & ~(1ull << 34);
+    int is_idx = d.tex.psm == PSMT8 || d.tex.psm == PSMT8H || d.tex.psm == PSMT4 || d.tex.psm == PSMT4HL || d.tex.psm == PSMT4HH;
+    if (is_idx) { uint64_t h = 1469598103934665603ull; for (int i = 0; i < 512; i++) { h ^= clut[i]; h *= 1099511628211ull; } key ^= h; }
+    for (int i = 0; i < count; i++) if (seen[i] == key) return;
+    seen[count] = key;
+    TexState t = d.tex; t.wms = t.wmt = 0;
+    int w = 1 << t.tw, h = 1 << t.th;
+    if (w > 512) w = 512;
+    if (h > 512) h = 512;
+    char path[1200];
+    snprintf(path, sizeof path, "%s/tex_%04d.ppm", dir, count);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P6\n%d %d\n255\n", w, h);
+        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { uint32_t c = tex_texel(&t, x, y); uint8_t px[3] = {(uint8_t)c, (uint8_t)(c >> 8), (uint8_t)(c >> 16)}; fwrite(px, 1, 3, f); }
+        fclose(f);
+    }
+    uint32_t cbp = bits(t0, 37, 14);
+    uint32_t tb = t.tbp & 16383, cb = cbp & 16383;
+    LOG("[texdump v%llu] tex_%04d tex0 %016llx tbp %x tbw %u psm %x %dx%d cbp %x cpsm %x csa %u | tex upload v%llu pkt %08x data %08x psm %x %ux%u bw %u | clut upload v%llu pkt %08x data %08x psm %x %ux%u\n",
+        g_vsyncs, count, (unsigned long long)t0, t.tbp, t.tbw, t.psm, 1 << t.tw, 1 << t.th, cbp, t.cpsm, t.csa,
+        upl[tb].vs, upl[tb].pkt, upl[tb].data, upl[tb].psm, upl[tb].w, upl[tb].h, upl[tb].bw,
+        upl[cb].vs, upl[cb].pkt, upl[cb].data, upl[cb].psm, upl[cb].w, upl[cb].h);
+    count++;
 }
 
 static int primlog = -1;
@@ -789,7 +892,7 @@ static void vertex_kick(Vtx v, int draw) {
     case 0:
         setup_ctx(&d);
         put_pixel(&d, (int)vq[0].x, (int)vq[0].y, (uint32_t)vq[0].z, pack_color(vq[0].r, vq[0].g, vq[0].b, vq[0].a),
-                  (int)vq[0].f, vq[0].u, vq[0].v);
+                  (int)vq[0].f, vq[0].u, vq[0].v, d.fst ? 1.0f : vq[0].q);
         vcount = 0;
         break;
     case 1:
@@ -819,6 +922,7 @@ static void vertex_kick(Vtx v, int draw) {
     }
     g_gs_prims++;
     if (cur_path >= 0 && cur_path < 3) g_prims_by_path[cur_path]++;
+    tex_dump_check();
     if (type <= 6) {
         DrawCtx d2; setup_ctx(&d2);
         int k;
@@ -839,6 +943,7 @@ static struct {
 } xfer;
 static struct { int active; uint32_t sbp, sbw, spsm, sx, sy, w, h, x, y; uint64_t acc; int acc_bits; } dl;
 
+static int xfer_logged;
 static void xfer_put_pixel(uint32_t v) {
     if (xfer.y >= xfer.h) return;
     gs_write_raw(xfer.dbp, xfer.dbw, xfer.dpsm, xfer.sx + xfer.x, (uint32_t)(bits(gs.trxpos, 48, 11)) + xfer.y, v);
@@ -851,11 +956,14 @@ static void xfer_start(void) {
     uint64_t bb = gs.bitbltbuf;
     uint32_t w = bits(gs.trxreg, 0, 12), h = bits(gs.trxreg, 32, 12);
     static int xl = -1;
-    if (xl < 0) xl = getenv("HP_XFERLOG") ? atoi(getenv("HP_XFERLOG")) : 0;
-    if (xl > 0) {
-        xl--;
-        extern unsigned long long g_vsyncs;
-        LOG("[gs xfer v%llu] path %d dir %d src bp %llx bw %llu psm %llx -> dst bp %llx bw %llu psm %llx, %ux%u at %llu,%llu\n", g_vsyncs, cur_path, dir,
+    static long long xafter;
+    extern unsigned long long g_vsyncs;
+    if (xl < 0) { xl = getenv("HP_XFERLOG") ? atoi(getenv("HP_XFERLOG")) : 0; xafter = getenv("HP_XFERAFTER") ? atoll(getenv("HP_XFERAFTER")) : 0; }
+    xfer_logged = 0;
+    if (xl > 0 && (long long)g_vsyncs >= xafter) {
+        xl--; xfer_logged = 1;
+        extern uint32_t g_dma_src;
+        LOG("[gs xfer v%llu] src ram %08x path %d dir %d src bp %llx bw %llu psm %llx -> dst bp %llx bw %llu psm %llx, %ux%u at %llu,%llu\n", g_vsyncs, g_dma_src, cur_path, dir,
             (unsigned long long)bits(bb, 0, 14), (unsigned long long)bits(bb, 16, 6), (unsigned long long)bits(bb, 24, 6),
             (unsigned long long)bits(bb, 32, 14), (unsigned long long)bits(bb, 48, 6), (unsigned long long)bits(bb, 56, 6), w, h,
             (unsigned long long)bits(gs.trxpos, 32, 11), (unsigned long long)bits(gs.trxpos, 48, 11));
@@ -866,6 +974,8 @@ static void xfer_start(void) {
         xfer.dbp = bits(bb, 32, 14); xfer.dbw = bits(bb, 48, 6); xfer.dpsm = bits(bb, 56, 6);
         xfer.sx = bits(gs.trxpos, 32, 11); xfer.x = 0; xfer.y = 0; xfer.w = w; xfer.h = h;
         xfer.pending = 0; xfer.pend_bits = 0;
+        { extern uint32_t g_dma_src; uint32_t k = xfer.dbp & 16383;
+          upl[k].pkt = g_dma_src; upl[k].data = 0; upl[k].psm = xfer.dpsm; upl[k].w = w; upl[k].h = h; upl[k].bw = xfer.dbw; upl[k].vs = g_vsyncs; upl_first = 1; }
     } else if (dir == 2) {
         uint32_t sbp = bits(bb, 0, 14), sbw = bits(bb, 16, 6), spsm = bits(bb, 24, 6);
         uint32_t dbp = bits(bb, 32, 14), dbw = bits(bb, 48, 6), dpsm = bits(bb, 56, 6);
@@ -932,6 +1042,7 @@ void gs_read_image(uint8_t *dst, uint32_t qwords) {
 static unsigned long long xfer_words, xfer_nonzero;
 static void xfer_data(uint64_t v) {
     if (!xfer.active) return;
+    if (upl_first) { extern uint32_t g_dma_src; upl[xfer.dbp & 16383].data = g_dma_src; upl_first = 0; }
     xfer_words++; if (v) xfer_nonzero++;
     switch (xfer.dpsm) {
     case PSMCT32: case PSMZ32:
@@ -957,7 +1068,7 @@ static void xfer_data(uint64_t v) {
     }
     if (xfer.y >= xfer.h) {
         xfer.active = 0;
-        if (getenv("HP_XFERLOG")) { extern unsigned long long g_vsyncs; LOG("[gs xfer v%llu] done dst bp %x: %llu words, %llu nonzero\n", g_vsyncs, xfer.dbp, xfer_words, xfer_nonzero); }
+        if (xfer_logged) { extern unsigned long long g_vsyncs; LOG("[gs xfer v%llu] done dst bp %x: %llu words, %llu nonzero\n", g_vsyncs, xfer.dbp, xfer_words, xfer_nonzero); }
         xfer_words = xfer_nonzero = 0;
     }
 }
@@ -990,7 +1101,20 @@ void gs_write_reg(int reg, uint64_t v) {
     case 0x03: gs.uv = v; break;
     case 0x04: gs.fog = (v >> 56) << 56; vertex_kick(make_vertex(v, 1, (uint8_t)(v >> 56)), 1); break;
     case 0x05: vertex_kick(make_vertex(v, 0, 0), 1); break;
-    case 0x06: case 0x07: gs.tex0[reg - 6] = v; clut_load(v); break;
+    case 0x06: case 0x07:
+        {   /* HP_TBP0LOG: report indexed textures set up with TBP0 = 0 (and a CLUT elsewhere); the first
+               one from PATH1 also saves the VU1 snapshot (HP_VUSNAP) of the run that made it */
+            static int n = -1; if (n < 0) n = getenv("HP_TBP0LOG") ? 40 : 0;
+            uint32_t psm = bits(v, 20, 6);
+            if (n > 0 && !(v & 0x3fff) && bits(v, 37, 14) && (psm == PSMT4 || psm == PSMT8)) {
+                n--; extern unsigned long long g_vsyncs; extern uint32_t g_dma_src;
+                LOG("[tbp0 v%llu] TEX0_%d %016llx via path %d (last xgkick %03x, VU1 start %04x, dma src %08x)\n", g_vsyncs, reg - 5,
+                    (unsigned long long)v, cur_path, g_last_xgkick, g_last_vu1_start, g_dma_src);
+                if (cur_path == 0) { extern void vu1_snapshot_save(void); vu1_snapshot_save(); }
+                static int dumped; if (!dumped++ && getenv("HP_RAMDUMP")) { extern void rt_usr1_work(void); rt_usr1_work(); }
+            }
+        }
+        gs.tex0[reg - 6] = v; clut_load(v); break;
     case 0x08: case 0x09: gs.clamp[reg - 8] = v; break;
     case 0x0a: gs.fog = v; break;
     case 0x0c: gs.fog = (v >> 56) << 56; vertex_kick(make_vertex(v, 1, (uint8_t)(v >> 56)), 0); break;
@@ -1008,7 +1132,8 @@ void gs_write_reg(int reg, uint64_t v) {
     case 0x1b: gs.prmode = v; break;
     case 0x1c: gs.texclut = v; break;
     case 0x22: gs.scanmsk = v; break;
-    case 0x34: case 0x35: case 0x36: case 0x37: break;   /* mip base pointers */
+    case 0x34: case 0x35: gs.miptbp1[reg - 0x34] = v; break;
+    case 0x36: case 0x37: gs.miptbp2[reg - 0x36] = v; break;
     case 0x3b: gs.texa = v; break;
     case 0x3d: gs.fogcol = v; break;
     case 0x3f: break;   /* TEXFLUSH */

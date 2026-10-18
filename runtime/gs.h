@@ -11,7 +11,7 @@ enum {
 typedef struct {
     uint64_t prim, rgbaq, st, uv, fog, tex0[2], clamp[2], tex1[2], xyoffset[2], prmodecont, prmode, texclut,
         scanmsk, texa, fogcol, scissor[2], alpha[2], dimx, dthe, colclamp, test[2], pabe, fba[2], frame[2],
-        zbuf[2], bitbltbuf, trxpos, trxreg, trxdir, label;
+        zbuf[2], bitbltbuf, trxpos, trxreg, trxdir, label, miptbp1[2], miptbp2[2];
 } GSState;
 
 extern GSState gs;

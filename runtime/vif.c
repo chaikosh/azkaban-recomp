@@ -81,9 +81,13 @@ void vif1_reg_write(uint32_t off, uint32_t val) {
         if (val & 1) { v1.need = 0; v1.cmd = 0; stalled = stall_next = path3_wait = 0; vq_head = vq_tail = 0; }   /* RST */
         int resume = 0;
         if (val & 8) {   /* STC: the VIF goes on with the queued data */
+            { extern void synclog(const char *, ...); synclog("vif1 STC (queued %u words)", vq_tail - vq_head); }
             stalled = 0;
             resume = vq_head != vq_tail || dma1_deferred;
-            if (sync_drain() && resume) { vif1_drain_locked(); resume = 0; }
+            /* only when no earlier DMA (e.g. the PATH3 texture upload the interrupt handler has just
+               kicked) is still waiting for the render thread; otherwise resume behind it */
+            extern int render_idle(void);
+            if (sync_drain() && resume && render_idle()) { vif1_drain_locked(); resume = 0; }
         }
         pthread_mutex_unlock(&g_gs_lock);
         if (resume) { extern void render_post(int job); render_post(RENDER_JOB_VIF1_DRAIN); }
@@ -227,7 +231,12 @@ static void vif1_command(uint32_t w) {
     case 0x06: break;   /* MSKPATH3 */
     case 0x07: v1.mark = imm; v1.mark_seen = 1; break;
     case 0x10: case 0x11: break;   /* FLUSHE / FLUSH: VU1 and PATH1/2 run synchronously */
-    case 0x13: { extern int dma_path3_busy(void); if (dma_path3_busy()) path3_wait = 1; break; }   /* FLUSHA: also PATH3 */
+    case 0x13: {   /* FLUSHA: also PATH3 */
+        extern int dma_path3_busy(void); extern void synclog(const char *, ...);
+        if (dma_path3_busy()) path3_wait = 1;
+        synclog("vif1 FLUSHA%s", path3_wait ? " (waits for PATH3)" : "");
+        break;
+    }
     case 0x14: case 0x15: vif1_mscal(imm); break;
     case 0x17: { extern uint32_t vu1_tpc(void); vif1_mscal(vu1_tpc()); break; }   /* MSCNT: resume at the VU's TPC */
     case 0x20: v1.need = 1; break;
@@ -286,6 +295,7 @@ static void vif1_exec_word(uint32_t w) {
     if (stall_next && !v1.need) {   /* the i-bit command has finished: stop and tell the EE */
         stall_next = 0;
         stalled = 1;
+        { extern void synclog(const char *, ...); synclog("vif1 I-stall code %08x mark %x", v1.code, v1.mark); }
         kern_raise_intc(5);
     }
 }

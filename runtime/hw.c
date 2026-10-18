@@ -4,6 +4,7 @@ int iopb_enabled(void);
 uint32_t iopb_sif_get_reg(uint32_t reg);
 void iopb_sif_set_reg(uint32_t reg, uint32_t v);
 #include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 #include <time.h>
 #include "gs.h"
@@ -131,6 +132,8 @@ static void note(const char *what, uint32_t a, uint64_t v) {
 static uint32_t sh32(uint8_t *base, uint32_t off) { uint32_t v; memcpy(&v, base + off, 4); return v; }
 static void sw32(uint8_t *base, uint32_t off, uint32_t v) { memcpy(base + off, &v, 4); }
 
+void gs_priv_write(uint32_t off, uint64_t v);
+
 /* ---- 32-bit register file -------------------------------------------------- */
 /* HP_MMIOSTATS: count EE reads of the hardware registers (0x10000000-0x1000ffff) */
 static int mmio_stats = -1;
@@ -253,6 +256,7 @@ void mmio_w32(uint32_t a, uint32_t v) {
             return;
         }
         sw32(gspriv, off, v);
+        { uint64_t q; memcpy(&q, gspriv + (off & ~7u), 8); gs_priv_write(off & ~7u, q); }   /* debug hooks see 32-bit writes too */
         return;
     }
     note("write (unmapped page)", p & ~0xffffu, v);
@@ -267,8 +271,6 @@ uint64_t mmio_r64(uint32_t a) {
     }
     return mmio_r32(a) | ((uint64_t)mmio_r32(a + 4) << 32);
 }
-
-void gs_priv_write(uint32_t off, uint64_t v);
 
 void mmio_w64(uint32_t a, uint64_t v) {
     uint32_t p = a & 0x1fffffffu;
@@ -301,7 +303,12 @@ U128 mmio_r128(uint32_t a) {
     uint32_t p = a & 0x1fffffffu;
     memset(&v, 0, sizeof v);
     if (p >= 0x10007000u && p < 0x10007010u) { extern uint32_t ipu_out_qwords(uint8_t *, uint32_t); ipu_out_qwords((uint8_t *)&v, 1); return v; }
-    if (p >= 0x10005000u && p < 0x10006000u) { extern void gs_read_image(uint8_t *, uint32_t); gs_read_image((uint8_t *)&v, 1); return v; }
+    if (p >= 0x10005000u && p < 0x10006000u) {   /* VIF1 FIFO read: GS download, after the GS work issued before it */
+        extern void gs_read_image(uint8_t *, uint32_t); extern void render_wait_idle(void); extern pthread_mutex_t g_gs_lock;
+        render_wait_idle();
+        pthread_mutex_lock(&g_gs_lock); gs_read_image((uint8_t *)&v, 1); pthread_mutex_unlock(&g_gs_lock);
+        return v;
+    }
     if (p >= 0x10004000u && p < 0x10008000u) { note("fifo read", p, 0); return v; }
     for (int k = 0; k < 4; k++) v.w[k] = mmio_r32(a + 4 * k);
     return v;
@@ -376,7 +383,21 @@ void display_vsync(void);
 void hw_vblank(int start) {
     { extern volatile int g_usr1_req; extern void rt_usr1_work(void); if (g_usr1_req) { g_usr1_req = 0; rt_usr1_work(); } }
     if (start) {
+        {   /* HP_DUMPAT=vsync[,vsync...]: run the SIGUSR1 diagnostic dump (HP_VRAMDUMP/HP_RAMDUMP/HP_PEEK) at those vsyncs */
+            extern unsigned long long g_vsyncs; extern void rt_usr1_work(void);
+            static const char *da = (const char *)1;
+            if (da == (const char *)1) da = getenv("HP_DUMPAT");
+            for (const char *p = da; p && *p; ) {
+                if (strtoull(p, NULL, 10) == g_vsyncs + 1) { rt_usr1_work(); break; }
+                p = strchr(p, ','); if (p) p++;
+            }
+        }
         display_vsync();
+        {   /* HP_EXITAT=vsync: end the run there (bounded debug runs) */
+            extern unsigned long long g_vsyncs;
+            static long long ea = -2; if (ea == -2) ea = getenv("HP_EXITAT") ? atoll(getenv("HP_EXITAT")) : -1;
+            if (ea >= 0 && (long long)g_vsyncs >= ea) { LOG("[exit] HP_EXITAT reached at vsync %llu\n", g_vsyncs); fflush(NULL); _exit(0); }
+        }
         if (iopb_enabled()) iopb_vblank(1);
         else { pad_vblank(); iop_tick(); }
         static int frames;

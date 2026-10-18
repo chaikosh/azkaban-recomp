@@ -101,7 +101,9 @@ static void poll_input(SDL_Gamepad *pad) {
     static double t0 = -1;
     if (ak == (const char *)1) ak = getenv("HP_AUTOKEY");
     if (ak) {
-        double now = (double)SDL_GetTicks() / 1000.0;
+        /* HP_AUTOKEYV=1: the times are emulated seconds (vsyncs / 59.94) instead of wall time, so runs repeat */
+        static int virt = -1; if (virt < 0) virt = getenv("HP_AUTOKEYV") != NULL;
+        double now = virt ? (double)g_vsyncs / 59.94 : (double)SDL_GetTicks() / 1000.0;
         if (t0 < 0) t0 = now;
         const char *p = ak;
         while (*p) {
