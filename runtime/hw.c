@@ -4,6 +4,7 @@ int iopb_enabled(void);
 uint32_t iopb_sif_get_reg(uint32_t reg);
 void iopb_sif_set_reg(uint32_t reg, uint32_t v);
 #include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 #include <time.h>
 #include "gs.h"
@@ -360,7 +361,21 @@ void display_vsync(void);
 void hw_vblank(int start) {
     { extern volatile int g_usr1_req; extern void rt_usr1_work(void); if (g_usr1_req) { g_usr1_req = 0; rt_usr1_work(); } }
     if (start) {
+        {   /* HP_DUMPAT=vsync[,vsync...]: run the SIGUSR1 diagnostic dump (HP_VRAMDUMP/HP_RAMDUMP/HP_PEEK) at those vsyncs */
+            extern unsigned long long g_vsyncs; extern void rt_usr1_work(void);
+            static const char *da = (const char *)1;
+            if (da == (const char *)1) da = getenv("HP_DUMPAT");
+            for (const char *p = da; p && *p; ) {
+                if (strtoull(p, NULL, 10) == g_vsyncs + 1) { rt_usr1_work(); break; }
+                p = strchr(p, ','); if (p) p++;
+            }
+        }
         display_vsync();
+        {   /* HP_EXITAT=vsync: end the run there (bounded debug runs) */
+            extern unsigned long long g_vsyncs;
+            static long long ea = -2; if (ea == -2) ea = getenv("HP_EXITAT") ? atoll(getenv("HP_EXITAT")) : -1;
+            if (ea >= 0 && (long long)g_vsyncs >= ea) { LOG("[exit] HP_EXITAT reached at vsync %llu\n", g_vsyncs); fflush(NULL); _exit(0); }
+        }
         if (iopb_enabled()) iopb_vblank(1);
         else { pad_vblank(); iop_tick(); }
         static int frames;

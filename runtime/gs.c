@@ -757,6 +757,47 @@ static void draw_line(const DrawCtx *d, const Vtx *v0, const Vtx *v1) {
     }
 }
 
+/* debug: last host->local upload per destination base pointer (for HP_TEXDUMP) */
+static struct { uint32_t pkt, data, psm, w, h, bw; unsigned long long vs; } upl[16384];
+static int upl_first;
+/* HP_TEXDUMP=dir [HP_TEXDUMPAT=vsync]: write every distinct texture (TEX0 + CLUT contents) the
+   primitives sample from that vsync on as dir/tex_<n>.ppm, with a log line naming its last upload. */
+static void tex_dump_check(void) {
+    static const char *dir = (const char *)1;
+    static long long at; static int count;
+    static uint64_t seen[1024];
+    extern unsigned long long g_vsyncs;
+    if (dir == (const char *)1) { dir = getenv("HP_TEXDUMP"); at = getenv("HP_TEXDUMPAT") ? atoll(getenv("HP_TEXDUMPAT")) : 0; }
+    if (!dir || (long long)g_vsyncs < at || count >= 1024) return;
+    DrawCtx d; setup_ctx(&d);
+    if (!d.tme) return;
+    uint64_t t0 = gs.tex0[bits((gs.prmodecont & 1) ? gs.prim : gs.prmode, 9, 1)];
+    uint64_t key = t0 & ~(7ull << 61) & ~(3ull << 35) & ~(1ull << 34);
+    int is_idx = d.tex.psm == PSMT8 || d.tex.psm == PSMT8H || d.tex.psm == PSMT4 || d.tex.psm == PSMT4HL || d.tex.psm == PSMT4HH;
+    if (is_idx) { uint64_t h = 1469598103934665603ull; for (int i = 0; i < 512; i++) { h ^= clut[i]; h *= 1099511628211ull; } key ^= h; }
+    for (int i = 0; i < count; i++) if (seen[i] == key) return;
+    seen[count] = key;
+    TexState t = d.tex; t.wms = t.wmt = 0;
+    int w = 1 << t.tw, h = 1 << t.th;
+    if (w > 512) w = 512;
+    if (h > 512) h = 512;
+    char path[1200];
+    snprintf(path, sizeof path, "%s/tex_%04d.ppm", dir, count);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P6\n%d %d\n255\n", w, h);
+        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { uint32_t c = tex_texel(&t, x, y); uint8_t px[3] = {(uint8_t)c, (uint8_t)(c >> 8), (uint8_t)(c >> 16)}; fwrite(px, 1, 3, f); }
+        fclose(f);
+    }
+    uint32_t cbp = bits(t0, 37, 14);
+    uint32_t tb = t.tbp & 16383, cb = cbp & 16383;
+    LOG("[texdump v%llu] tex_%04d tex0 %016llx tbp %x tbw %u psm %x %dx%d cbp %x cpsm %x csa %u | tex upload v%llu pkt %08x data %08x psm %x %ux%u bw %u | clut upload v%llu pkt %08x data %08x psm %x %ux%u\n",
+        g_vsyncs, count, (unsigned long long)t0, t.tbp, t.tbw, t.psm, 1 << t.tw, 1 << t.th, cbp, t.cpsm, t.csa,
+        upl[tb].vs, upl[tb].pkt, upl[tb].data, upl[tb].psm, upl[tb].w, upl[tb].h, upl[tb].bw,
+        upl[cb].vs, upl[cb].pkt, upl[cb].data, upl[cb].psm, upl[cb].w, upl[cb].h);
+    count++;
+}
+
 static int primlog = -1;
 static void vertex_kick(Vtx v, int draw) {
     if (g_gs_gpu) { g_gs_prims += draw; return; }
@@ -819,6 +860,7 @@ static void vertex_kick(Vtx v, int draw) {
     }
     g_gs_prims++;
     if (cur_path >= 0 && cur_path < 3) g_prims_by_path[cur_path]++;
+    tex_dump_check();
     if (type <= 6) {
         DrawCtx d2; setup_ctx(&d2);
         int k;
@@ -839,6 +881,7 @@ static struct {
 } xfer;
 static struct { int active; uint32_t sbp, sbw, spsm, sx, sy, w, h, x, y; uint64_t acc; int acc_bits; } dl;
 
+static int xfer_logged;
 static void xfer_put_pixel(uint32_t v) {
     if (xfer.y >= xfer.h) return;
     gs_write_raw(xfer.dbp, xfer.dbw, xfer.dpsm, xfer.sx + xfer.x, (uint32_t)(bits(gs.trxpos, 48, 11)) + xfer.y, v);
@@ -851,11 +894,14 @@ static void xfer_start(void) {
     uint64_t bb = gs.bitbltbuf;
     uint32_t w = bits(gs.trxreg, 0, 12), h = bits(gs.trxreg, 32, 12);
     static int xl = -1;
-    if (xl < 0) xl = getenv("HP_XFERLOG") ? atoi(getenv("HP_XFERLOG")) : 0;
-    if (xl > 0) {
-        xl--;
-        extern unsigned long long g_vsyncs;
-        LOG("[gs xfer v%llu] path %d dir %d src bp %llx bw %llu psm %llx -> dst bp %llx bw %llu psm %llx, %ux%u at %llu,%llu\n", g_vsyncs, cur_path, dir,
+    static long long xafter;
+    extern unsigned long long g_vsyncs;
+    if (xl < 0) { xl = getenv("HP_XFERLOG") ? atoi(getenv("HP_XFERLOG")) : 0; xafter = getenv("HP_XFERAFTER") ? atoll(getenv("HP_XFERAFTER")) : 0; }
+    xfer_logged = 0;
+    if (xl > 0 && (long long)g_vsyncs >= xafter) {
+        xl--; xfer_logged = 1;
+        extern uint32_t g_dma_src;
+        LOG("[gs xfer v%llu] src ram %08x path %d dir %d src bp %llx bw %llu psm %llx -> dst bp %llx bw %llu psm %llx, %ux%u at %llu,%llu\n", g_vsyncs, g_dma_src, cur_path, dir,
             (unsigned long long)bits(bb, 0, 14), (unsigned long long)bits(bb, 16, 6), (unsigned long long)bits(bb, 24, 6),
             (unsigned long long)bits(bb, 32, 14), (unsigned long long)bits(bb, 48, 6), (unsigned long long)bits(bb, 56, 6), w, h,
             (unsigned long long)bits(gs.trxpos, 32, 11), (unsigned long long)bits(gs.trxpos, 48, 11));
@@ -866,6 +912,8 @@ static void xfer_start(void) {
         xfer.dbp = bits(bb, 32, 14); xfer.dbw = bits(bb, 48, 6); xfer.dpsm = bits(bb, 56, 6);
         xfer.sx = bits(gs.trxpos, 32, 11); xfer.x = 0; xfer.y = 0; xfer.w = w; xfer.h = h;
         xfer.pending = 0; xfer.pend_bits = 0;
+        { extern uint32_t g_dma_src; uint32_t k = xfer.dbp & 16383;
+          upl[k].pkt = g_dma_src; upl[k].data = 0; upl[k].psm = xfer.dpsm; upl[k].w = w; upl[k].h = h; upl[k].bw = xfer.dbw; upl[k].vs = g_vsyncs; upl_first = 1; }
     } else if (dir == 2) {
         uint32_t sbp = bits(bb, 0, 14), sbw = bits(bb, 16, 6), spsm = bits(bb, 24, 6);
         uint32_t dbp = bits(bb, 32, 14), dbw = bits(bb, 48, 6), dpsm = bits(bb, 56, 6);
@@ -932,6 +980,7 @@ void gs_read_image(uint8_t *dst, uint32_t qwords) {
 static unsigned long long xfer_words, xfer_nonzero;
 static void xfer_data(uint64_t v) {
     if (!xfer.active) return;
+    if (upl_first) { extern uint32_t g_dma_src; upl[xfer.dbp & 16383].data = g_dma_src; upl_first = 0; }
     xfer_words++; if (v) xfer_nonzero++;
     switch (xfer.dpsm) {
     case PSMCT32: case PSMZ32:
@@ -957,7 +1006,7 @@ static void xfer_data(uint64_t v) {
     }
     if (xfer.y >= xfer.h) {
         xfer.active = 0;
-        if (getenv("HP_XFERLOG")) { extern unsigned long long g_vsyncs; LOG("[gs xfer v%llu] done dst bp %x: %llu words, %llu nonzero\n", g_vsyncs, xfer.dbp, xfer_words, xfer_nonzero); }
+        if (xfer_logged) { extern unsigned long long g_vsyncs; LOG("[gs xfer v%llu] done dst bp %x: %llu words, %llu nonzero\n", g_vsyncs, xfer.dbp, xfer_words, xfer_nonzero); }
         xfer_words = xfer_nonzero = 0;
     }
 }

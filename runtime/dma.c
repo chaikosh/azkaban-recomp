@@ -67,6 +67,20 @@ static void spr_transfer(int ch) {
     }
 }
 
+/* HP_SYNCLOG=vsync: log VIF1/GIF synchronisation events (kicks, I-bit stalls, STC, FLUSHA, job
+   and channel completion) for 30 vsyncs from there, with the guest context that caused them. */
+#include <stdarg.h>
+void synclog(const char *fmt, ...) {
+    static long long from = -2;
+    extern unsigned long long g_vsyncs;
+    if (from == -2) from = getenv("HP_SYNCLOG") ? atoll(getenv("HP_SYNCLOG")) : -1;
+    if (from < 0 || (long long)g_vsyncs < from || (long long)g_vsyncs >= from + 30) return;
+    char buf[400];
+    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
+    EE *c = kern_current_ctx();
+    LOG("[sync v%llu] %s | ee pc %08x ra %08x\n", g_vsyncs, buf, c ? c->pc : 0, c ? RW(31) : 0);
+}
+
 unsigned g_dma_count[10];
 static unsigned g_dma_qwords;
 void dma_finish(int ch);
@@ -148,7 +162,7 @@ static void render_channel(int ch) {
         if (g_trace > 1) LOG("[dma1] start CHCR %08x MADR %08x QWC %u TADR %08x\n", mmio_r32(base[1]), mmio_r32(base[1] + 0x10),
                              mmio_r32(base[1] + 0x20), mmio_r32(base[1] + 0x30));
         dma_run(1, vif1_sink, (chcr_now(1) >> 6) & 1);
-    } else dma_run(2, gif_sink, 0);
+    } else { synclog("gif job start tadr %08x", mmio_r32(base[2] + 0x30)); dma_run(2, gif_sink, 0); synclog("gif job end tadr %08x", mmio_r32(base[2] + 0x30)); }
     uint32_t q = g_dma_qwords;
     extern int vif1_dma_done(uint32_t qwords);
     int complete = ch == 1 ? vif1_dma_done(q) : 1;
@@ -203,7 +217,7 @@ void dma_start(int ch) {
         LOG("[ipu] dma %s CHCR %08x MADR %08x QWC %u data %02x%02x%02x%02x %02x%02x%02x%02x\n", chname[ch], mmio_r32(base[ch]), madr, qwc,
             p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
     }
-    if (ch == 1 || ch == 2) { render_post(ch); return; }
+    if (ch == 1 || ch == 2) { synclog("kick ch%d chcr %08x tadr %08x madr %08x qwc %u", ch, mmio_r32(base[ch]), mmio_r32(base[ch] + 0x30), mmio_r32(base[ch] + 0x10), mmio_r32(base[ch] + 0x20) & 0xffff); render_post(ch); return; }
     g_dma_qwords = 0;
     if (ch == 8 || ch == 9) spr_transfer(ch);
     if (ch == 4) {   /* toIPU is pulled by the IPU as its input FIFO drains */
@@ -261,6 +275,7 @@ int dma_ipu_pull(U128 *q) {
 
 void dma_finish(int ch) {
     extern void mmio_w32_raw(uint32_t a, uint32_t v);
+    if (ch == 1 || ch == 2) synclog("finish ch%d", ch);
     uint32_t chcr = mmio_r32(base[ch]);
     mmio_w32_raw(base[ch], chcr & ~0x100u);
     mmio_w32_raw(base[ch] + 0x20, 0);
@@ -275,6 +290,7 @@ static U128 *dma_ptr(uint32_t a) {
     return (U128 *)(g_ram + (a & 0x01fffff0u));
 }
 
+uint32_t g_dma_src;   /* debug: address of the quadword the DMA engine is handing over */
 static void dma_run(int ch, DmaSink sink, int tte) {
     uint32_t b = base[ch];
     uint32_t chcr = mmio_r32(b), madr = mmio_r32(b + 0x10), qwc = mmio_r32(b + 0x20) & 0xffff;
@@ -291,7 +307,7 @@ static void dma_run(int ch, DmaSink sink, int tte) {
                     (unsigned long long)dma_ptr(madr)->d[0], (unsigned long long)dma_ptr(madr)->d[1]);
             }
         }
-        for (uint32_t k = 0; k < qwc; k++) sink(dma_ptr(madr + 16 * k), 1, 0);
+        for (uint32_t k = 0; k < qwc; k++) { g_dma_src = madr + 16 * k; sink(dma_ptr(madr + 16 * k), 1, 0); }
         if (mode == 0) return;
     }
     uint32_t tadr = mmio_r32(b + 0x30);
@@ -331,7 +347,7 @@ static void dma_run(int ch, DmaSink sink, int tte) {
                     d0 ? (unsigned long long)d0->d[0] : 0ull);
             }
         }
-        for (uint32_t k = 0; k < n; k++) sink(dma_ptr(data + 16 * k), 1, 0);
+        for (uint32_t k = 0; k < n; k++) { g_dma_src = data + 16 * k; sink(dma_ptr(data + 16 * k), 1, 0); }
         if (end) break;
         tadr = next;
         if (((tag >> 31) & 1) && (chcr & 0x80)) break;   /* IRQ with TIE stops the chain */
@@ -376,4 +392,13 @@ void fifo_write(int which, U128 v) {
 
 void gs_priv_write(uint32_t off, uint64_t v) {
     if (g_trace) LOG("[gs] priv %04x = %016llx\n", off, (unsigned long long)v);
+    {   /* HP_CRTLOG=vsync: log changes of the PCRTC registers (PMODE..BGCOLOR) from that vsync, 300 lines */
+        static long long from = -2; static int left = 300; static uint64_t last[0x20]; static uint32_t seen;
+        extern unsigned long long g_vsyncs;
+        if (from == -2) from = getenv("HP_CRTLOG") ? atoll(getenv("HP_CRTLOG")) : -1;
+        if (from >= 0 && off < 0x100 && (long long)g_vsyncs >= from && left > 0 && (!(seen >> (off >> 3) & 1) || last[off >> 3] != v)) {
+            left--; seen |= 1u << (off >> 3); last[off >> 3] = v;
+            LOG("[crt v%llu] %04x = %016llx\n", g_vsyncs, off, (unsigned long long)v);
+        }
+    }
 }

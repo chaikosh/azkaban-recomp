@@ -80,9 +80,13 @@ a diagnostic dump.
 | `HP_CALLTRACE`, `HP_CALLHIST` | core.c | Call tracing / call history |
 | `HP_PCRING` | kernel.c | Ring buffer of recent program counters |
 | `HP_PRIMLOG`, `HP_PRIMSKIP`, `HP_PRIMAFTER` | gs.c | Log GS primitives |
-| `HP_XFERLOG` | gs.c | Log GS image transfers |
+| `HP_XFERLOG`, `HP_XFERAFTER` | gs.c | Log GS image transfers (with the RAM address of the packet), from a vsync on |
+| `HP_TEXDUMP`, `HP_TEXDUMPAT` | gs.c | Write each distinct texture the primitives sample (from a vsync on) as a PPM, with its last upload |
+| `HP_SYNCLOG` | dma.c | Log VIF1/GIF synchronisation (kicks, I-bit stalls, STC, FLUSHA, completions) for 30 vsyncs |
+| `HP_CRTLOG` | dma.c | Log changes of the PCRTC registers (PMODE, SMODE2, DISPFB, DISPLAY) from a vsync on |
+| `HP_DUMPAT`, `HP_EXITAT` | hw.c | Run the SIGUSR1 dump at given vsyncs; exit at a vsync (bounded runs) |
 | `HP_VIFLOG`, `HP_GIFLOG`, `HP_QLOG` | hle.c | Log VIF, GIF and queue activity |
-| `HP_AUTOKEY` | display.c | Scripted key presses |
+| `HP_AUTOKEY`, `HP_AUTOKEYV` | display.c | Scripted key presses; with `HP_AUTOKEYV=1` the times are emulated seconds (vsyncs / 59.94), so runs repeat on a loaded machine |
 | `HP_HEADLESS` | core.c | Run without a window |
 | `HP_GS_THREADS` | gs.c | Number of rasterizer worker threads |
 | `HP_GS=gpu`, `HP_GSSYNC` | gs_bridge.cpp | GPU renderer; `HP_GSSYNC` waits for each displayed frame instead of showing the newest finished one |
