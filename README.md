@@ -82,6 +82,7 @@ a diagnostic dump.
 | `HP_PRIMLOG`, `HP_PRIMSKIP`, `HP_PRIMAFTER` | gs.c | Log GS primitives |
 | `HP_XFERLOG`, `HP_XFERAFTER` | gs.c | Log GS image transfers (with the RAM address of the packet), from a vsync on |
 | `HP_TEXDUMP`, `HP_TEXDUMPAT` | gs.c | Write each distinct texture the primitives sample (from a vsync on) as a PPM, with its last upload |
+| `HP_TBP0LOG` | gs.c | Report indexed TEX0 setups with TBP0 = 0 (streamed mip levels); with `HP_VUSNAP`/`HP_RAMDUMP` also save the VU1 run / RAM |
 | `HP_SYNCLOG` | dma.c | Log VIF1/GIF synchronisation (kicks, I-bit stalls, STC, FLUSHA, completions) for 30 vsyncs |
 | `HP_CRTLOG` | dma.c | Log changes of the PCRTC registers (PMODE, SMODE2, DISPFB, DISPLAY) from a vsync on |
 | `HP_DUMPAT`, `HP_EXITAT` | hw.c | Run the SIGUSR1 dump at given vsyncs; exit at a vsync (bounded runs) |
