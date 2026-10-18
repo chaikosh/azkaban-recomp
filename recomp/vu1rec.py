@@ -200,8 +200,71 @@ class Gen:
         self.pcs = pcs
         self.status = status                          # some program reads status flags: keep vu_set_mac
         self.mac_pcs = img.mac_liveness(pcs) if flags else set()
+        self.tick_pcs, self.due_pcs = self.pipeline(start, pcs)
         self.cur = 0
         self.scalar = os.environ.get('VU1REC_SCALAR') == '1'   # emit the per-component form only
+
+    def pipeline(self, start, pcs):
+        """Forward dataflow over every way the routine's pairs run (label, branch delay slot, E-bit
+        delay slot): the most FDIV latency that can still be pending before each pair (unknown at
+        the routine's start: a previous routine may have issued it), and whether an XGKICK can be
+        due.  Returns the pairs that need vu_q_tick and the pairs that need the kick check."""
+        img = self.img
+        pcs = set(pcs)
+        succ = {}
+        def add(a, b):
+            succ.setdefault(a, set()).add(b & 0x7ff)
+        for n in pcs:
+            br, e, d = img.branch(n), img.ebit(n), (n + 1) & 0x7ff
+            add(n, d)                       # the next pair always runs (plain, delay slot, E slot)
+            if e or not br:
+                continue
+            if img.branch(d) or img.ebit(d):
+                continue                    # handed to the interpreter
+            kind, tgt, cond, link = br
+            if tgt is not None:
+                add(d, tgt)
+            if cond:
+                add(d, n + 2)
+        def q_info(m):
+            if img.up[m] & I_BIT:
+                return False, 0
+            lo = img.lo[m]
+            if not lower_waits_q(lo):
+                return False, 0
+            code = (((lo >> 6) & 31) << 2) | (lo & 3)
+            return True, (13 if code == 58 else 7 if code in (56, 57) else 0)
+        qin = {start: 13}
+        din = {start: True}
+        work = [start]
+        tick, due = set(), set()
+        while work:
+            m = work.pop()
+            waits, lat = q_info(m)
+            q = 0 if waits else qin.get(m, 0)
+            if lat:
+                q = lat
+            if q > 0:
+                tick.add(m)
+            qout = max(q - 1, 0)
+            dout = img.lower_is_kick(m) and not (img.up[m] & I_BIT)
+            if din.get(m):
+                due.add(m)
+            for x in succ.get(m, ()):
+                changed = False
+                if qout > qin.get(x, -1):
+                    qin[x] = qout
+                    changed = True
+                if dout and not din.get(x):
+                    din[x] = True
+                    changed = True
+                if x not in din:
+                    din[x] = din.get(x, False)
+                    changed = changed or x not in qin
+                    qin.setdefault(x, 0)
+                if changed:
+                    work.append(x)
+        return tick, due
 
     def mac(self, dest):
         if not self.flags or self.cur not in self.mac_pcs:
@@ -520,8 +583,9 @@ class Gen:
             out.append(f's.vi[{vicommit[0]}] = viv;')
         if up & I_BIT:
             out.append(f'{{ union {{ uint32_t u; float f; }} c = {{{lo}u}}; s.i = c.f; }}')
-        out.append('vu_q_tick(&s);')
-        if kick_check:
+        if n in self.tick_pcs:
+            out.append('vu_q_tick(&s);')
+        if n in self.due_pcs:
             out.append('if (due >= 0) { vu1_xgkick((uint32_t)due); due = -1; }')
         if kick:
             out.append('due = kv;')

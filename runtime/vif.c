@@ -175,45 +175,62 @@ static void unpack_element(const uint8_t *e) {
     v1.up_cnt++;
 }
 
-/* Bulk UNPACK of whole elements for the common case (no write mask, MODE 0, CL >= WL, elements
-   of whole words: V4/V3/V2/S-32, V4/V2-16, V4-8): the same results as unpack_element, without
-   the per-word byte buffer.  Returns the data words consumed (0: use the general path). */
+/* Bulk UNPACK: reads the elements straight from the DMA words as a byte stream (an element may
+   straddle words; a partial one is carried in ub/ubn exactly like the per-word path), for every
+   format but V4-5 and filling writes (WL > CL).  Plain writes (no mask, MODE 0) are stored
+   directly; masked or offset writes go through unpack_store.  Returns the data words consumed
+   (0: use the per-word path).  HP_VIFSLOW=1 turns it off. */
 static int fast_off = -1;
+static inline void fast_store(const uint8_t *e, uint32_t ncomp, uint32_t bits, uint32_t idx, uint32_t cl, uint32_t wl, int plain) {
+    uint32_t c[4];
+    if (bits == 32) memcpy(c, e, ncomp * 4);
+    else if (bits == 16)
+        for (uint32_t k = 0; k < ncomp; k++) { uint32_t x = e[2 * k] | ((uint32_t)e[2 * k + 1] << 8); c[k] = v1.up_usn ? x : (uint32_t)(int32_t)(int16_t)x; }
+    else
+        for (uint32_t k = 0; k < ncomp; k++) c[k] = v1.up_usn ? e[k] : (uint32_t)(int32_t)(int8_t)e[k];
+    uint32_t row = wl == cl ? 0 : idx % wl;
+    uint32_t qaddr = v1.up_addr + (wl == cl ? idx : (idx / wl) * cl + row);
+    if (!plain) { unpack_store(qaddr, c, (int)ncomp, wl == cl ? idx % wl : row, 0); return; }
+    uint32_t *dst = (uint32_t *)(g_vu1_data + ((qaddr & 0x3ff) << 4));
+    switch (ncomp) {
+    case 4: dst[0] = c[0]; dst[1] = c[1]; dst[2] = c[2]; dst[3] = c[3]; break;
+    case 3: dst[0] = c[0]; dst[1] = c[1]; dst[2] = c[2]; dst[3] = 0; break;
+    case 2: dst[0] = c[0]; dst[1] = c[1]; dst[2] = c[0]; dst[3] = c[1]; break;
+    default: dst[0] = dst[1] = dst[2] = dst[3] = c[0]; break;
+    }
+}
 static uint32_t unpack_fast(const uint32_t *w, uint32_t nw) {
     if (fast_off < 0) fast_off = getenv("HP_VIFSLOW") != NULL;
-    if (fast_off || ubn || (v1.up_m && v1.mask) || v1.mode || v1.up_vl == 3) return 0;
+    if (fast_off || v1.up_vl == 3) return 0;
     uint32_t cl = v1.cl ? v1.cl : 1, wl = v1.wl ? v1.wl : 1;
     if (wl > cl) return 0;
+    uint32_t left = v1.up_total - v1.up_cnt;
+    if (!left) return 0;
     uint32_t ncomp = v1.up_vn + 1, bits = 32u >> v1.up_vl, ebytes = ncomp * bits / 8;
-    if (ebytes & 3) return 0;
-    uint32_t ewords = ebytes / 4;
-    uint32_t nelem = nw / ewords, left = v1.up_total - v1.up_cnt;
-    if (nelem > left) nelem = left;
-    if (!nelem) return 0;
+    int plain = !(v1.up_m && v1.mask) && !v1.mode;
     const uint8_t *src = (const uint8_t *)w;
-    for (uint32_t e = 0; e < nelem; e++, src += ebytes) {
-        uint32_t idx = v1.up_cnt + e;
-        uint32_t qaddr = v1.up_addr + (wl == cl ? idx : (idx / wl) * cl + (idx % wl));
-        uint32_t *dst = (uint32_t *)(g_vu1_data + ((qaddr & 0x3ff) << 4));
-        uint32_t c[4];
-        if (bits == 32) memcpy(c, src, ebytes);
-        else if (bits == 16) {
-            for (uint32_t k = 0; k < ncomp; k++) {
-                uint32_t x = src[2 * k] | ((uint32_t)src[2 * k + 1] << 8);
-                c[k] = v1.up_usn ? x : (uint32_t)(int32_t)(int16_t)x;
-            }
-        } else {
-            for (uint32_t k = 0; k < ncomp; k++) c[k] = v1.up_usn ? src[k] : (uint32_t)(int32_t)(int8_t)src[k];
-        }
-        switch (ncomp) {
-        case 4: dst[0] = c[0]; dst[1] = c[1]; dst[2] = c[2]; dst[3] = c[3]; break;
-        case 3: dst[0] = c[0]; dst[1] = c[1]; dst[2] = c[2]; dst[3] = 0; break;
-        case 2: dst[0] = c[0]; dst[1] = c[1]; dst[2] = c[0]; dst[3] = c[1]; break;
-        default: dst[0] = dst[1] = dst[2] = dst[3] = c[0]; break;
-        }
+    size_t avail = (size_t)nw * 4, pos = 0;
+    if (ubn) {   /* finish the element the per-word path started */
+        size_t need = ebytes - (size_t)ubn;
+        if (need > avail) return 0;
+        uint8_t tmp[16];
+        memcpy(tmp, ub, (size_t)ubn);
+        memcpy(tmp + ubn, src, need);
+        fast_store(tmp, ncomp, bits, v1.up_cnt, cl, wl, plain);
+        v1.up_cnt++; left--;
+        pos = need;
+        ubn = 0;
     }
-    v1.up_cnt += nelem;
-    return nelem * ewords;
+    while (left && pos + ebytes <= avail) {
+        fast_store(src + pos, ncomp, bits, v1.up_cnt, cl, wl, plain);
+        v1.up_cnt++; left--;
+        pos += ebytes;
+    }
+    uint32_t words = (uint32_t)((pos + 3) / 4);
+    if (!words) return 0;
+    size_t extra = (size_t)words * 4 - pos;   /* rest of the last word: the next element's start, or padding */
+    if (extra) { memcpy(ub, src + pos, extra); ubn = (int)extra; }
+    return words;
 }
 
 static void vif1_mscal(uint32_t addr_pairs) {

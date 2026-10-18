@@ -62,6 +62,7 @@ std::condition_variable g_q_cv, g_q_done_cv;
 std::deque<Item> g_queue;
 std::size_t g_queued_bytes = 0;
 bool g_gs_busy = false, g_threaded = false;
+std::vector<Batch> g_free;   // rendered batches with their capacity kept (g_q_lock)
 
 // --- the newest finished frame ---
 std::mutex g_frame_lock;
@@ -130,6 +131,7 @@ void gs_thread() {
             if (it.show) show_frame(it.regs);
         }
         ql.lock();
+        if (it.batch.data.capacity() && g_free.size() < 8) g_free.push_back(std::move(it.batch));
         g_gs_busy = false;
         g_q_done_cv.notify_all();
     }
@@ -138,17 +140,21 @@ void gs_thread() {
 // Hands the gathered data (and optionally a frame request) on; the caller holds g_pend_lock,
 // which keeps the batches in arrival order.
 void post_locked(bool show, const Show *regs) {
-    Item it;
-    std::swap(it.batch, g_pend);
-    if (show) { it.show = true; it.regs = *regs; }
     if (!g_threaded) {
         std::lock_guard<std::mutex> lk(g_lock);
-        render_batch(it.batch);
-        if (it.show) show_frame(it.regs);
+        render_batch(g_pend);   // clears it, keeping the capacity
+        if (show) show_frame(*regs);
         return;
     }
-    if (it.batch.data.empty() && !it.show) return;
+    if (g_pend.data.empty() && !show) return;
+    Item it;
+    if (show) { it.show = true; it.regs = *regs; }
     std::unique_lock<std::mutex> ql(g_q_lock);
+    std::swap(it.batch, g_pend);
+    if (!g_free.empty()) {   // gather the next batch into a buffer that is already mapped
+        g_pend = std::move(g_free.back());
+        g_free.pop_back();
+    }
     // a GS far behind holds up the producers, like a full GIF FIFO
     g_q_done_cv.wait(ql, [] { return g_queued_bytes < (16u << 20); });
     g_queued_bytes += it.batch.data.size();
