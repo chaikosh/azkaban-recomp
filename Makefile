@@ -6,15 +6,24 @@ GEN      := $(REC)/gen
 PY       := python3 -I
 
 CC       := clang
+ifeq ($(RELEASE),1)
+# release: no per-block tracing, return-address checks or watchpoints; objects in build/rel
+OBJDIR   := $(OUT)/rel
+OPT      ?= -O2
+CHECKS   :=
+else
+OBJDIR   := $(OUT)
 DEBUGFLAGS ?= -DWATCH
 OPT      ?= -O1
-CFLAGS   := $(OPT) -g -fno-strict-aliasing -fwrapv -w -Iruntime -I$(GEN) -I/opt/homebrew/include -DRA_CHECK -DTRACE_PC $(DEBUGFLAGS)
+CHECKS   := -DRA_CHECK -DTRACE_PC $(DEBUGFLAGS)
+endif
+CFLAGS   := $(OPT) -g -fno-strict-aliasing -fwrapv -w -Iruntime -I$(GEN) -I/opt/homebrew/include $(CHECKS)
 LDFLAGS  := -L/opt/homebrew/lib -lSDL3
 
 RT_SRC   := $(wildcard runtime/*.c)
 GEN_SRC   = $(wildcard $(GEN)/*.c)
-RT_OBJ   := $(patsubst %.c,$(OUT)/obj/%.o,$(RT_SRC))
-GEN_OBJ   = $(patsubst $(GEN)/%.c,$(OUT)/obj/gen/%.o,$(GEN_SRC))
+RT_OBJ   := $(patsubst %.c,$(OBJDIR)/obj/%.o,$(RT_SRC))
+GEN_OBJ   = $(patsubst $(GEN)/%.c,$(OBJDIR)/obj/gen/%.o,$(GEN_SRC))
 
 .PHONY: all recomp run clean link
 all: $(OUT)/hp
@@ -27,13 +36,13 @@ $(OUT)/hp: $(GEN)/funcs.h FORCE
 	@$(MAKE) --no-print-directory link
 
 link: $(RT_OBJ) $(GEN_OBJ)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $(OUT)/hp $^
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $(OBJDIR)/hp $^
 
-$(OUT)/obj/%.o: %.c runtime/*.h
+$(OBJDIR)/obj/%.o: %.c runtime/*.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -O2 -c $< -o $@
 
-$(OUT)/obj/gen/%.o: $(GEN)/%.c runtime/ee.h runtime/ee_gen.h
+$(OBJDIR)/obj/gen/%.o: $(GEN)/%.c runtime/ee.h runtime/ee_gen.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
