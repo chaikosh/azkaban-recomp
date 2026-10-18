@@ -30,6 +30,12 @@ void display_vsync(void) {
     if (h > MAXH) h = MAXH;
     if (w <= 0 || h <= 0) return;
     pthread_mutex_lock(&fm);
+    extern int g_gs_gpu;
+    extern int gsb_display(uint64_t, uint64_t, const uint64_t *, const uint64_t *, uint32_t *, uint32_t, int *, int *);
+    if (g_gs_gpu) {   /* the GPU renderer hands back the displayed frame */
+        uint64_t fb2[2] = {hw_gs_priv(0x0070), hw_gs_priv(0x0090)}, disp2[2] = {hw_gs_priv(0x0080), hw_gs_priv(0x00a0)};
+        if (!gsb_display(pmode, hw_gs_priv(0x0020), fb2, disp2, frame_buf, MAXW * MAXH, &w, &h)) { pthread_mutex_unlock(&fm); return; }
+    } else
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++) {
             uint32_t v = gs_read_raw(fbp, fbw, psm, dbx + (uint32_t)x, dby + (uint32_t)y), c;

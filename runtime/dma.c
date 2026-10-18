@@ -93,7 +93,7 @@ void dma_stats(void) {
     LOG("[stats] snd updates %u acks %u\n", g_snd_updates, g_snd_acks);
     {   /* speed: game frames and render-thread time per 2 s (wall) */
         extern unsigned g_frames_queued; extern double g_prof[8];
-        static unsigned lf; static double lp[8]; static struct timespec lt;
+        static unsigned lf; static double lp[8]; static struct timespec lt; static unsigned long long lvs; extern unsigned long long g_vsyncs;
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         double wall = lt.tv_sec ? (now.tv_sec - lt.tv_sec) + (now.tv_nsec - lt.tv_nsec) * 1e-9 : 2.0;
         LOG("[speed] %.1f game fps | vu1 %.0f%% | render %.0f%% (vif1 %.0f%% tri %.0f%% sprite %.0f%% wait %.0f%%)\n", (g_frames_queued - lf) / wall, 100 * (g_prof[4] - lp[4]) / wall,
@@ -101,6 +101,13 @@ void dma_stats(void) {
             100 * (g_prof[2] - lp[2]) / wall, 100 * (g_prof[1] - lp[1]) / wall, 100 * (g_prof[3] - lp[3]) / wall);
         lf = g_frames_queued; for (int k = 0; k < 8; k++) lp[k] = g_prof[k]; lt = now;
         hp_thread_report(wall);
+        { extern int g_gs_gpu; extern void gsb_times(double *, double *, double *);
+          static double lg, ld, ldl;
+          if (g_gs_gpu) { double g, d, dl; gsb_times(&g, &d, &dl);
+            LOG("[gpu] gif %.0f%% display %.0f%% download %.0f%% of wall, %.1f vsyncs/s\n", 100 * (g - lg) / wall, 100 * (d - ld) / wall, 100 * (dl - ldl) / wall,
+                (double)(g_vsyncs - lvs) / wall);
+            lg = g; ld = d; ldl = dl; }
+          lvs = g_vsyncs; }
         { extern unsigned long long g_ev_count, g_ev_late_ns; static unsigned long long lc, ll;
           unsigned long long n = g_ev_count - lc, l = g_ev_late_ns - ll; lc = g_ev_count; ll = g_ev_late_ns;
           LOG("[events] %.0f/s, mean lateness %.0f us, total late %.0f%% of wall\n", n / wall, n ? l / 1000.0 / n : 0.0, 100.0 * l / 1e9 / wall); }

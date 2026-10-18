@@ -41,7 +41,9 @@ to `build/` and is never distributed.
 
 ## Build and run
 
-Requirements: macOS, clang, Python 3, and SDL3 (`brew install sdl3`).
+Requirements: macOS, clang, Python 3, and SDL3 (`brew install sdl3`). The GPU
+renderer links wgpu-native; the Makefile downloads its static library with
+`scripts/fetch_wgpu.sh` on the first build.
 
 You need the contents of your own disc in two places (both git-ignored):
 
@@ -55,7 +57,12 @@ make -j8                                                  # recompiles if needed
 # or step by step:
 python3 -I recomp/main.py disc/SLUS_209.26 build/recomp   # regenerate the C
 ./build/hp build/recomp/image.bin disc                    # run
+make -j8 RELEASE=1 && HP_GS=gpu ./build/rel/hp build/recomp/image.bin disc   # optimized, GPU renderer
 ```
+
+`HP_GS=gpu` draws with WebGPU compute shaders (Metal) instead of the software
+rasterizer in `runtime/gs.c`; the software renderer stays the default and the
+reference.
 
 ## Debugging knobs
 
@@ -78,6 +85,7 @@ a diagnostic dump.
 | `HP_AUTOKEY` | display.c | Scripted key presses |
 | `HP_HEADLESS` | core.c | Run without a window |
 | `HP_GS_THREADS` | gs.c | Number of rasterizer worker threads |
+| `HP_GS=gpu`, `HP_GSSYNC` | gs_bridge.cpp | GPU renderer; `HP_GSSYNC` waits for each displayed frame instead of showing the newest finished one |
 | `HP_CDLAT`, `HP_CDSEEK` | iop_servers.c | Emulated disc read latency / seek time |
 | `HP_ISO` | iop_servers.c | Path to the ISO image |
 

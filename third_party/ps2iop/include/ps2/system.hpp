@@ -19,4 +19,7 @@ extern Options g_options;
 
 std::uint64_t now();   // EE cycles
 
+enum class Rendered { idle, presented, busy };   // used by the vendored GS
+std::uint64_t frame_count();                      // vblanks so far (GPU profiling)
+
 }

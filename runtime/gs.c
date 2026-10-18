@@ -8,6 +8,12 @@
 #include <math.h>
 
 uint8_t *g_vram;
+/* HP_GS=gpu: the GPU renderer (gs_bridge.cpp) draws; this file only keeps the register side */
+int g_gs_gpu;
+int gsb_enabled(void);
+int gsb_init(void);
+void gsb_gif(int path, const void *data, uint32_t qwc);
+void gsb_read_image(uint8_t *dst, uint32_t qwords);
 #define VRAM_WORDS (1u << 20)
 #define V32(i) (((uint32_t *)g_vram)[(i) & (VRAM_WORDS - 1)])
 #define V16(i) (((uint16_t *)g_vram)[(i) & (2 * VRAM_WORDS - 1)])
@@ -209,6 +215,7 @@ static uint32_t clut[512];   /* raw entries: 32-bit colors or 16-bit values */
 static uint32_t cbp0 = ~0u, cbp1 = ~0u;
 
 static void clut_load(uint64_t tex0) {
+    if (g_gs_gpu) return;
     uint32_t psm = bits(tex0, 20, 6), cbp = bits(tex0, 37, 14), cpsm = bits(tex0, 51, 4);
     uint32_t csm = bits(tex0, 55, 1), csa = bits(tex0, 56, 5), cld = bits(tex0, 61, 3);
     if (psm != PSMT8 && psm != PSMT8H && psm != PSMT4 && psm != PSMT4HL && psm != PSMT4HH) return;
@@ -752,6 +759,7 @@ static void draw_line(const DrawCtx *d, const Vtx *v0, const Vtx *v1) {
 
 static int primlog = -1;
 static void vertex_kick(Vtx v, int draw) {
+    if (g_gs_gpu) { g_gs_prims += draw; return; }
     uint64_t prim = gs.prim;
     int type = bits(prim, 0, 3);
     static long primskip = -1;
@@ -838,6 +846,7 @@ static void xfer_put_pixel(uint32_t v) {
 }
 
 static void xfer_start(void) {
+    if (g_gs_gpu) { xfer.active = 0; dl.active = 0; return; }
     int dir = bits(gs.trxdir, 0, 2);
     uint64_t bb = gs.bitbltbuf;
     uint32_t w = bits(gs.trxreg, 0, 12), h = bits(gs.trxreg, 32, 12);
@@ -893,6 +902,7 @@ static int64_t dl_next_pixel(void) {
 
 /* Fill `qwords` quadwords with downloaded image data in the source format (zeros past the end). */
 void gs_read_image(uint8_t *dst, uint32_t qwords) {
+    if (g_gs_gpu) { gsb_read_image(dst, qwords); return; }
     unsigned bpp;
     switch (dl.spsm) {
     case PSMCT32: case PSMZ32: bpp = 32; break;
@@ -1074,6 +1084,7 @@ static void gif_packed(GifPath *p, int reg, const U128 *d) {
 
 /* Feed `n` quadwords of GIF data on path `pi` (0 = PATH1, 1 = PATH2, 2 = PATH3). */
 void gif_feed(int pi, const U128 *q, uint32_t n) {
+    if (g_gs_gpu) gsb_gif(pi, q, n);
     GifPath *p = &paths[pi];
     cur_path = pi;
     for (uint32_t i = 0; i < n; i++) {
@@ -1123,6 +1134,7 @@ int gif_path_idle(int pi) { return !paths[pi].active; }
 
 void gs_init(void) {
     g_vram = calloc(1, 4u << 20);
+    if (gsb_enabled()) g_gs_gpu = gsb_init();
     memset(&gs, 0, sizeof gs);
     gs.prmodecont = 1;   /* reset value: primitive attributes come from PRIM */
 }

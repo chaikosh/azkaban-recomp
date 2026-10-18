@@ -3,3 +3,4 @@ build/
 __pycache__/
 *.pkl
 iso/
+third_party/wgpu-native/lib*/

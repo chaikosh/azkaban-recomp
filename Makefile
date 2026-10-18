@@ -31,7 +31,16 @@ IOP_DIR  := third_party/ps2iop
 CXX      := clang++
 CXXFLAGS := -std=c++20 -O2 -g -w -I$(IOP_DIR)/include -I$(IOP_DIR)/src -I$(IOP_DIR)/src/iop
 IOP_SRC  := $(wildcard $(IOP_DIR)/src/iop/*.cpp) $(IOP_DIR)/src/disc.cpp runtime/iop_bridge.cpp
-IOP_OBJ  := $(patsubst %.cpp,$(OBJDIR)/obj/%.o,$(IOP_SRC))
+# GPU renderer (HP_GS=gpu): ps2-web-recomp's GS (MIT) on wgpu-native (BSD-3/MIT/Apache-2.0)
+GS_DIR   := third_party/ps2gs
+WGPU_DIR := third_party/wgpu-native
+CXXFLAGS += -DPS2_GPU -I$(GS_DIR)/include -I$(GS_DIR)/src -I$(WGPU_DIR)/include
+GS_SRC   := $(wildcard $(GS_DIR)/src/gs/*.cpp) $(GS_DIR)/src/gs/gpu/gpu.cpp runtime/gs_bridge.cpp
+WGSL_OBJ := $(OBJDIR)/obj/wgsl/gs_wgsl.o $(OBJDIR)/obj/wgsl/blit_wgsl.o
+IOP_OBJ  := $(patsubst %.cpp,$(OBJDIR)/obj/%.o,$(IOP_SRC) $(GS_SRC)) $(WGSL_OBJ)
+WGPU_LIB := $(WGPU_DIR)/lib/libwgpu_native.a
+LDFLAGS  += $(WGPU_LIB) -framework Metal -framework QuartzCore -framework Foundation -framework CoreFoundation \
+            -framework IOKit -framework IOSurface -lobjc
 GEN_SRC   = $(wildcard $(GEN)/*.c)
 RT_OBJ   := $(patsubst %.c,$(OBJDIR)/obj/%.o,$(RT_SRC))
 GEN_OBJ   = $(patsubst $(GEN)/%.c,$(OBJDIR)/obj/gen/%.o,$(GEN_SRC))
@@ -49,9 +58,22 @@ $(OUT)/hp: $(GEN)/funcs.h FORCE
 link: $(RT_OBJ) $(GEN_OBJ) $(IOP_OBJ)
 	$(CXX) $(CFLAGS) $(LDFLAGS) -o $(OBJDIR)/hp $^
 
-$(OBJDIR)/obj/%.o: %.cpp $(IOP_DIR)/src/iop/*.hpp
+$(OBJDIR)/obj/%.o: %.cpp $(IOP_DIR)/src/iop/*.hpp $(GS_DIR)/src/gs/*.hpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# WGSL shaders embedded as C strings (kGsShader, kBlitShader)
+$(OBJDIR)/obj/wgsl/gs_wgsl.cpp: $(GS_DIR)/src/gs/gpu/gs.wgsl
+	@mkdir -p $(dir $@)
+	{ printf 'extern const char kGsShader[];\nconst char kGsShader[] = R"WGSL('; cat $<; printf ')WGSL";\n'; } > $@
+$(OBJDIR)/obj/wgsl/blit_wgsl.cpp: $(GS_DIR)/src/gs/gpu/blit.wgsl
+	@mkdir -p $(dir $@)
+	{ printf 'extern const char kBlitShader[];\nconst char kBlitShader[] = R"WGSL('; cat $<; printf ')WGSL";\n'; } > $@
+$(OBJDIR)/obj/wgsl/%.o: $(OBJDIR)/obj/wgsl/%.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(WGPU_LIB):
+	scripts/fetch_wgpu.sh
 
 $(OBJDIR)/obj/%.o: %.c runtime/*.h
 	@mkdir -p $(dir $@)
