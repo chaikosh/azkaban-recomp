@@ -298,7 +298,8 @@ static void vif1_drain_locked(void) {
     }
     if (!stalled && !path3_wait && vq_head == vq_tail && dma1_deferred) {
         dma1_deferred = 0;
-        kern_after(10000 + (uint64_t)dma1_qwords * 8, dma_finish, 1);
+        extern void dma_complete_vif1(uint32_t qwords);
+        dma_complete_vif1(dma1_qwords);
     }
 }
 

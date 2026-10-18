@@ -71,6 +71,7 @@ unsigned g_dma_count[10];
 static unsigned g_dma_qwords;
 void dma_finish(int ch);
 void kern_after(uint64_t ns, void (*fn)(int), int arg);
+static void dma_complete_after(uint64_t base_ns, uint64_t qwords, int ch);
 
 void dma_stats(void) {
     static unsigned last[10];
@@ -117,6 +118,7 @@ void dma_stats(void) {
     vif_stats();
     if (getenv("HP_VUSTATS")) { extern void vu1_stats(void); vu1_stats(); }
     { extern void vu1rec_stats(void); vu1rec_stats(); }
+    { extern void mmio_stats_report(void); mmio_stats_report(); }
     gs_fb_stats();
     ipu_stats();
 }
@@ -145,7 +147,7 @@ static void render_channel(int ch) {
         for (uint32_t k = 0; k < qwc; k++) gs_read_image((uint8_t *)dma_ptr(madr + 16 * k), 1);
         mmio_w32_raw(base[1] + 0x10, madr + 16 * qwc);
         pthread_mutex_unlock(&g_gs_lock);
-        kern_after(20000 + (uint64_t)qwc * 8, dma_finish, 1);
+        dma_complete_after(20000, qwc, 1);
         return;
     }
     if (ch == 1) {
@@ -162,26 +164,41 @@ static void render_channel(int ch) {
     pthread_mutex_unlock(&g_gs_lock);
     clock_gettime(CLOCK_MONOTONIC, &pb);
     if (ch == 1) g_prof[0] += (pb.tv_sec - pa.tv_sec) + (pb.tv_nsec - pa.tv_nsec) * 1e-9;
-    if (complete) kern_after(10000 + (uint64_t)q * 8, dma_finish, ch);
+    if (complete) dma_complete_after(10000, q, ch);
 }
 
+/* Render work runs one item at a time, in order: on the render thread, or (GIF transfers) right
+   away on the posting thread when nothing is queued or running: the game busy-waits on D2_CHCR
+   after each GIF transfer, and waking the render thread costs more than the work.
+   HP_RENDERTHREAD=1 always uses the render thread. */
+static int r_busy;
+static void run_job(int job) {
+    if (job == 16) { extern void vif1_drain_job(void); vif1_drain_job(); }
+    else render_channel(job);
+}
 static void *render_thread(void *arg) {
     hp_thread_register("render");
     (void)arg;
     for (;;) {
         pthread_mutex_lock(&rq_m);
-        while (rq_head == rq_tail) pthread_cond_wait(&rq_cv, &rq_m);
+        while (rq_head == rq_tail || r_busy) pthread_cond_wait(&rq_cv, &rq_m);
         int ch = rq[rq_head];
         rq_head = (rq_head + 1) % 32;
+        r_busy = 1;
         pthread_mutex_unlock(&rq_m);
-        if (ch == 16) { extern void vif1_drain_job(void); vif1_drain_job(); continue; }
-        render_channel(ch);
+        run_job(ch);
+        pthread_mutex_lock(&rq_m);
+        r_busy = 0;
+        pthread_cond_broadcast(&rq_cv);
+        pthread_mutex_unlock(&rq_m);
     }
     return NULL;
 }
 
 /* Queue work for the render thread: a DMA channel (1, 2) or a job (16 = resume VIF1 after STC). */
 void render_post(int job) {
+    static int threaded = -1;
+    if (threaded < 0) threaded = getenv("HP_RENDERTHREAD") != NULL;
     pthread_mutex_lock(&rq_m);
     if (!rthread_started) {
         pthread_t t;
@@ -191,10 +208,22 @@ void render_post(int job) {
         pthread_create(&t, &at, render_thread, NULL);
         rthread_started = 1;
     }
+    /* only GIF (2): short transfers the EE waits for right away; VIF1 (1) stays on the render
+       thread, where it overlaps with the game's own work */
+    if (!threaded && job == 2 && rq_head == rq_tail && !r_busy) {
+        r_busy = 1;
+        pthread_mutex_unlock(&rq_m);
+        run_job(job);
+        pthread_mutex_lock(&rq_m);
+        r_busy = 0;
+        pthread_cond_broadcast(&rq_cv);   /* anything queued meanwhile goes to the render thread */
+        pthread_mutex_unlock(&rq_m);
+        return;
+    }
     if ((rq_tail + 1) % 32 == rq_head) LOG("[dma] render queue full\n");
     rq[rq_tail] = job;
     rq_tail = (rq_tail + 1) % 32;
-    pthread_cond_signal(&rq_cv);
+    pthread_cond_broadcast(&rq_cv);
     pthread_mutex_unlock(&rq_m);
 }
 
@@ -225,7 +254,7 @@ void dma_start(int ch) {
         ipu_from_dma_start(mmio_r32(base[3] + 0x10), mmio_r32(base[3] + 0x20) & 0xffff);
         return;
     }
-    kern_after(20000 + (uint64_t)g_dma_qwords * 8, dma_finish, ch);
+    dma_complete_after(20000, g_dma_qwords, ch);
 }
 
 /* toIPU pull: hand the IPU one quadword, advancing MADR/QWC/TADR like the DMAC would.
@@ -266,6 +295,25 @@ int dma_ipu_pull(U128 *q) {
     }
     return 0;
 }
+
+/* Completion latency of the DMA channels that do not model their own timing (SPR, GIF, VIF1).
+   HP_DMALAT=base_ns,per_qword_ns; the default 0,0 completes the channel as soon as its data has
+   been processed (a timed completion goes through the alarm thread, which itself adds ~10 us, and
+   the game busy-waits on CHCR for every transfer). */
+static void dma_complete_after(uint64_t base_ns, uint64_t qwords, int ch) {
+    static int init; static uint64_t b0, pq;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("HP_DMALAT");
+        if (e) { unsigned long long x = 0, y = 0; sscanf(e, "%llu,%llu", &x, &y); b0 = x; pq = y; }
+    }
+    (void)base_ns;
+    uint64_t ns = b0 + qwords * pq;
+    if (!ns) dma_finish(ch);
+    else kern_after(ns, dma_finish, ch);
+}
+
+void dma_complete_vif1(uint32_t qwords) { dma_complete_after(10000, qwords, 1); }
 
 void dma_finish(int ch) {
     extern void mmio_w32_raw(uint32_t a, uint32_t v);

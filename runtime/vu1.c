@@ -477,6 +477,17 @@ static void rec_revalidate(void) {
                 }
         if (h == e->key) rec_valid[rec_nvalid++] = e;
     }
+    /* several can match at once (a small partial image and the full one): try the most complete first */
+    int count[64];
+    for (int k = 0; k < rec_nvalid; k++) {
+        count[k] = 0;
+        for (int b = 0; b < 256; b++) count[k] += __builtin_popcount(rec_valid[k]->labels[b]);
+    }
+    for (int i = 1; i < rec_nvalid; i++)
+        for (int j = i; j > 0 && count[j] > count[j - 1]; j--) {
+            const VuRecEntry *t = rec_valid[j]; rec_valid[j] = rec_valid[j - 1]; rec_valid[j - 1] = t;
+            int c = count[j]; count[j] = count[j - 1]; count[j - 1] = c;
+        }
 }
 static const VuRecEntry *rec_lookup(uint32_t start) {
     static unsigned gen_seen;
