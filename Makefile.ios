@@ -1,0 +1,125 @@
+# Native arm64 iOS build (SDL3 + wgpu-native on Metal, no JIT).  Needs the generated code from
+# the desktop pipeline first: `make recomp` (build/recomp/gen, image.bin, vu1_gen.c).
+#
+#   make -f Makefile.ios -j4                      iOS Simulator .app, ad-hoc signed
+#   make -f Makefile.ios sim-install sim-data sim-run [SIM=<udid>]
+#                                                 install into a booted simulator, clone the ISO
+#                                                 into its Documents, launch (log: Documents/hp.log)
+#   make -f Makefile.ios SDK=iphoneos -j4         device .app (sign: ios/sign_device.py,
+#                                                 install: ios/install_device.py)
+#   make -f Makefile.ios SDK=iphoneos lib xcode   static library + ios/HPAzkaban.xcodeproj, for
+#                                                 signing and running from Xcode
+# Dependencies (SDL3, wgpu-native) come from ios/deps.sh, run automatically.
+SDK      ?= iphonesimulator
+MINOS    := 16.0
+ifeq ($(SDK),iphonesimulator)
+TARGET   := arm64-apple-ios$(MINOS)-simulator
+PLATFORM := iPhoneSimulator
+WGPU_LIB := third_party/wgpu-native/lib-ios-sim/libwgpu_native.a
+else ifeq ($(SDK),iphoneos)
+TARGET   := arm64-apple-ios$(MINOS)
+PLATFORM := iPhoneOS
+WGPU_LIB := third_party/wgpu-native/lib-ios/libwgpu_native.a
+else
+$(error SDK must be iphonesimulator or iphoneos)
+endif
+NAME      := HPAzkaban
+BUNDLE_ID := com.chaikosh.hp3
+OUT       := build/ios-$(SDK)
+APP       := $(OUT)/$(NAME).app
+REC       := build/recomp
+GEN       := $(REC)/gen
+DEPS      := deps/ios-$(SDK)
+SIM       ?= booted
+
+CC        := xcrun -sdk $(SDK) clang
+CXX       := xcrun -sdk $(SDK) clang++
+# same code generation as the desktop RELEASE=1 build
+CFLAGS    := -O2 -g -target $(TARGET) -fno-strict-aliasing -fwrapv -w -Iruntime -I$(GEN) -I$(DEPS)/include
+GENFLAGS  := -O2 -g0 -target $(TARGET) -fno-strict-aliasing -fwrapv -w -Iruntime -I$(GEN)
+IOP_DIR   := third_party/ps2iop
+GS_DIR    := third_party/ps2gs
+WGPU_DIR  := third_party/wgpu-native
+CXXFLAGS  := -std=c++20 -O2 -g -w -target $(TARGET) -I$(IOP_DIR)/include -I$(IOP_DIR)/src -I$(IOP_DIR)/src/iop \
+             -DPS2_GPU -I$(GS_DIR)/include -I$(GS_DIR)/src -I$(WGPU_DIR)/include
+FRAMEWORKS := UIKit Foundation CoreFoundation CoreGraphics QuartzCore Metal IOSurface AVFoundation AudioToolbox \
+              CoreAudio CoreHaptics CoreMotion GameController CoreBluetooth OpenGLES UniformTypeIdentifiers CoreMedia CoreVideo
+LDFLAGS   := -target $(TARGET) -L$(DEPS)/lib -lSDL3 $(WGPU_LIB) $(addprefix -framework ,$(FRAMEWORKS)) -lobjc
+
+RT_SRC    := $(wildcard runtime/*.c runtime/ios/*.c)
+IOP_SRC   := $(wildcard $(IOP_DIR)/src/iop/*.cpp) $(IOP_DIR)/src/disc.cpp runtime/iop_bridge.cpp
+GS_SRC    := $(wildcard $(GS_DIR)/src/gs/*.cpp) $(GS_DIR)/src/gs/gpu/gpu.cpp runtime/gs_bridge.cpp
+GEN_SRC   := $(wildcard $(GEN)/*.c)
+OBJS      := $(patsubst %.c,$(OUT)/obj/%.o,$(RT_SRC)) $(patsubst %.cpp,$(OUT)/obj/%.o,$(IOP_SRC) $(GS_SRC)) \
+             $(OUT)/obj/wgsl/gs_wgsl.o $(OUT)/obj/wgsl/blit_wgsl.o $(OUT)/obj/vu1_gen.o \
+             $(patsubst $(GEN)/%.c,$(OUT)/obj/gen/%.o,$(GEN_SRC))
+
+.PHONY: all app lib deps xcode bundle sim-install sim-data sim-run sim-log clean
+all: app
+app: deps
+	@test -f $(GEN)/funcs.h -a -f $(REC)/image.bin -a -f $(REC)/vu1_gen.c || { echo "run make recomp first"; exit 1; }
+	@$(MAKE) -f Makefile.ios --no-print-directory SDK=$(SDK) bundle
+lib: deps
+	@$(MAKE) -f Makefile.ios --no-print-directory SDK=$(SDK) $(OUT)/libhp.a
+
+deps:
+	@sh ios/deps.sh $(SDK)
+
+$(OUT)/obj/%.o: %.c runtime/*.h runtime/ios/*.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OUT)/obj/%.o: %.cpp $(IOP_DIR)/src/iop/*.hpp $(GS_DIR)/src/gs/*.hpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+$(OUT)/obj/gen/%.o: $(GEN)/%.c runtime/ee.h runtime/ee_gen.h
+	@mkdir -p $(dir $@)
+	@$(CC) $(GENFLAGS) -c $< -o $@ && echo "  gen $*"
+$(OUT)/obj/vu1_gen.o: $(REC)/vu1_gen.c runtime/vu1_core.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# WGSL shaders embedded as C strings (kGsShader, kBlitShader), as in the desktop Makefile
+$(OUT)/obj/wgsl/gs_wgsl.cpp: $(GS_DIR)/src/gs/gpu/gs.wgsl
+	@mkdir -p $(dir $@)
+	{ printf 'extern const char kGsShader[];\nconst char kGsShader[] = R"WGSL('; cat $<; printf ')WGSL";\n'; } > $@
+$(OUT)/obj/wgsl/blit_wgsl.cpp: $(GS_DIR)/src/gs/gpu/blit.wgsl
+	@mkdir -p $(dir $@)
+	{ printf 'extern const char kBlitShader[];\nconst char kBlitShader[] = R"WGSL('; cat $<; printf ')WGSL";\n'; } > $@
+$(OUT)/obj/wgsl/%.o: $(OUT)/obj/wgsl/%.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# ---- .app without Xcode: binary, Info.plist, bundled image.bin; ad-hoc signature
+$(APP)/$(NAME): $(OBJS) $(WGPU_LIB) $(DEPS)/lib/libSDL3.a
+	@mkdir -p $(APP)
+	$(CXX) -o $@ $(OBJS) $(LDFLAGS)
+
+bundle: $(APP)/$(NAME)
+	cp ios/Info.plist $(APP)/Info.plist
+	plutil -replace CFBundleSupportedPlatforms -json '["$(PLATFORM)"]' $(APP)/Info.plist
+	plutil -replace MinimumOSVersion -string $(MINOS) $(APP)/Info.plist
+	cp -c $(REC)/image.bin $(APP)/image.bin 2>/dev/null || cp $(REC)/image.bin $(APP)/image.bin
+	codesign --force --sign - --timestamp=none $(APP)
+	@echo "built $(APP)"
+
+# ---- static library for the Xcode project (ios/project.yml)
+$(OUT)/libhp.a: $(OBJS)
+	rm -f $@
+	libtool -static -o $@ $^
+	@echo "built $@ ($$(du -sh $@ | cut -f1))"
+
+xcode:
+	cd ios && xcodegen generate --quiet && echo "generated ios/$(NAME).xcodeproj"
+
+# ---- simulator helpers (SIM=booted or a device UDID); game variables go through SIMCTL_CHILD_*,
+#      e.g. SIMCTL_CHILD_HP_AUTOKEY=start@40 make -f Makefile.ios sim-run
+sim-install:
+	xcrun simctl install $(SIM) $(APP)
+sim-data:
+	sh ios/sim_data.sh $(SIM)
+sim-run:
+	xcrun simctl launch $(SIM) $(BUNDLE_ID)
+sim-log:
+	@cat "$$(xcrun simctl get_app_container $(SIM) $(BUNDLE_ID) data)/Documents/hp.log"
+
+clean:
+	rm -rf $(OUT)
