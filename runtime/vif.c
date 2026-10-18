@@ -181,24 +181,25 @@ static void unpack_element(const uint8_t *e) {
    directly; masked or offset writes go through unpack_store.  Returns the data words consumed
    (0: use the per-word path).  HP_VIFSLOW=1 turns it off. */
 static int fast_off = -1;
-static inline void fast_store(const uint8_t *e, uint32_t ncomp, uint32_t bits, uint32_t idx, uint32_t cl, uint32_t wl, int plain) {
-    uint32_t c[4];
-    if (bits == 32) memcpy(c, e, ncomp * 4);
-    else if (bits == 16)
-        for (uint32_t k = 0; k < ncomp; k++) { uint32_t x = e[2 * k] | ((uint32_t)e[2 * k + 1] << 8); c[k] = v1.up_usn ? x : (uint32_t)(int32_t)(int16_t)x; }
-    else
-        for (uint32_t k = 0; k < ncomp; k++) c[k] = v1.up_usn ? e[k] : (uint32_t)(int32_t)(int8_t)e[k];
-    uint32_t row = wl == cl ? 0 : idx % wl;
-    uint32_t qaddr = v1.up_addr + (wl == cl ? idx : (idx / wl) * cl + row);
-    if (!plain) { unpack_store(qaddr, c, (int)ncomp, wl == cl ? idx % wl : row, 0); return; }
-    uint32_t *dst = (uint32_t *)(g_vu1_data + ((qaddr & 0x3ff) << 4));
-    switch (ncomp) {
-    case 4: dst[0] = c[0]; dst[1] = c[1]; dst[2] = c[2]; dst[3] = c[3]; break;
-    case 3: dst[0] = c[0]; dst[1] = c[1]; dst[2] = c[2]; dst[3] = 0; break;
-    case 2: dst[0] = c[0]; dst[1] = c[1]; dst[2] = c[0]; dst[3] = c[1]; break;
-    default: dst[0] = dst[1] = dst[2] = dst[3] = c[0]; break;
+/* Writes one decoded element (c[0..ncomp-1]) the way unpack_store does, with the write mask
+   pre-split into 2-bit ops per cycle row (mop) and ROW/COL kept in locals by the caller. */
+static inline __attribute__((always_inline)) void put_element(uint32_t *dst, const uint32_t *c, uint32_t ncomp, uint32_t ops,
+                                                              int mode, uint32_t *row, uint32_t colv) {
+    for (int k = 0; k < 4; k++) {
+        uint32_t m = (ops >> (2 * k)) & 3, val;
+        if (m == 0) {
+            uint32_t d = k < (int)ncomp ? c[k] : (ncomp == 1 ? c[0] : (ncomp == 2 ? c[k & 1] : dst[k]));
+            if (ncomp == 3 && k == 3) d = 0;
+            if (mode == 1) d += row[k];
+            else if (mode == 2) { d += row[k]; row[k] = d; }
+            val = d;
+        } else if (m == 1) val = row[k];
+        else if (m == 2) val = colv;
+        else continue;
+        dst[k] = val;
     }
 }
+
 static uint32_t unpack_fast(const uint32_t *w, uint32_t nw) {
     if (fast_off < 0) fast_off = getenv("HP_VIFSLOW") != NULL;
     if (fast_off || v1.up_vl == 3) return 0;
@@ -210,22 +211,48 @@ static uint32_t unpack_fast(const uint32_t *w, uint32_t nw) {
     int plain = !(v1.up_m && v1.mask) && !v1.mode;
     const uint8_t *src = (const uint8_t *)w;
     size_t avail = (size_t)nw * 4, pos = 0;
+    uint32_t mop[4] = {0, 0, 0, 0};   /* write-mask ops per cycle row (rows past 3 use row 3) */
+    if (!plain && v1.up_m && v1.mask) for (int r = 0; r < 4; r++) mop[r] = (v1.mask >> (8 * r)) & 0xff;
+    uint32_t row[4] = {v1.row[0], v1.row[1], v1.row[2], v1.row[3]};
+    const int mode = (int)v1.mode;
+    uint8_t tmp[16];
+#define ELEM(e) do { \
+        const uint8_t *el = (e); \
+        uint32_t c[4]; \
+        if (bits == 32) memcpy(c, el, ncomp * 4); \
+        else if (bits == 16) for (uint32_t k = 0; k < ncomp; k++) { uint32_t x = el[2 * k] | ((uint32_t)el[2 * k + 1] << 8); c[k] = v1.up_usn ? x : (uint32_t)(int32_t)(int16_t)x; } \
+        else for (uint32_t k = 0; k < ncomp; k++) c[k] = v1.up_usn ? el[k] : (uint32_t)(int32_t)(int8_t)el[k]; \
+        uint32_t idx = v1.up_cnt, rr = idx % wl; \
+        uint32_t qaddr = v1.up_addr + (wl == cl ? idx : (idx / wl) * cl + rr); \
+        uint32_t *dst = (uint32_t *)(g_vu1_data + ((qaddr & 0x3ff) << 4)); \
+        if (plain) { \
+            switch (ncomp) { \
+            case 4: dst[0] = c[0]; dst[1] = c[1]; dst[2] = c[2]; dst[3] = c[3]; break; \
+            case 3: dst[0] = c[0]; dst[1] = c[1]; dst[2] = c[2]; dst[3] = 0; break; \
+            case 2: dst[0] = c[0]; dst[1] = c[1]; dst[2] = c[0]; dst[3] = c[1]; break; \
+            default: dst[0] = dst[1] = dst[2] = dst[3] = c[0]; break; \
+            } \
+        } else { \
+            uint32_t cr = rr > 3 ? 3 : rr; \
+            put_element(dst, c, ncomp, mop[cr], mode, row, v1.col[cr]); \
+        } \
+        v1.up_cnt++; left--; \
+    } while (0)
     if (ubn) {   /* finish the element the per-word path started */
         size_t need = ebytes - (size_t)ubn;
         if (need > avail) return 0;
-        uint8_t tmp[16];
         memcpy(tmp, ub, (size_t)ubn);
         memcpy(tmp + ubn, src, need);
-        fast_store(tmp, ncomp, bits, v1.up_cnt, cl, wl, plain);
-        v1.up_cnt++; left--;
+        ELEM(tmp);
         pos = need;
         ubn = 0;
     }
     while (left && pos + ebytes <= avail) {
-        fast_store(src + pos, ncomp, bits, v1.up_cnt, cl, wl, plain);
-        v1.up_cnt++; left--;
+        ELEM(src + pos);
         pos += ebytes;
     }
+#undef ELEM
+    if (mode == 2) for (int k = 0; k < 4; k++) v1.row[k] = row[k];
     uint32_t words = (uint32_t)((pos + 3) / 4);
     if (!words) return 0;
     size_t extra = (size_t)words * 4 - pos;   /* rest of the last word: the next element's start, or padding */
@@ -444,7 +471,15 @@ void vif1_words(const uint32_t *w, uint32_t n) {
     if (!vq) vq = malloc(VQ_SIZE * sizeof(uint32_t));
     uint32_t i = 0;
     if (!stalled && !path3_wait && vq_head == vq_tail) i = vif1_exec_block(w, n);   /* timed by the DMA caller (g_prof[0]) */
-    for (; i < n; i++) vif1_word(w[i]);   /* the rest waits in the queue */
+    if (i < n) {   /* the rest waits in the queue */
+        uint32_t left = n - i;
+        if (vq_tail - vq_head + left > VQ_SIZE) { LOG("[vif1] queue overflow\n"); left = VQ_SIZE - (vq_tail - vq_head); }
+        while (left) {
+            uint32_t at = vq_tail & (VQ_SIZE - 1), run = VQ_SIZE - at < left ? VQ_SIZE - at : left;
+            memcpy(&vq[at], w + i, run * 4);
+            vq_tail += run; i += run; left -= run;
+        }
+    }
 }
 
 void vif1_qword(const U128 *q, int is_tag) {
