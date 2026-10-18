@@ -251,7 +251,7 @@ static void load_image(const char *path) {
 }
 
 #include "gs.h"
-static void *guest_main(void *arg) { (void)arg; kern_run_main(g_entry_point); return NULL; }
+static void *guest_main(void *arg) { (void)arg; extern void hp_thread_register(const char *); hp_thread_register("ee-main"); kern_run_main(g_entry_point); return NULL; }
 
 int main(int argc, char **argv) {
     const char *image = argc > 1 ? argv[1] : "build/recomp/image.bin";

@@ -201,13 +201,17 @@ static uint32_t gif_packet_size(uint32_t qaddr) {
     return n;
 }
 
+double g_vu1_kick_time;
 void vu1_xgkick(uint32_t qaddr) {
+    struct timespec ka, kb; clock_gettime(CLOCK_MONOTONIC, &ka);
     { extern uint32_t g_last_xgkick; g_last_xgkick = qaddr & 0x3ff; }
     uint32_t n = gif_packet_size(qaddr);
     if (n > 1024) n = 1024;   /* a kick never reads more than the 16 KiB of VU1 data memory (addresses wrap) */
     U128 buf[1024];
     for (uint32_t k = 0; k < n; k++) memcpy(&buf[k], dmem(qaddr + k), 16);
     gif_feed(0, buf, n);
+    clock_gettime(CLOCK_MONOTONIC, &kb);
+    g_vu1_kick_time += (kb.tv_sec - ka.tv_sec) + (kb.tv_nsec - ka.tv_nsec) * 1e-9;
 }
 
 static float efu_atan(float x) { return atanf(x); }

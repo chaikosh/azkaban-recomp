@@ -146,7 +146,12 @@ static void vif1_mscal(uint32_t addr_pairs) {
     v1.tops = v1.dbf ? v1.base : v1.base + v1.ofst;
     v1.dbf ^= 1;
     v1.last_pc = addr_pairs;
+    extern double g_prof[8], g_vu1_kick_time;
+    struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+    double k0 = g_vu1_kick_time;
     vu1_run(addr_pairs, v1.top, v1.itop);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    g_prof[4] += (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) * 1e-9 - (g_vu1_kick_time - k0);   /* VU1 alone, without GS drawing */
 }
 
 /* Begin the command in `w`; returns number of data words it needs. */

@@ -6,7 +6,12 @@ GEN      := $(REC)/gen
 PY       := python3 -I
 
 CC       := clang
-ifeq ($(RELEASE),1)
+ifeq ($(PROFILE),1)
+# release code with per-block pc tracking only (HP_PROF sampling); objects in build/prof
+OBJDIR   := $(OUT)/prof
+OPT      ?= -O2
+CHECKS   := -DTRACE_PC
+else ifeq ($(RELEASE),1)
 # release: no per-block tracing, return-address checks or watchpoints; objects in build/rel
 OBJDIR   := $(OUT)/rel
 OPT      ?= -O2

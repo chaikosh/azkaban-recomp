@@ -497,6 +497,7 @@ static void run_rows(void) {
 }
 
 static void *gs_worker(void *arg) {
+    { extern void hp_thread_register(const char *); hp_thread_register("gs-worker"); }
     (void)arg;
     int seen = 0;
     for (;;) {

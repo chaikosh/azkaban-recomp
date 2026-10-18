@@ -1,5 +1,7 @@
 /* DMA controller channels and the VIF/GIF/IPU FIFOs (stubs until the GS work). */
 #include "rt.h"
+void hp_thread_register(const char *name);
+void hp_thread_report(double wall);
 #include <stdlib.h>
 #include <pthread.h>
 #include "gs.h"
@@ -89,6 +91,20 @@ void dma_stats(void) {
     lp = g_gs_prims; lpx = g_gs_pixels; lvu = g_vu1_insns; lvw = g_vif1_words;
     extern unsigned g_snd_acks, g_snd_updates;
     LOG("[stats] snd updates %u acks %u\n", g_snd_updates, g_snd_acks);
+    {   /* speed: game frames and render-thread time per 2 s (wall) */
+        extern unsigned g_frames_queued; extern double g_prof[8];
+        static unsigned lf; static double lp[8]; static struct timespec lt;
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        double wall = lt.tv_sec ? (now.tv_sec - lt.tv_sec) + (now.tv_nsec - lt.tv_nsec) * 1e-9 : 2.0;
+        LOG("[speed] %.1f game fps | vu1 %.0f%% | render %.0f%% (vif1 %.0f%% tri %.0f%% sprite %.0f%% wait %.0f%%)\n", (g_frames_queued - lf) / wall, 100 * (g_prof[4] - lp[4]) / wall,
+            100 * (g_prof[0] - lp[0]) / wall, 100 * (g_prof[0] - lp[0] - (g_prof[2] - lp[2]) - (g_prof[1] - lp[1])) / wall,
+            100 * (g_prof[2] - lp[2]) / wall, 100 * (g_prof[1] - lp[1]) / wall, 100 * (g_prof[3] - lp[3]) / wall);
+        lf = g_frames_queued; for (int k = 0; k < 8; k++) lp[k] = g_prof[k]; lt = now;
+        hp_thread_report(wall);
+        { extern unsigned long long g_ev_count, g_ev_late_ns; static unsigned long long lc, ll;
+          unsigned long long n = g_ev_count - lc, l = g_ev_late_ns - ll; lc = g_ev_count; ll = g_ev_late_ns;
+          LOG("[events] %.0f/s, mean lateness %.0f us, total late %.0f%% of wall\n", n / wall, n ? l / 1000.0 / n : 0.0, 100.0 * l / 1e9 / wall); }
+    }
     { extern unsigned long long g_fifo1_qw, g_fifo1_nz; LOG("[stats] vif1 fifo qwords %llu nonzero %llu\n", g_fifo1_qw, g_fifo1_nz); }
     extern void vif_stats(void), gs_fb_stats(void), ipu_stats(void);
     vif_stats();
@@ -134,6 +150,7 @@ static void render_channel(int ch) {
 }
 
 static void *render_thread(void *arg) {
+    hp_thread_register("render");
     (void)arg;
     for (;;) {
         pthread_mutex_lock(&rq_m);

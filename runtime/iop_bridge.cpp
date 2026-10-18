@@ -63,7 +63,9 @@ void advance_locked() {
     ps2::sif::pump();
 }
 
+extern "C" void hp_thread_register(const char *name);
 void iop_thread() {
+    hp_thread_register("iop");
     std::unique_lock<std::recursive_mutex> lk(g_lock);
     while (g_running) {
         advance_locked();

@@ -302,6 +302,7 @@ int rt_cpcond0(EE *c) { return 1; }
 
 /* ---- threads ------------------------------------------------------------ */
 static void *thread_entry(void *arg) {
+    { extern void hp_thread_register(const char *); char nm[16]; snprintf(nm, sizeof nm, "ee-%d", (int)(intptr_t)arg); hp_thread_register(nm); }
     int t = (int)(intptr_t)arg;
     pthread_mutex_lock(&km);
     my_tid = t;
@@ -736,6 +737,7 @@ static void *clock_monitor(void *arg) {
 }
 
 static void *vblank_thread(void *arg) {
+    { extern void hp_thread_register(const char *); hp_thread_register("vblank"); }
     (void)arg;
     uint64_t next = virt_ns();
     const uint64_t period = 16683333;   /* 59.94 Hz of emulated time */
@@ -760,6 +762,7 @@ void hw_timers_fire(void);
 typedef struct { int used; uint64_t due; void (*fn)(int); int arg; } KEvent;
 #define MAX_EVENTS 64
 static KEvent events[MAX_EVENTS];
+unsigned long long g_ev_count, g_ev_late_ns;   /* deferred events fired and their total lateness */
 
 void kern_after(uint64_t ns, void (*fn)(int), int arg) {
     pthread_mutex_lock(&km);
@@ -779,6 +782,7 @@ void kern_timers_changed(void) {
 }
 
 static void *alarm_thread(void *arg) {
+    { extern void hp_thread_register(const char *); hp_thread_register("alarm"); }
     (void)arg;
     pthread_mutex_lock(&km);
     for (;;) {
@@ -790,6 +794,7 @@ static void *alarm_thread(void *arg) {
         if (best >= 0) {
             KEvent e = events[best];
             events[best].used = 0;
+            g_ev_count++; g_ev_late_ns += now - e.due;
             pthread_mutex_unlock(&km);
             e.fn(e.arg);
             pthread_mutex_lock(&km);

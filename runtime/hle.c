@@ -13,7 +13,9 @@ void hle_stream_done(EE *c) {
 #include <time.h>
 static double tnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static int qlog(void) { static int n = -1; if (n < 0) n = getenv("HP_QLOG") ? 100000 : 0; return n > 0 ? n-- : 0; }
+unsigned g_frames_queued;
 void hle_log_queue(EE *c) {
+    g_frames_queued++;
     if (qlog()) LOG("[q %.4f] queue frame (busy %08x head %08x)\n", tnow(), ld32(0x4df7cc), ld32(0x47b82c));
     f_0013c150_orig(c);
 }
