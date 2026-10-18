@@ -442,7 +442,8 @@ void hw_init(void) {
     ipu_init();
     if (iopb_enabled()) {
         const char *iso = getenv("HP_ISO") ? getenv("HP_ISO") : "iso/Harry Potter and the Prisoner of Azkaban (USA).iso";
-        const char *mc = getenv("HP_MEMCARD") ? getenv("HP_MEMCARD") : "build/memcard0.ps2";
+        extern const char *fastboot_memcard(void);
+        const char *mc = fastboot_memcard();   /* HP_MEMCARD, or build/memcard0.ps2 (HP_FASTBOOT=save/load: their own card) */
         iopb_init(iso, mc);
     } else iop_init();
 }

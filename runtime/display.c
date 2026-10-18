@@ -99,8 +99,8 @@ enum { B_SELECT = 0, B_L3, B_R3, B_START, B_UP, B_RIGHT, B_DOWN, B_LEFT, B_L2, B
 
 static void poll_input(SDL_Gamepad *pad) {
     const bool *k = SDL_GetKeyboardState(NULL);
-    uint16_t on = 0;
-    /* HP_AUTOKEY="start@8,cross@12": press a button for ~0.3 s at the given second */
+    uint16_t on = 0, ak_dirs = 0;
+    /* HP_AUTOKEY="start@8,cross@12:1.5": press a button at the given second for 0.3 s (or the given hold time) */
     static const char *ak = (const char *)1;
     static double t0 = -1;
     if (ak == (const char *)1) ak = getenv("HP_AUTOKEY");
@@ -111,13 +111,14 @@ static void poll_input(SDL_Gamepad *pad) {
         if (t0 < 0) t0 = now;
         const char *p = ak;
         while (*p) {
-            char name[16]; double at = 0;
-            if (sscanf(p, "%15[a-z]@%lf", name, &at) == 2 && now - t0 >= at && now - t0 < at + 0.3) {
+            char name[16]; double at = 0, hold = 0.3;   /* "name@second" or "name@second:holdseconds" */
+            if (sscanf(p, "%15[a-z]@%lf:%lf", name, &at, &hold) >= 2 && now - t0 >= at && now - t0 < at + hold) {
                 int b = !strcmp(name, "start") ? B_START : !strcmp(name, "cross") ? B_CRO : !strcmp(name, "circle") ? B_CIR :
                         !strcmp(name, "select") ? B_SELECT : !strcmp(name, "down") ? B_DOWN : !strcmp(name, "up") ? B_UP :
                         !strcmp(name, "left") ? B_LEFT : !strcmp(name, "right") ? B_RIGHT : !strcmp(name, "triangle") ? B_TRI :
                         !strcmp(name, "square") ? B_SQU : !strcmp(name, "lone") ? B_L1 : !strcmp(name, "rone") ? B_R1 : B_START;
-                on |= 1u << b;
+                int stick = !strcmp(name, "lleft") ? 1 : !strcmp(name, "lright") ? 2 : !strcmp(name, "lup") ? 4 : !strcmp(name, "ldown") ? 8 : 0;
+                if (stick) ak_dirs |= stick; else on |= 1u << b;
             }
             p = strchr(p, ',');
             if (!p) break;
@@ -134,6 +135,9 @@ static void poll_input(SDL_Gamepad *pad) {
     int lx = 0x80, ly = 0x80, rx = 0x80, ry = 0x80;
     if (k[SDL_SCANCODE_LEFT]) lx = 0; if (k[SDL_SCANCODE_RIGHT]) lx = 0xff;
     if (k[SDL_SCANCODE_UP]) ly = 0; if (k[SDL_SCANCODE_DOWN]) ly = 0xff;
+    /* scripted left stick: "lup", "ldown", "lleft", "lright" */
+    if (ak_dirs & 1) lx = 0; if (ak_dirs & 2) lx = 0xff;
+    if (ak_dirs & 4) ly = 0; if (ak_dirs & 8) ly = 0xff;
     if (k[SDL_SCANCODE_J]) rx = 0; if (k[SDL_SCANCODE_L]) rx = 0xff;
     if (k[SDL_SCANCODE_I]) ry = 0; if (k[SDL_SCANCODE_K]) ry = 0xff;
     if (pad) {
@@ -262,7 +266,11 @@ void display_loop(void) {
     for (;;) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_EVENT_QUIT) { fflush(stderr); _exit(0); }
+            if (e.type == SDL_EVENT_QUIT) {   /* a save made just before must still reach the card file */
+                extern int iopb_enabled(void); extern void iopb_mc_flush(void);
+                if (iopb_enabled()) iopb_mc_flush();
+                fflush(stderr); _exit(0);
+            }
             if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) pad = SDL_OpenGamepad(e.gdevice.which);
         }
         poll_input(pad);

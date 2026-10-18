@@ -80,6 +80,7 @@ seconds by using the game's own debug paths (`runtime/fastboot.c`):
 
 ```sh
 # corridor in ~10 s; the run ends at vsync 1200 (~20 s)
+mkdir -p /tmp/shots
 HP_FASTBOOT=1 HP_EXITAT=1200 HP_GS=gpu HP_SHOT=/tmp/shots HP_SHOTEVERY=60 \
   perl -e 'alarm shift; exec @ARGV' 60 build/rel/hp build/recomp/image.bin disc
 ```
@@ -96,11 +97,25 @@ starts (wall seconds since launch, vsync). Other modes and options:
   the preset. Chapters and rooms are named like the script binaries in
   `MISC.BIG` (`<chapter>_<room>.hpb`: `day1_greathall`, `night2_lowerdungeon`,
   ...). An unknown chapter falls back to the normal front end.
+- `HP_FASTBOOT=save`: the direct start, then pause -> Save Game -> format a new
+  card -> slot 1, then exit (~2 min). It writes `build/memcard_fastboot.ps2`
+  afresh: a save made in the train corridor ("The Dementor").
+- `HP_FASTBOOT=load`: the front end without the FMV, then Load Game -> slot 1
+  of `build/memcard_fastboot.ps2`: the corridor at ~43 s (the loaded game starts
+  there; no cutscene). `HP_MEMCARD` picks another card for both.
 
-The direct start keeps no memory card profile. Saving a game in the train is
-possible from the in-game options page when the level script allows it, but a
-save and Load Game path is not needed for test runs: the front end alone takes
-longer than the direct start.
+The direct start is the fastest path and needs no memory card data; `load`
+exercises the front end, the memory card and the load path. The log also notes
+`in-game UI starting (pre_ig)` and `in-game HUD, player control (ig)`.
+
+The save/load presets drive the menus with a UI script that reacts to what the
+GUI reports instead of fixed times (menus accept input only after their
+animations, which vary from run to run). `HP_UISCRIPT` runs your own, e.g.
+`HP_FASTBOOT=1 HP_UISCRIPT="wait:SetTraceControlMode(ig) press:start=PauseGame"`
+opens the pause menu as soon as Harry can move. Steps: `wait:TEXT`,
+`press:BUTTON=TEXT` (press until TEXT is reported), `press:BUTTON`,
+`sleep:SECONDS`, `exit`; the events are the FSCommands `HP_FSLOG=1` prints, and
+`card_written`. See `runtime/fastboot.c`.
 
 ## iOS
 
@@ -187,8 +202,10 @@ a diagnostic dump.
 | `HP_CRTLOG` | dma.c | Log changes of the PCRTC registers (PMODE, SMODE2, DISPFB, DISPLAY) from a vsync on |
 | `HP_DUMPAT`, `HP_EXITAT` | hw.c | Run the SIGUSR1 dump at given vsyncs; exit at a vsync (bounded runs) |
 | `HP_VIFLOG`, `HP_GIFLOG`, `HP_QLOG` | hle.c | Log VIF, GIF and queue activity |
-| `HP_AUTOKEY`, `HP_AUTOKEYV` | display.c | Scripted key presses (`cross@12,start@20`; also `circle`, `square`, `triangle`, `select`, `up`/`down`/`left`/`right`, `lone`/`rone` for L1/R1); with `HP_AUTOKEYV=1` the times are emulated seconds (vsyncs / 59.94), so runs repeat on a loaded machine |
-| `HP_FASTBOOT` | fastboot.c | Fast test boot: `1` straight into the train corridor with cutscenes skipped, `noskip`, `menu` (see "Fast test runs") |
+| `HP_AUTOKEY`, `HP_AUTOKEYV` | display.c | Scripted key presses (`cross@12,start@20:1` = hold 1 s; also `circle`, `square`, `triangle`, `select`, d-pad `up`/`down`/`left`/`right`, left stick `lup`/`ldown`/`lleft`/`lright`, `lone`/`rone` for L1/R1); with `HP_AUTOKEYV=1` the times are emulated seconds (vsyncs / 59.94), so runs repeat on a loaded machine |
+| `HP_FASTBOOT` | fastboot.c | Fast test boot: `1` straight into the train corridor with cutscenes skipped, `noskip`, `menu`, `save`, `load` (see "Fast test runs") |
+| `HP_UISCRIPT` | fastboot.c | Menu input that reacts to the GUI's FSCommands (`wait:`, `press:`, `sleep:`, `exit`) |
+| `HP_MEMCARD` | hw.c | Memory card file (default `build/memcard0.ps2`; written ~1 s after the game stops writing, and on window close) |
 | `HP_ARGS`, `HP_ARGSLOG` | fastboot.c | Extra game options (`-startChapter=X -startRoom=Y -startDebugPoint=Z -nomovie ...`); log every option lookup |
 | `HP_FSLOG` | fastboot.c | Log the GUI's FSCommands and the cutscenes (start / end, with wall seconds) |
 | `HP_HEADLESS` | core.c | Run without a window |
