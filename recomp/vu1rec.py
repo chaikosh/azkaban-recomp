@@ -544,9 +544,10 @@ class Gen:
         self.key, self.ranges = key, ranges
         self.name = name = f'vr_{self.start:04x}_{key:016x}'
         prev_kick = lambda m: (not (img.up[(m - 1) & 0x7ff] & I_BIT)) and img.lower_is_kick((m - 1) & 0x7ff)
-        out = [f'static int {name}(VU1 *g, VuResume *res) {{']
-        out.append('    VU1 *restrict const S = g;')
-        out.append('#define s (*S)')
+        # restrict on the parameters (LLVM ignores it on locals): the VU registers in *g never alias
+        # the data memory, so they can stay in host registers across stores and kicks
+        out = [f'static int {name}(VU1 *restrict g, VuResume *restrict res) {{']
+        out.append('#define s (*g)')
         out.append('    int due = res->due, tk = 0, tk2 = 0; uint32_t tkt = 0, tk2t = 0, tpc = 0;')
         out.append('    V4 ur, lr; uint16_t viv; int kv;')
         out.append('    (void)tk2; (void)tk2t; (void)ur; (void)lr; (void)viv; (void)kv;')

@@ -16,7 +16,20 @@ void hp_thread_register(const char *name) {
     pthread_setname_np(name);
     /* the emulation threads are latency-critical: keep them on the performance cores (with the
        default QoS macOS moves them to the efficiency cores as soon as other work runs) */
-    if (!getenv("HP_NOQOS")) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    if (!getenv("HP_NOQOS")) {
+        /* threads named in HP_QOSLOW (default: the GS thread, which only has to keep up) get a lower
+           class, so they do not take a performance core from the EE */
+        const char *low = getenv("HP_QOSLOW") ? getenv("HP_QOSLOW") : "gs";
+        int is_low = 0;
+        size_t n = strlen(name);
+        for (const char *p = low; *p; ) {
+            const char *e = strchr(p, ','); size_t len = e ? (size_t)(e - p) : strlen(p);
+            if (len == n && !strncmp(p, name, n)) is_low = 1;
+            if (!e) break;
+            p = e + 1;
+        }
+        pthread_set_qos_class_self_np(is_low ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INTERACTIVE, 0);
+    }
     pthread_mutex_lock(&tm);
     if (nt < MAXT) { snprintf(tt[nt].name, sizeof tt[nt].name, "%s", name); tt[nt].port = pthread_mach_thread_np(pthread_self()); nt++; }
     pthread_mutex_unlock(&tm);
