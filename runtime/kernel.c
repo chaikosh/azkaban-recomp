@@ -693,6 +693,7 @@ void rt_syscall(EE *c, uint32_t pc) {
         if (iopb_enabled()) { pthread_mutex_unlock(&km); r = iopb_sif_get_reg(A0); pthread_mutex_lock(&km); }
         else r = hw_sif_get_reg(A0);
         break;
+    case 91: r = 0; break;       /* GetEntryAddress */
     case 124: r = -1; break;     /* Deci2Call: no debug host */
     case 125: r = 0; break;      /* PSMode */
     case 126: r = 0; break;      /* MachineType */

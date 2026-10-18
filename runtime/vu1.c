@@ -181,7 +181,7 @@ static void upper(uint32_t op, V4 *out_fd, int *out_reg, int *out_dest, int *out
 }
 
 /* ---- lower ----------------------------------------------------------------- */
-static int xgkick_pending = -1;
+static int xgkick_pending = -1, xgkick_due = -1;
 
 static uint32_t gif_packet_size(uint32_t qaddr) {
     uint32_t n = 0;
@@ -202,9 +202,11 @@ static uint32_t gif_packet_size(uint32_t qaddr) {
 }
 
 void vu1_xgkick(uint32_t qaddr) {
+    { extern uint32_t g_last_xgkick; g_last_xgkick = qaddr & 0x3ff; }
     uint32_t n = gif_packet_size(qaddr);
+    if (n > 1024) n = 1024;   /* a kick never reads more than the 16 KiB of VU1 data memory (addresses wrap) */
     U128 buf[1024];
-    for (uint32_t k = 0; k < n && k < 1024; k++) memcpy(&buf[k], dmem(qaddr + k), 16);
+    for (uint32_t k = 0; k < n; k++) memcpy(&buf[k], dmem(qaddr + k), 16);
     gif_feed(0, buf, n);
 }
 
@@ -373,7 +375,32 @@ static void write_vf(int reg, const V4 *v, int dest) {
 }
 
 /* Run from `start` (instruction pairs) until the E bit; `top`/`itop` from VIF. */
+/* HP_VUSNAP=dir: keep the state each run starts from; the first implausible GS write
+   (gs.c, HP_GSCHECK) saves the code, the pre-run data and registers of the run that made it */
+static uint8_t snap_data[16384];
+static uint8_t snap_regs[4096];
+static uint32_t snap_start, snap_top, snap_itop;
+static int snap_on = -1;
+void vu1_snapshot_save(void) {
+    static int saved;
+    const char *dir = getenv("HP_VUSNAP");
+    if (!dir || saved++) return;
+    char path[1024]; FILE *f;
+    snprintf(path, sizeof path, "%s/code.bin", dir); f = fopen(path, "wb"); if (f) { fwrite(g_vu1_code, 1, 16384, f); fclose(f); }
+    snprintf(path, sizeof path, "%s/data.bin", dir); f = fopen(path, "wb"); if (f) { fwrite(snap_data, 1, 16384, f); fclose(f); }
+    snprintf(path, sizeof path, "%s/regs.bin", dir); f = fopen(path, "wb"); if (f) { fwrite(snap_regs, 1, sizeof snap_regs, f); fclose(f); }
+    LOG("[vu1] snapshot of the run at %04x (top %04x itop %04x) saved to %s\n", snap_start, snap_top, snap_itop, dir);
+}
+/* TPC: where the last microprogram stopped (the pair after its E-bit delay slot); MSCNT resumes here */
+uint32_t vu1_tpc(void) { return vu.pc; }
 void vu1_run(uint32_t start, uint32_t top, uint32_t itop) {
+    { extern uint32_t g_last_vu1_start; g_last_vu1_start = start; }
+    if (snap_on < 0) snap_on = getenv("HP_VUSNAP") != NULL;
+    if (snap_on) {
+        memcpy(snap_data, g_vu1_data, 16384);
+        memcpy(snap_regs, &vu, sizeof vu < sizeof snap_regs ? sizeof vu : sizeof snap_regs);
+        snap_start = start; snap_top = top; snap_itop = itop;
+    }
     static int dumped;
     const char *dump = getenv("HP_VUDUMP");
     if (dump && dumped++ == 20) {
@@ -409,13 +436,19 @@ void vu1_run(uint32_t start, uint32_t top, uint32_t itop) {
         if (uacc) for (int k = 0; k < 4; k++) if (udest & (8 >> k)) vu.acc.u[k] = ures.u[k];
         if (vireg > 0) vu.vi[vireg] = vival;
         if (up & 0x80000000u) { union { uint32_t u; float f; } c = {lo}; vu.i = c.f; }
-        if (xgkick_pending >= 0) vu1_xgkick((uint32_t)xgkick_pending);
+        /* XGKICK: the GIF starts reading the packet a little later, so the pair after the kick can
+           still finish its tag (games write NLOOP right after XGKICK); kick one pair late */
+        if (xgkick_due >= 0) { vu1_xgkick((uint32_t)xgkick_due); xgkick_due = -1; }
+        if (xgkick_pending >= 0) xgkick_due = xgkick_pending;
         /* sequencing: delay slots for branches and the E bit */
         uint32_t next = pc + 1;
         if (branch_pending) { next = branch_target; branch_pending = 0; }
         if (br) { branch_pending = 1; branch_target = tgt; }
         vu.pc = next & 0x7ff;
-        if (ending) return;
+        if (ending) {
+            if (xgkick_due >= 0) { vu1_xgkick((uint32_t)xgkick_due); xgkick_due = -1; }
+            return;
+        }
         if (up & 0x40000000u) ending = 1;   /* E bit: one more pair runs */
     }
     LOG("[vu1] program at %04x did not finish\n", start);

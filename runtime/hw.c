@@ -285,6 +285,7 @@ U128 mmio_r128(uint32_t a) {
     uint32_t p = a & 0x1fffffffu;
     memset(&v, 0, sizeof v);
     if (p >= 0x10007000u && p < 0x10007010u) { extern uint32_t ipu_out_qwords(uint8_t *, uint32_t); ipu_out_qwords((uint8_t *)&v, 1); return v; }
+    if (p >= 0x10005000u && p < 0x10006000u) { extern void gs_read_image(uint8_t *, uint32_t); gs_read_image((uint8_t *)&v, 1); return v; }
     if (p >= 0x10004000u && p < 0x10008000u) { note("fifo read", p, 0); return v; }
     for (int k = 0; k < 4; k++) v.w[k] = mmio_r32(a + 4 * k);
     return v;

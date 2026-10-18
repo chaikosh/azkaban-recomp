@@ -87,7 +87,7 @@ static void unpack_store(uint32_t qaddr, const uint32_t *c, int ncomp, uint32_t 
         switch (m) {
         case 0: {
             uint32_t d = k < ncomp ? c[k] : (ncomp == 1 ? c[0] : (ncomp == 2 ? c[k & 1] : dst[k]));
-            if (ncomp == 3 && k == 3) d = dst[3];
+            if (ncomp == 3 && k == 3) d = 0;   /* V3 writes W = 0 (as ps2-web-recomp does) */
             if (v1.mode == 1) d += v1.row[k];
             else if (v1.mode == 2) { d += v1.row[k]; v1.row[k] = d; }
             val = d;
@@ -163,6 +163,14 @@ static void vif1_command(uint32_t w) {
     uint32_t cmd = (w >> 24) & 0x7f, num = (w >> 16) & 0xff, imm = w & 0xffff;
     g_vifcmd_count[cmd]++;
     v1.code = w;
+    {   /* HP_VIFCMDS=vsync[,n]: log every VIF1 command from that vsync */
+        static long from = -2, left = 0;
+        if (from == -2) { const char *e = getenv("HP_VIFCMDS"); from = e ? atol(e) : -1; left = (e && strchr(e, ',')) ? atol(strchr(e, ',') + 1) : 400; }
+        extern unsigned long long g_vsyncs;
+        if (from >= 0 && (long)g_vsyncs >= from && left > 0) { left--;
+            LOG("[vifcmd v%llu] %08x cmd %02x num %u imm %04x | cl %u wl %u base %03x ofst %03x tops %03x itops %03x dbf %u\n", g_vsyncs, w, cmd, num, imm,
+                v1.cl, v1.wl, v1.base, v1.ofst, v1.tops, v1.itops, v1.dbf); }
+    }
     if (w & 0x80000000u) stall_next = 1;       /* i bit: interrupt and stall once this command (and its data) is done */
     v1.cmd = cmd; v1.num = num; v1.imm = imm; v1.got = 0; v1.need = 0;
     if ((cmd & 0x60) == 0x60) {   /* UNPACK */
@@ -194,7 +202,7 @@ static void vif1_command(uint32_t w) {
     case 0x07: v1.mark = imm; v1.mark_seen = 1; break;
     case 0x10: case 0x11: case 0x13: break;   /* FLUSHE / FLUSH / FLUSHA: VU runs synchronously */
     case 0x14: case 0x15: vif1_mscal(imm); break;
-    case 0x17: vif1_mscal(v1.last_pc); break;   /* MSCNT: continue (approximation) */
+    case 0x17: { extern uint32_t vu1_tpc(void); vif1_mscal(vu1_tpc()); break; }   /* MSCNT: resume at the VU's TPC */
     case 0x20: v1.need = 1; break;
     case 0x30: case 0x31: v1.need = 4; break;
     case 0x4a: v1.need = (num ? num : 256) * 2; v1.mpg_addr = imm * 8; break;

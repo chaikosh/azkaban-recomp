@@ -828,6 +828,7 @@ static struct {
     uint32_t dbp, dbw, dpsm, x, y, sx, w, h;
     uint64_t pending; int pend_bits;
 } xfer;
+static struct { int active; uint32_t sbp, sbw, spsm, sx, sy, w, h, x, y; uint64_t acc; int acc_bits; } dl;
 
 static void xfer_put_pixel(uint32_t v) {
     if (xfer.y >= xfer.h) return;
@@ -869,9 +870,50 @@ static void xfer_start(void) {
             }
         }
         xfer.active = 0;
-    } else {
-        if (dir == 1) LOG("[gs] local->host transfer not supported\n");
+    } else if (dir == 1) {   /* local->host: the EE reads the rectangle through the VIF1 FIFO */
+        dl.active = 1;
+        dl.sbp = bits(bb, 0, 14); dl.sbw = bits(bb, 16, 6); dl.spsm = bits(bb, 24, 6);
+        dl.sx = bits(gs.trxpos, 0, 11); dl.sy = bits(gs.trxpos, 16, 11);
+        dl.w = w; dl.h = h; dl.x = 0; dl.y = 0;
+        dl.acc = 0; dl.acc_bits = 0;
         xfer.active = 0;
+    } else {
+        xfer.active = 0;
+    }
+}
+
+/* Next pixel of a local->host transfer, or -1 when the rectangle is done. */
+static int64_t dl_next_pixel(void) {
+    if (!dl.active || dl.y >= dl.h) { dl.active = 0; return -1; }
+    uint32_t v = gs_read_raw(dl.sbp, dl.sbw, dl.spsm, dl.sx + dl.x, dl.sy + dl.y);
+    if (++dl.x >= dl.w) { dl.x = 0; dl.y++; }
+    return v;
+}
+
+/* Fill `qwords` quadwords with downloaded image data in the source format (zeros past the end). */
+void gs_read_image(uint8_t *dst, uint32_t qwords) {
+    unsigned bpp;
+    switch (dl.spsm) {
+    case PSMCT32: case PSMZ32: bpp = 32; break;
+    case PSMCT24: case PSMZ24: bpp = 24; break;
+    case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: bpp = 16; break;
+    case PSMT8: case PSMT8H: bpp = 8; break;
+    default: bpp = 4; break;
+    }
+    for (uint32_t q = 0; q < qwords; q++) {
+        uint8_t out[16];
+        for (int b = 0; b < 16; b++) {
+            while (dl.acc_bits < 8) {
+                int64_t px = dl_next_pixel();
+                if (px < 0) { dl.acc |= 0; dl.acc_bits = 8; break; }
+                dl.acc |= ((uint64_t)px & ((1ull << bpp) - 1)) << dl.acc_bits;
+                dl.acc_bits += bpp;
+            }
+            out[b] = (uint8_t)dl.acc;
+            dl.acc >>= 8;
+            dl.acc_bits -= 8;
+        }
+        memcpy(dst + 16 * q, out, 16);
     }
 }
 
@@ -910,7 +952,19 @@ static void xfer_data(uint64_t v) {
 }
 
 /* ---- register writes ----------------------------------------------------------------- */
+uint32_t g_last_xgkick = 0, g_last_vu1_start = 0;
+static int frame_plausible(uint64_t v) {
+    uint32_t fbw = bits(v, 16, 6), psm = bits(v, 24, 6);
+    int okpsm = psm == 0 || psm == 1 || psm == 2 || psm == 0xa || psm == 0x30 || psm == 0x31 || psm == 0x32 || psm == 0x3a;
+    return okpsm && fbw <= 32 && bits(v, 30, 2) == 0;
+}
 void gs_write_reg(int reg, uint64_t v) {
+    if ((reg == 0x4c || reg == 0x4d) && !frame_plausible(v)) {   /* HP_GSCHECK: report implausible FRAME writes */
+        static int n = -1; if (n < 0) n = getenv("HP_GSCHECK") ? 12 : 0;
+        if (n > 0) { n--; extern unsigned long long g_vsyncs;
+            LOG("[gscheck v%llu] FRAME_%d = %016llx via path %d (last xgkick %03x, VU1 start %04x)\n", g_vsyncs, reg - 0x4b, (unsigned long long)v, cur_path, g_last_xgkick, g_last_vu1_start);
+            if (cur_path == 0) { extern void vu1_snapshot_save(void); vu1_snapshot_save(); } }
+    }
     static int ctx2log = -1;
     if (ctx2log < 0) ctx2log = getenv("HP_CTX2LOG") ? 200 : 0;
     if (ctx2log > 0 && (reg == 0x07 || reg == 0x09 || reg == 0x15 || reg == 0x19 || reg == 0x41 || reg == 0x43 ||

@@ -109,6 +109,16 @@ static void render_channel(int ch) {
     clock_gettime(CLOCK_MONOTONIC, &pa);
     pthread_mutex_lock(&g_gs_lock);
     g_dma_qwords = 0;
+    if (ch == 1 && !(chcr_now(1) & 1)) {   /* VIF1 to memory: a GS local->host download, ordered after earlier GS work */
+        extern void gs_read_image(uint8_t *dst, uint32_t qwords);
+        extern void mmio_w32_raw(uint32_t a, uint32_t v);
+        uint32_t madr = mmio_r32(base[1] + 0x10), qwc = mmio_r32(base[1] + 0x20) & 0xffff;
+        for (uint32_t k = 0; k < qwc; k++) gs_read_image((uint8_t *)dma_ptr(madr + 16 * k), 1);
+        mmio_w32_raw(base[1] + 0x10, madr + 16 * qwc);
+        pthread_mutex_unlock(&g_gs_lock);
+        kern_after(20000 + (uint64_t)qwc * 8, dma_finish, 1);
+        return;
+    }
     if (ch == 1) {
         if (g_trace > 1) LOG("[dma1] start CHCR %08x MADR %08x QWC %u TADR %08x\n", mmio_r32(base[1]), mmio_r32(base[1] + 0x10),
                              mmio_r32(base[1] + 0x20), mmio_r32(base[1] + 0x30));
