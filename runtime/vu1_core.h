@@ -24,18 +24,18 @@ typedef struct {
     uint32_t branch_target;
 } VuResume;
 
-/* Recompiled code images (build/recomp/vu1_gen.c): returns 0 when the program finished, 1 when
-   the interpreter has to continue from *res. */
-typedef int (*VuRecFn)(VU1 *v, uint32_t start, VuResume *res);
+/* Recompiled routines (build/recomp/vu1_gen.c): code reachable from one start pair up to the next
+   JR/JALR.  fn returns 0 when the program finished, 1 when it stopped: res->jr_miss == 2 is a
+   dynamic jump to res->pc (the dispatcher looks for the routine there), otherwise the interpreter
+   continues from *res.  res->due carries a pending XGKICK in and out. */
+typedef int (*VuRtFn)(VU1 *v, VuResume *res);
 typedef struct {
-    uint64_t hash;             /* code image it was made from (for reports) */
-    VuRecFn fn;
-    int flags;
+    uint16_t start;
+    VuRtFn fn;
     const uint16_t *ranges;    /* pairs it was compiled from: [a, b) ..., 0xffff */
-    uint64_t key;              /* FNV-1a of those pairs: valid while micro memory matches */
-    const uint8_t *labels;     /* bitmap of the pairs it can start at */
-} VuRecEntry;
-extern const VuRecEntry g_vu1rec_table[];
+    uint64_t key;              /* FNV-1a of those pairs: usable while micro memory holds them */
+} VuRoutine;
+extern const VuRoutine g_vu1_routines[];
 
 extern uint8_t *g_vu1_data;
 void vu1_xgkick(uint32_t qaddr);

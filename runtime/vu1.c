@@ -449,87 +449,85 @@ void vu1_stats(void) {
 static void interp(int ending, int branch_pending, uint32_t branch_target);
 static int rec_on = -1, rec_check;
 static unsigned long long rec_runs, rec_bails, rec_misses, rec_bad;
+static int rec_nroutines;
+static int rt_head[2048], *rt_next;          /* routines by start pair */
+static unsigned *rt_gen; static uint8_t *rt_ok; /* validity per code generation */
 static int rec_enabled(void) {
     if (rec_on < 0) {
         const char *e = getenv("HP_VUREC");
         rec_on = !e || strcmp(e, "0") != 0;
         rec_check = getenv("HP_VURECCHECK") != NULL;
-        int n = 0;
-        while (g_vu1rec_table[n].fn) n++;
-        LOG("[vu1rec] %d recompiled code images%s%s\n", n, rec_on ? "" : " (disabled by HP_VUREC=0)", rec_check ? ", checking every run" : "");
+        while (g_vu1_routines[rec_nroutines].fn) rec_nroutines++;
+        rt_next = calloc(rec_nroutines + 1, sizeof *rt_next);
+        rt_gen = calloc(rec_nroutines + 1, sizeof *rt_gen);
+        rt_ok = calloc(rec_nroutines + 1, 1);
+        for (int k = 0; k < 2048; k++) rt_head[k] = -1;
+        for (int k = rec_nroutines - 1; k >= 0; k--) {
+            int st = g_vu1_routines[k].start & 0x7ff;
+            rt_next[k] = rt_head[st];
+            rt_head[st] = k;
+        }
+        LOG("[vu1rec] %d recompiled routines%s%s\n", rec_nroutines, rec_on ? "" : " (disabled by HP_VUREC=0)", rec_check ? ", checking every run" : "");
     }
     return rec_on;
 }
-/* Compiled programs are matched against the pairs they were compiled from, not the whole
-   micro memory: the game's uploads leave different leftovers around the same renderer. */
-static const VuRecEntry *rec_valid[64];
-static int rec_nvalid;
-static void rec_revalidate(void) {
-    rec_nvalid = 0;
-    for (int k = 0; g_vu1rec_table[k].fn && rec_nvalid < 64; k++) {
-        const VuRecEntry *e = &g_vu1rec_table[k];
-        uint64_t h = 1469598103934665603ull;
-        for (const uint16_t *r = e->ranges; *r != 0xffff; r += 2)
-            for (uint32_t n = r[0]; n < r[1]; n++)
-                for (int b = 0; b < 8; b++) {
-                    int byte = g_vu1_code[(n & 0x7ff) * 8 + b];
-                    h ^= (uint8_t)byte; h *= 1099511628211ull;
-                }
-        if (h == e->key) rec_valid[rec_nvalid++] = e;
-    }
-    /* several can match at once (a small partial image and the full one): try the most complete first */
-    int count[64];
-    for (int k = 0; k < rec_nvalid; k++) {
-        count[k] = 0;
-        for (int b = 0; b < 256; b++) count[k] += __builtin_popcount(rec_valid[k]->labels[b]);
-    }
-    for (int i = 1; i < rec_nvalid; i++)
-        for (int j = i; j > 0 && count[j] > count[j - 1]; j--) {
-            const VuRecEntry *t = rec_valid[j]; rec_valid[j] = rec_valid[j - 1]; rec_valid[j - 1] = t;
-            int c = count[j]; count[j] = count[j - 1]; count[j - 1] = c;
-        }
-}
-static const VuRecEntry *rec_lookup(uint32_t start) {
-    static unsigned gen_seen;
+/* A routine is used while micro memory holds exactly the pairs it was compiled from. */
+static const VuRoutine *rec_lookup(uint32_t pc) {
     extern unsigned g_vu1_code_gen;
-    if (gen_seen != g_vu1_code_gen) { rec_revalidate(); gen_seen = g_vu1_code_gen; }
-    for (int k = 0; k < rec_nvalid; k++)
-        if (rec_valid[k]->labels[start >> 3] & (1u << (start & 7))) return rec_valid[k];
-    static uint32_t missed[64]; static int nmissed;
-    uint32_t key = (g_vu1_code_gen << 11) | start;
-    int seen = 0;
-    for (int k = 0; k < nmissed; k++) seen |= missed[k] == key;
-    if (!seen && nmissed < 64) {
-        missed[nmissed++] = key;
-        extern unsigned long long g_vsyncs;
-        LOG("[vu1rec] no recompiled program for %04x in code image %016llx (vsync %llu); collect with HP_VUCOLLECT=build/recomp/vu1\n",
-            start, (unsigned long long)vu1_code_hash(), g_vsyncs);
+    for (int k = rt_head[pc & 0x7ff]; k >= 0; k = rt_next[k]) {
+        const VuRoutine *r = &g_vu1_routines[k];
+        if (rt_gen[k] != g_vu1_code_gen) {
+            uint64_t h = 1469598103934665603ull;
+            for (const uint16_t *g = r->ranges; *g != 0xffff; g += 2)
+                for (uint32_t n = g[0]; n < g[1]; n++)
+                    for (int b = 0; b < 8; b++) { h ^= g_vu1_code[(n & 0x7ff) * 8 + b]; h *= 1099511628211ull; }
+            rt_ok[k] = h == r->key;
+            rt_gen[k] = g_vu1_code_gen;
+        }
+        if (rt_ok[k]) return r;
     }
     return NULL;
 }
-static void rec_run(const VuRecEntry *e, uint32_t start) {
-    VuResume r;
+static void rec_note_miss(uint32_t pc, uint32_t start) {
+    static uint32_t missed[64]; static int nmissed;
+    extern unsigned g_vu1_code_gen;
+    uint32_t key = (g_vu1_code_gen << 11) | pc;
+    for (int k = 0; k < nmissed; k++) if (missed[k] == key) return;
+    if (nmissed < 64) missed[nmissed++] = key;
+    extern unsigned long long g_vsyncs;
+    LOG("[vu1rec] no recompiled routine at %04x (program start %04x, code image %016llx, vsync %llu): interpreting; "
+        "collect with HP_VUCOLLECT=build/recomp/vu1\n", pc, start, (unsigned long long)vu1_code_hash(), g_vsyncs);
+}
+/* Runs the program at start through recompiled routines (the interpreter takes over where none
+   fits).  Returns 0 if no routine fits the start at all (nothing was run). */
+static int rec_run(uint32_t start) {
+    const VuRoutine *rt = rec_lookup(start);
+    if (!rt) { rec_note_miss(start, start); return 0; }
     rec_runs++;
-    if (!e->fn(&vu, start, &r)) return;
-    rec_bails++;
-    if (r.jr_miss) {
-        rec_misses++;
-        static int n;
-        if (n++ < 20) LOG("[vu1rec] %016llx: no compiled code at %04x (start %04x), interpreting\n", (unsigned long long)e->hash, r.pc, start);
+    VuResume r;
+    r.due = -1;
+    for (long hops = 0; hops < 1000000; hops++) {
+        if (!rt->fn(&vu, &r)) return 1;
+        if (r.jr_miss != 2) break;               /* a case the routines do not compile */
+        const VuRoutine *next = rec_lookup(r.pc);
+        if (!next) { rec_misses++; rec_note_miss(r.pc, start); break; }
+        rt = next;
     }
+    rec_bails++;
     vu.pc = r.pc;
     xgkick_due = r.due;
-    interp(r.ending, r.branch_pending, r.branch_target);
+    interp(r.jr_miss == 2 ? 0 : r.ending, r.jr_miss == 2 ? 0 : r.branch_pending, r.jr_miss == 2 ? 0 : r.branch_target);
+    return 1;
 }
 static int same32(const void *a, const void *b) { return !memcmp(a, b, 4); }
-static void rec_run_checked(const VuRecEntry *e, uint32_t start) {
+static int rec_run_checked(uint32_t start) {
     static uint8_t data0[16384], data1[16384];
     static U128 *kicks1;
     static uint32_t kicks1_max;
     VU1 vu0 = vu;
     memcpy(data0, g_vu1_data, 16384);
     capturing = 1; cap_n = 0;
-    rec_run(e, start);
+    if (!rec_run(start)) { capturing = 0; vu = vu0; return 0; }
     VU1 vu1 = vu;
     memcpy(data1, g_vu1_data, 16384);
     uint32_t n1 = cap_n;
@@ -565,12 +563,13 @@ static void rec_run_checked(const VuRecEntry *e, uint32_t start) {
     if (what[0]) {
         rec_bad++;
         static int n;
-        if (n++ < 20) LOG("[vu1rec] MISMATCH %016llx start %04x: %s\n", (unsigned long long)e->hash, start, what);
+        if (n++ < 20) LOG("[vu1rec] MISMATCH code image %016llx start %04x: %s\n", (unsigned long long)vu1_code_hash(), start, what);
     }
     if (cap_n) gif_feed(0, cap, cap_n);   /* the interpreter's result is the one that counts */
+    return 1;
 }
 void vu1rec_stats(void) {
-    LOG("[vu1rec] runs %llu, handed to the interpreter %llu (unknown jump targets %llu), check mismatches %llu\n", rec_runs, rec_bails, rec_misses, rec_bad);
+    LOG("[vu1rec] runs %llu, finished by the interpreter %llu (no routine at a jump target %llu), check mismatches %llu\n", rec_runs, rec_bails, rec_misses, rec_bad);
 }
 
 /* TPC: where the last microprogram stopped (the pair after its E-bit delay slot); MSCNT resumes here */
@@ -600,14 +599,9 @@ void vu1_run(uint32_t start, uint32_t top, uint32_t itop) {
     vu.pc = start & 0x7ff;
     vu.top = top; vu.itop = itop;
     vu.vf[0].f[0] = vu.vf[0].f[1] = vu.vf[0].f[2] = 0; vu.vf[0].f[3] = 1.0f;
-    if (rec_enabled()) {
-        const VuRecEntry *e = rec_lookup(start & 0x7ff);
-        if (e) {
-            if (rec_check) rec_run_checked(e, start & 0x7ff);
-            else rec_run(e, start & 0x7ff);
-            if (prog) prog->pairs += g_vu1_insns - insns0;
-            return;
-        }
+    if (rec_enabled() && (rec_check ? rec_run_checked(start & 0x7ff) : rec_run(start & 0x7ff))) {
+        if (prog) prog->pairs += g_vu1_insns - insns0;
+        return;
     }
     interp(0, 0, 0);
     if (prog) prog->pairs += g_vu1_insns - insns0;

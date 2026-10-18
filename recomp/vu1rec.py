@@ -75,7 +75,7 @@ class Image:
                     work.append(s & 0x7ff)
         return seen
 
-    def successors(self, n):
+    def successors(self, n, follow_jr=True):
         if self.ebit(n):
             return []
         br = self.branch(n)
@@ -90,9 +90,26 @@ class Image:
             out.append(tgt)
         if cond or link:
             out.append((n + 2) & 0x7ff)
-        if kind == 'jr':
+        if kind == 'jr' and follow_jr:
             out.extend(sorted(self.jr_targets))
         return out
+
+    def routine(self, start):
+        """Pairs reachable from `start` without following JR/JALR (those leave the routine through
+        the dispatcher), and the return sites of calls made in it (routine starts of their own)."""
+        seen, work, returns = set(), [start & 0x7ff], set()
+        while work:
+            n = work.pop()
+            if n in seen:
+                continue
+            seen.add(n)
+            br = self.branch(n)
+            if br and br[3]:
+                returns.add((n + 2) & 0x7ff)
+            for x in self.successors(n, follow_jr=False):
+                if x not in seen:
+                    work.append(x)
+        return seen, returns
 
     def upper_sets_mac(self, n):
         up = self.up[n]
@@ -175,11 +192,12 @@ def dest_comps(dest):
 
 
 class Gen:
-    def __init__(self, img, flags):
+    def __init__(self, img, flags, status, start, pcs):
         self.img = img
-        self.flags = flags
-        pcs = img.reachable()
-        self.status = img.reads_status(pcs)          # status flags read anywhere: keep vu_set_mac
+        self.flags = flags                            # some program reads MAC flags: compute them where live
+        self.start = start
+        self.pcs = pcs
+        self.status = status                          # some program reads status flags: keep vu_set_mac
         self.mac_pcs = img.mac_liveness(pcs) if flags else set()
         self.cur = 0
         self.scalar = os.environ.get('VU1REC_SCALAR') == '1'   # emit the per-component form only
@@ -507,106 +525,75 @@ class Gen:
 
     def function(self):
         img = self.img
-        pcs = sorted(img.reachable())
-        labels = set(pcs)
-        targets = set(img.entries) | set(img.jr_targets)
-        for n in pcs:
-            br = img.branch(n)
-            if br and not img.ebit(n) and br[1] is not None:
-                targets.add(br[1])
-            if br and not img.ebit(n) and (br[2] or br[3]):
-                targets.add((n + 2) & 0x7ff)
-        prev_kick = lambda m: (not (img.up[(m - 1) & 0x7ff] & I_BIT)) and img.lower_is_kick((m - 1) & 0x7ff)
-        name = f'vu1rec_{img.hash}'
-        out = [f'static int {name}(VU1 *g, uint32_t start, VuResume *res) {{']
-        out.append('    VU1 s = *g;')
-        out.append('    res->jr_miss = 0;')
-        out.append('    int due = -1, tk = 0, tk2 = 0; uint32_t tkt = 0, tk2t = 0, jr_pc = 0, tpc = 0;')
-        out.append('    V4 ur, lr; uint16_t viv; int kv;')
-        out.append('    (void)tk2; (void)tk2t; (void)ur; (void)lr; (void)viv; (void)kv;')
-        jt = ', '.join(f'[{n}] = &&L_{n:04x}' for n in pcs)
-        out.append(f'    static void *const jt[2048] = {{{jt}}};')
-        out.append('    jr_pc = start & 0x7ff;')
-        out.append('    if (!jt[jr_pc]) goto jr_unknown;')
-        out.append('    goto *jt[jr_pc];')
-        prev = None
-        for n in pcs:
-            if prev is not None and prev != n - 1:
-                pass
-            out.append(f'L_{n:04x}: {{')
-            kc = True   # any compiled pair can be a jump target (JR goes through jt)
-            br = img.branch(n)
-            e = img.ebit(n)
-            d = (n + 1) & 0x7ff
-            if e:
-                out += ['    ' + l for l in self.body(n, kc, 'tk' if br else None)]
-                out.append('    /* E bit: the next pair runs, then the program ends */')
-                out += ['    ' + l for l in self.body(d, prev_kick(d), None)]
-                if br:
-                    out.append(f'    tpc = tk ? (tkt & 0x7ff) : {(n + 2) & 0x7ff};')
-                else:
-                    out.append(f'    tpc = {(n + 2) & 0x7ff};')
-                out.append('    goto done;')
-            elif br:
-                out += ['    ' + l for l in self.body(n, kc, 'tk')]
-                dbr = img.branch(d)
-                out.append('    /* delay slot */')
-                out += ['    ' + l for l in self.body(d, prev_kick(d), 'tk2' if dbr else None)]
-                if dbr or img.ebit(d):
-                    out.append(f'    res->pc = tk ? (tkt & 0x7ff) : {(n + 2) & 0x7ff};')
-                    out.append(f'    res->branch_pending = {"tk2" if dbr else "0"}; res->branch_target = {"tk2t" if dbr else "0"};')
-                    out.append(f'    res->ending = {1 if img.ebit(d) else 0};')
-                    out.append('    goto bail;')
-                else:
-                    kind, tgt, cond, link = br
-                    if kind == 'jr':
-                        out.append('    jr_pc = tkt & 0x7ff;')
-                        out.append('    if (!jt[jr_pc]) goto jr_unknown;')
-                        out.append('    goto *jt[jr_pc];')
-                    elif cond:
-                        out.append(f'    if (tk) goto L_{tgt:04x};')
-                        out.append(f'    goto L_{(n + 2) & 0x7ff:04x};')
-                    else:
-                        out.append(f'    goto L_{tgt:04x};')
-            else:
-                out += ['    ' + l for l in self.body(n, kc, None)]
-                nx = (n + 1) & 0x7ff
-                out.append(f'    goto L_{nx:04x};')
-            out.append('}')
-            prev = n
-        out.append('jr_unknown:')
-        out.append('    res->pc = jr_pc; res->branch_pending = 0; res->branch_target = 0; res->ending = 0;')
-        out.append('    res->jr_miss = 1;')
-        out.append('bail:')
-        out.append('    res->due = due;')
-        out.append('    *g = s;')
-        out.append('    return 1;')
-        out.append('done:')
-        out.append('    if (due >= 0) vu1_xgkick((uint32_t)due);')
-        out.append('    s.pc = tpc;')
-        out.append('    *g = s;')
-        out.append('    return 0;')
-        out.append('}')
-        # the pairs this function was compiled from (labels and delay slots): it is used only while
-        # micro memory holds exactly these
+        pcs = sorted(self.pcs)
         used = sorted(set(pcs) | {(n + 1) & 0x7ff for n in pcs})
+        key = 1469598103934665603
+        for n in used:
+            for b in img.lo[n].to_bytes(4, 'little') + img.up[n].to_bytes(4, 'little'):
+                key = ((key ^ b) * 1099511628211) & 0xffffffffffffffff
         ranges = []
         for n in used:
             if ranges and ranges[-1][1] == n:
                 ranges[-1][1] = n + 1
             else:
                 ranges.append([n, n + 1])
-        key = 1469598103934665603
-        for n in used:
-            for b in img.lo[n].to_bytes(4, 'little') + img.up[n].to_bytes(4, 'little'):
-                key = ((key ^ b) * 1099511628211) & 0xffffffffffffffff
-        flat = ', '.join(f'{a}, {b}' for a, b in ranges)
-        out.append(f'static const uint16_t ranges_{img.hash}[] = {{{flat}, 0xffff}};')
-        bm = [0] * 256
+        self.key, self.ranges = key, ranges
+        self.name = name = f'vr_{self.start:04x}_{key:016x}'
+        prev_kick = lambda m: (not (img.up[(m - 1) & 0x7ff] & I_BIT)) and img.lower_is_kick((m - 1) & 0x7ff)
+        out = [f'static int {name}(VU1 *g, VuResume *res) {{']
+        out.append('    VU1 *restrict const S = g;')
+        out.append('#define s (*S)')
+        out.append('    int due = res->due, tk = 0, tk2 = 0; uint32_t tkt = 0, tk2t = 0, tpc = 0;')
+        out.append('    V4 ur, lr; uint16_t viv; int kv;')
+        out.append('    (void)tk2; (void)tk2t; (void)ur; (void)lr; (void)viv; (void)kv;')
+        out.append(f'    goto L_{self.start:04x};')
         for n in pcs:
-            bm[n >> 3] |= 1 << (n & 7)
-        out.append(f'static const uint8_t labels_{img.hash}[256] = {{{", ".join(str(x) for x in bm)}}};')
-        self.key = key
+            out.append(f'L_{n:04x}: {{')
+            br = img.branch(n)
+            e = img.ebit(n)
+            d = (n + 1) & 0x7ff
+            if e:
+                out += ['    ' + l for l in self.body(n, True, 'tk' if br else None)]
+                out.append('    /* E bit: the next pair runs, then the program ends */')
+                out += ['    ' + l for l in self.body(d, prev_kick(d), None)]
+                out.append(f'    tpc = tk ? (tkt & 0x7ff) : {(n + 2) & 0x7ff};' if br else f'    tpc = {(n + 2) & 0x7ff};')
+                out.append('    goto done;')
+            elif br:
+                out += ['    ' + l for l in self.body(n, True, 'tk')]
+                dbr = img.branch(d)
+                out.append('    /* delay slot */')
+                out += ['    ' + l for l in self.body(d, prev_kick(d), 'tk2' if dbr else None)]
+                if dbr or img.ebit(d):
+                    out.append(f'    res->pc = tk ? (tkt & 0x7ff) : {(n + 2) & 0x7ff};')
+                    out.append(f'    res->branch_pending = {"tk2" if dbr else "0"}; res->branch_target = {"tk2t" if dbr else "0"};')
+                    out.append(f'    res->ending = {1 if img.ebit(d) else 0}; res->jr_miss = 0;')
+                    out.append('    goto bail;')
+                else:
+                    kind, tgt, cond, link = br
+                    if kind == 'jr':
+                        out.append('    res->pc = tkt & 0x7ff; res->branch_pending = 0; res->branch_target = 0; res->ending = 0;')
+                        out.append('    res->jr_miss = 2;')
+                        out.append('    goto bail;')
+                    elif cond:
+                        out.append(f'    if (tk) goto L_{tgt:04x};')
+                        out.append(f'    goto L_{(n + 2) & 0x7ff:04x};')
+                    else:
+                        out.append(f'    goto L_{tgt:04x};')
+            else:
+                out += ['    ' + l for l in self.body(n, True, None)]
+                out.append(f'    goto L_{(n + 1) & 0x7ff:04x};')
+            out.append('}')
+        out.append('bail:')
+        out.append('    res->due = due;')
+        out.append('    return 1;')
+        out.append('done:')
+        out.append('    if (due >= 0) vu1_xgkick((uint32_t)due);')
+        out.append('    s.pc = tpc;')
+        out.append('    return 0;')
+        out.append('#undef s')
+        out.append('}')
+        flat = ', '.join(f'{a}, {b}' for a, b in ranges)
+        out.append(f'static const uint16_t rg_{self.start:04x}_{key:016x}[] = {{{flat}, 0xffff}};')
         return out, len(pcs)
 
 
@@ -635,45 +622,47 @@ def main():
                 images[parts[0]].jr_targets.add(int(parts[1], 16) & 0x7ff)
             else:
                 images[parts[0]].entries.add(int(parts[1], 16) & 0x7ff)
-    # Images often hold the same renderer with different leftovers around it: a jump target seen in
-    # one image is added to another when the code it reaches is identical there.
-    for a in images.values():
-        for b in images.values():
-            if a is b:
-                continue
-            for t in sorted(b.jr_targets - a.jr_targets):
-                saved = b.entries
-                b.entries = {t}
-                saved_jr = b.jr_targets
-                b.jr_targets = set()
-                reach = b.reachable()
-                b.entries, b.jr_targets = saved, saved_jr
-                used = reach | {(n + 1) & 0x7ff for n in reach}
-                if all(a.lo[n] == b.lo[n] and a.up[n] == b.up[n] for n in used):
-                    a.jr_targets.add(t)
+    # One C function per routine: code reachable from an entry, a JR target or a call's return
+    # site, up to the next JR/JALR (which goes back through the dispatcher).  Routines are keyed by
+    # their own pairs, so they are shared between code images and valid whenever micro memory holds
+    # those pairs, whatever else is loaded around them.
+    allpcs = {h: img.reachable() for h, img in images.items()}
+    flags = any(img.reads_flags(allpcs[h]) for h, img in images.items())
+    status = any(img.reads_status(allpcs[h]) for h, img in images.items())
     out = ['/* Generated by recomp/vu1rec.py from the VU1 code images the game uploaded. Do not edit. */',
            '#include "vu1_core.h"',
            '']
-    table = []
+    table, seen = [], set()
     total = 0
     for h, img in sorted(images.items()):
         if not img.entries:
             continue
-        flags = img.reads_flags(img.reachable())
-        g = Gen(img, flags)
-        lines, n = g.function()
-        total += n
-        out += lines
-        out.append('')
-        table.append((h, flags, g.key))
-    out.append('const VuRecEntry g_vu1rec_table[] = {')
-    for h, flags, key in table:
-        out.append(f'    {{0x{h}ull, vu1rec_{h}, {1 if flags else 0}, ranges_{h}, 0x{key:016x}ull, labels_{h}}},')
-    out.append('    {0, 0, 0, 0, 0, 0},')
+        starts, work = set(), sorted(img.entries | img.jr_targets)
+        while work:
+            st = work.pop()
+            if st in starts:
+                continue
+            starts.add(st)
+            pcs, returns = img.routine(st)
+            work.extend(r for r in returns if r not in starts)
+            g = Gen(img, flags, status, st, pcs)
+            lines, n = g.function()
+            ident = (st, g.key, tuple(map(tuple, g.ranges)))
+            if ident in seen:
+                continue
+            seen.add(ident)
+            total += n
+            out += lines
+            out.append('')
+            table.append((st, g.name, g.key))
+    out.append('const VuRoutine g_vu1_routines[] = {')
+    for st, name, key in table:
+        out.append(f'    {{{st}, {name}, rg_{st:04x}_{key:016x}, 0x{key:016x}ull}},')
+    out.append('    {0, 0, 0, 0},')
     out.append('};')
     with open(dst, 'w') as f:
         f.write('\n'.join(out) + '\n')
-    print(f'vu1rec: {len(table)} code images, {total} pairs -> {dst}')
+    print(f'vu1rec: {len(images)} code images, {len(table)} routines, {total} pairs -> {dst}')
 
 
 if __name__ == '__main__':
