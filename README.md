@@ -64,6 +64,44 @@ make -j8 RELEASE=1 && HP_GS=gpu ./build/rel/hp build/recomp/image.bin disc   # o
 rasterizer in `runtime/gs.c`; the software renderer stays the default and the
 reference.
 
+### Fast test runs
+
+A normal boot (memory card check, EA/WB logos, intro movie, title, menu, New
+Game, the train-compartment cutscene) reaches the first 3D gameplay (the train
+corridor) after about two minutes. `HP_FASTBOOT=1` gets there in about 10
+seconds by using the game's own debug paths (`runtime/fastboot.c`):
+
+- the debug options `-startChapter=Intro -startRoom=HogwartsExpress` are added
+  to the options the game reads from `RUNTIME.CFG`, so it skips the logos, the
+  movies and the front end and starts the chapter in that room;
+- cutscenes are made skippable and Cross is pressed while one plays, so the
+  game's own skip ends it (the corridor that follows is the same as after
+  watching the scene).
+
+```sh
+# corridor in ~10 s; the run ends at vsync 1200 (~20 s)
+HP_FASTBOOT=1 HP_EXITAT=1200 HP_GS=gpu HP_SHOT=/tmp/shots HP_SHOTEVERY=60 \
+  perl -e 'alarm shift; exec @ARGV' 60 build/rel/hp build/recomp/image.bin disc
+```
+
+The log shows `[fastboot 8.7s v518] cutscene over: gameplay` when the corridor
+starts (wall seconds since launch, vsync). Other modes and options:
+
+- `HP_FASTBOOT=noskip`: the same start, but cutscenes play (corridor at ~40 s).
+- `HP_FASTBOOT=menu`: the normal front end without the FMV (`-nomovie`): the
+  main menu at ~22 s instead of ~75 s. Add `HP_AUTOKEYV=1 HP_AUTOKEY=cross@23`
+  for New Game (corridor at ~29 s, cutscene skipped).
+- `HP_ARGS="-startChapter=Day1 -startRoom=GreatHall"`: start in another room
+  (the Great Hall at ~7 s), or pass any other game option; `HP_ARGS` wins over
+  the preset. Chapters and rooms are named like the script binaries in
+  `MISC.BIG` (`<chapter>_<room>.hpb`: `day1_greathall`, `night2_lowerdungeon`,
+  ...). An unknown chapter falls back to the normal front end.
+
+The direct start keeps no memory card profile. Saving a game in the train is
+possible from the in-game options page when the level script allows it, but a
+save and Load Game path is not needed for test runs: the front end alone takes
+longer than the direct start.
+
 ## Debugging knobs
 
 Everything is controlled by environment variables read by the runtime. See the
@@ -87,7 +125,10 @@ a diagnostic dump.
 | `HP_CRTLOG` | dma.c | Log changes of the PCRTC registers (PMODE, SMODE2, DISPFB, DISPLAY) from a vsync on |
 | `HP_DUMPAT`, `HP_EXITAT` | hw.c | Run the SIGUSR1 dump at given vsyncs; exit at a vsync (bounded runs) |
 | `HP_VIFLOG`, `HP_GIFLOG`, `HP_QLOG` | hle.c | Log VIF, GIF and queue activity |
-| `HP_AUTOKEY`, `HP_AUTOKEYV` | display.c | Scripted key presses; with `HP_AUTOKEYV=1` the times are emulated seconds (vsyncs / 59.94), so runs repeat on a loaded machine |
+| `HP_AUTOKEY`, `HP_AUTOKEYV` | display.c | Scripted key presses (`cross@12,start@20`; also `circle`, `square`, `triangle`, `select`, `up`/`down`/`left`/`right`, `lone`/`rone` for L1/R1); with `HP_AUTOKEYV=1` the times are emulated seconds (vsyncs / 59.94), so runs repeat on a loaded machine |
+| `HP_FASTBOOT` | fastboot.c | Fast test boot: `1` straight into the train corridor with cutscenes skipped, `noskip`, `menu` (see "Fast test runs") |
+| `HP_ARGS`, `HP_ARGSLOG` | fastboot.c | Extra game options (`-startChapter=X -startRoom=Y -startDebugPoint=Z -nomovie ...`); log every option lookup |
+| `HP_FSLOG` | fastboot.c | Log the GUI's FSCommands and the cutscenes (start / end, with wall seconds) |
 | `HP_HEADLESS` | core.c | Run without a window |
 | `HP_GS_THREADS` | gs.c | Number of rasterizer worker threads |
 | `HP_GS=gpu`, `HP_GSSYNC` | gs_bridge.cpp | GPU renderer; `HP_GSSYNC` waits for each displayed frame instead of showing the newest finished one |
