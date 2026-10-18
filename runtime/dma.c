@@ -112,11 +112,23 @@ void dma_stats(void) {
     {   /* speed: game frames and render-thread time per 2 s (wall) */
         extern unsigned g_frames_queued; extern double g_prof[8];
         static unsigned lf; static double lp[8]; static struct timespec lt; static unsigned long long lvs; extern unsigned long long g_vsyncs;
-        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        struct timespec now; clock_gettime(CLOCK_UPTIME_RAW, &now);
         double wall = lt.tv_sec ? (now.tv_sec - lt.tv_sec) + (now.tv_nsec - lt.tv_nsec) * 1e-9 : 2.0;
         LOG("[speed] %.1f game fps | vu1 %.0f%% | render %.0f%% (vif1 %.0f%% tri %.0f%% sprite %.0f%% wait %.0f%%)\n", (g_frames_queued - lf) / wall, 100 * (g_prof[4] - lp[4]) / wall,
             100 * (g_prof[0] - lp[0]) / wall, 100 * (g_prof[0] - lp[0] - (g_prof[2] - lp[2]) - (g_prof[1] - lp[1])) / wall,
             100 * (g_prof[2] - lp[2]) / wall, 100 * (g_prof[1] - lp[1]) / wall, 100 * (g_prof[3] - lp[3]) / wall);
+        {   /* per game frame: VIF1 commands without VU1, VU1 without its GS kicks, the kicks */
+            extern double g_vu1_kick_time; static double lk, lg, ld;
+            extern int g_gs_gpu; extern void gsb_times(double *, double *, double *);
+            double g = 0, d = 0, dl = 0;
+            if (g_gs_gpu) gsb_times(&g, &d, &dl);
+            double fr = g_frames_queued - lf;
+            if (fr > 0)
+                LOG("[frame] ms per game frame: vif1 %.1f, vu1 %.1f, vu1 kicks %.1f | gpu gif parse %.1f, display %.1f\n",
+                    1000 * ((g_prof[5] - lp[5]) - (g_prof[4] - lp[4]) - (g_vu1_kick_time - lk)) / fr, 1000 * (g_prof[4] - lp[4]) / fr,
+                    1000 * (g_vu1_kick_time - lk) / fr, 1000 * (g - lg) / fr, 1000 * (d - ld) / fr);
+            lk = g_vu1_kick_time; lg = g; ld = d;
+        }
         lf = g_frames_queued; for (int k = 0; k < 8; k++) lp[k] = g_prof[k]; lt = now;
         hp_thread_report(wall);
         { extern int g_gs_gpu; extern void gsb_times(double *, double *, double *);
@@ -154,7 +166,7 @@ int dma_path3_busy(void) { return __atomic_load_n(&path3_pending, __ATOMIC_SEQ_C
 static void render_channel(int ch) {
     extern double g_prof[8];
     struct timespec pa, pb;
-    clock_gettime(CLOCK_MONOTONIC, &pa);
+    clock_gettime(CLOCK_UPTIME_RAW, &pa);
     pthread_mutex_lock(&g_gs_lock);
     g_dma_qwords = 0;
     if (ch == 1 && !(chcr_now(1) & 1)) {   /* VIF1 to memory: a GS local->host download, ordered after earlier GS work */
@@ -181,7 +193,7 @@ static void render_channel(int ch) {
     extern int vif1_dma_done(uint32_t qwords);
     int complete = ch == 1 ? vif1_dma_done(q) : 1;
     pthread_mutex_unlock(&g_gs_lock);
-    clock_gettime(CLOCK_MONOTONIC, &pb);
+    clock_gettime(CLOCK_UPTIME_RAW, &pb);
     if (ch == 1) g_prof[0] += (pb.tv_sec - pa.tv_sec) + (pb.tv_nsec - pa.tv_nsec) * 1e-9;
     if (complete) dma_complete_after(10000, q, ch);
 }
@@ -441,7 +453,9 @@ static void dma_run(int ch, DmaSink sink, int tte) {
 static uint32_t chcr_now(int ch) { return mmio_r32(base[ch]); }
 void vif1_qword(const U128 *q, int is_tag);
 static void vif1_sink(const U128 *q, uint32_t n, int is_tag) {
+    extern void vif1_words(const uint32_t *w, uint32_t n);
     g_dma_qwords += n;
+    if (!is_tag) { vif1_words((const uint32_t *)q, n * 4); return; }
     for (uint32_t k = 0; k < n; k++) vif1_qword(&q[k], is_tag);
 }
 

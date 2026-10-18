@@ -164,6 +164,47 @@ static void unpack_element(const uint8_t *e) {
     v1.up_cnt++;
 }
 
+/* Bulk UNPACK of whole elements for the common case (no write mask, MODE 0, CL >= WL, elements
+   of whole words: V4/V3/V2/S-32, V4/V2-16, V4-8): the same results as unpack_element, without
+   the per-word byte buffer.  Returns the data words consumed (0: use the general path). */
+static int fast_off = -1;
+static uint32_t unpack_fast(const uint32_t *w, uint32_t nw) {
+    if (fast_off < 0) fast_off = getenv("HP_VIFSLOW") != NULL;
+    if (fast_off || ubn || (v1.up_m && v1.mask) || v1.mode || v1.up_vl == 3) return 0;
+    uint32_t cl = v1.cl ? v1.cl : 1, wl = v1.wl ? v1.wl : 1;
+    if (wl > cl) return 0;
+    uint32_t ncomp = v1.up_vn + 1, bits = 32u >> v1.up_vl, ebytes = ncomp * bits / 8;
+    if (ebytes & 3) return 0;
+    uint32_t ewords = ebytes / 4;
+    uint32_t nelem = nw / ewords, left = v1.up_total - v1.up_cnt;
+    if (nelem > left) nelem = left;
+    if (!nelem) return 0;
+    const uint8_t *src = (const uint8_t *)w;
+    for (uint32_t e = 0; e < nelem; e++, src += ebytes) {
+        uint32_t idx = v1.up_cnt + e;
+        uint32_t qaddr = v1.up_addr + (wl == cl ? idx : (idx / wl) * cl + (idx % wl));
+        uint32_t *dst = (uint32_t *)(g_vu1_data + ((qaddr & 0x3ff) << 4));
+        uint32_t c[4];
+        if (bits == 32) memcpy(c, src, ebytes);
+        else if (bits == 16) {
+            for (uint32_t k = 0; k < ncomp; k++) {
+                uint32_t x = src[2 * k] | ((uint32_t)src[2 * k + 1] << 8);
+                c[k] = v1.up_usn ? x : (uint32_t)(int32_t)(int16_t)x;
+            }
+        } else {
+            for (uint32_t k = 0; k < ncomp; k++) c[k] = v1.up_usn ? src[k] : (uint32_t)(int32_t)(int8_t)src[k];
+        }
+        switch (ncomp) {
+        case 4: dst[0] = c[0]; dst[1] = c[1]; dst[2] = c[2]; dst[3] = c[3]; break;
+        case 3: dst[0] = c[0]; dst[1] = c[1]; dst[2] = c[2]; dst[3] = 0; break;
+        case 2: dst[0] = c[0]; dst[1] = c[1]; dst[2] = c[0]; dst[3] = c[1]; break;
+        default: dst[0] = dst[1] = dst[2] = dst[3] = c[0]; break;
+        }
+    }
+    v1.up_cnt += nelem;
+    return nelem * ewords;
+}
+
 static void vif1_mscal(uint32_t addr_pairs) {
     v1.top = v1.tops;
     v1.itop = v1.itops;
@@ -172,10 +213,10 @@ static void vif1_mscal(uint32_t addr_pairs) {
     v1.dbf ^= 1;
     v1.last_pc = addr_pairs;
     extern double g_prof[8], g_vu1_kick_time;
-    struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+    struct timespec a, b; clock_gettime(CLOCK_UPTIME_RAW, &a);
     double k0 = g_vu1_kick_time;
     vu1_run(addr_pairs, v1.top, v1.itop);
-    clock_gettime(CLOCK_MONOTONIC, &b);
+    clock_gettime(CLOCK_UPTIME_RAW, &b);
     g_prof[4] += (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) * 1e-9 - (g_vu1_kick_time - k0);   /* VU1 alone, without GS drawing */
 }
 
@@ -300,17 +341,48 @@ static void vif1_exec_word(uint32_t w) {
     }
 }
 
+/* Runs words until done or until the VIF stops (i-bit stall, FLUSHA waiting for PATH3); returns
+   the words consumed.  Whole UNPACK elements go through unpack_fast. */
+static uint32_t vif1_exec_block(const uint32_t *w, uint32_t n) {
+    uint32_t i = 0;
+    while (i < n && !stalled && !path3_wait) {
+        if (v1.need && (v1.cmd & 0x60) == 0x60) {
+            uint32_t want = v1.need - v1.got;
+            uint32_t k = unpack_fast(w + i, want < n - i ? want : n - i);
+            if (k) {
+                g_vif1_words += k;
+                v1.got += k;
+                i += k;
+                if (v1.got >= v1.need) { v1.cmd = 0; v1.need = 0; }
+                if (stall_next && !v1.need) {
+                    stall_next = 0;
+                    stalled = 1;
+                    { extern void synclog(const char *, ...); synclog("vif1 I-stall code %08x mark %x", v1.code, v1.mark); }
+                    kern_raise_intc(5);
+                }
+                continue;
+            }
+        }
+        vif1_exec_word(w[i++]);
+    }
+    return i;
+}
+
+static inline double vnow(void) { struct timespec t; clock_gettime(CLOCK_UPTIME_RAW, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+extern double g_prof[8];   /* 5: VIF1 command processing including VU1 (vu1.c: 4 = VU1 alone) */
 static void vif1_drain_locked(void) {
+    double t0 = vnow();
     while (!stalled && !path3_wait && vq_head != vq_tail) {
-        uint32_t w = vq[vq_head & (VQ_SIZE - 1)];
-        vq_head++;
-        vif1_exec_word(w);
+        uint32_t at = vq_head & (VQ_SIZE - 1), len = vq_tail - vq_head;
+        if (len > VQ_SIZE - at) len = VQ_SIZE - at;   /* contiguous part of the ring */
+        vq_head += vif1_exec_block(&vq[at], len);
     }
     if (!stalled && !path3_wait && vq_head == vq_tail && dma1_deferred) {
         dma1_deferred = 0;
         extern void dma_complete_vif1(uint32_t qwords);
         dma_complete_vif1(dma1_qwords);
     }
+    g_prof[5] += vnow() - t0;
 }
 
 /* Render thread, g_gs_lock held: every GIF DMA transfer started so far has gone through. */
@@ -337,6 +409,16 @@ int vif1_dma_done(uint32_t qwords) {
     dma1_deferred = 1;
     dma1_qwords = qwords;
     return 0;
+}
+
+/* Data words straight from the DMA engine (lock held). */
+void vif1_words(const uint32_t *w, uint32_t n) {
+    if (!vq) vq = malloc(VQ_SIZE * sizeof(uint32_t));
+    uint32_t i = 0;
+    double t0 = vnow();
+    if (!stalled && !path3_wait && vq_head == vq_tail) i = vif1_exec_block(w, n);
+    g_prof[5] += vnow() - t0;
+    for (; i < n; i++) vif1_word(w[i]);   /* the rest waits in the queue */
 }
 
 void vif1_qword(const U128 *q, int is_tag) {

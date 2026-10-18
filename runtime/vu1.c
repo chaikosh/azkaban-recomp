@@ -186,7 +186,7 @@ static U128 *cap;
 static uint32_t cap_n, cap_max;
 static int capturing;
 void vu1_xgkick(uint32_t qaddr) {
-    struct timespec ka, kb; clock_gettime(CLOCK_MONOTONIC, &ka);
+    struct timespec ka, kb; clock_gettime(CLOCK_UPTIME_RAW, &ka);
     { extern uint32_t g_last_xgkick; g_last_xgkick = qaddr & 0x3ff; }
     uint32_t n = gif_packet_size(qaddr);
     if (n > 1024) n = 1024;   /* a kick never reads more than the 16 KiB of VU1 data memory (addresses wrap) */
@@ -199,7 +199,7 @@ void vu1_xgkick(uint32_t qaddr) {
     U128 buf[1024];
     for (uint32_t k = 0; k < n; k++) memcpy(&buf[k], dmem(qaddr + k), 16);
     gif_feed(0, buf, n);
-    clock_gettime(CLOCK_MONOTONIC, &kb);
+    clock_gettime(CLOCK_UPTIME_RAW, &kb);
     g_vu1_kick_time += (kb.tv_sec - ka.tv_sec) + (kb.tv_nsec - ka.tv_nsec) * 1e-9;
 }
 
@@ -499,7 +499,7 @@ static void rec_note_miss(uint32_t pc, uint32_t start) {
    fits).  Returns 0 if no routine fits the start at all (nothing was run). */
 static int rec_run(uint32_t start) {
     const VuRoutine *rt = rec_lookup(start);
-    if (!rt) { rec_note_miss(start, start); return 0; }
+    if (!rt) { rec_note_miss(start, start); if (collect_jr) note_jr(start); return 0; }
     rec_runs++;
     VuResume r;
     r.due = -1;
@@ -507,7 +507,7 @@ static int rec_run(uint32_t start) {
         if (!rt->fn(&vu, &r)) return 1;
         if (r.jr_miss != 2) break;               /* a case the routines do not compile */
         const VuRoutine *next = rec_lookup(r.pc);
-        if (!next) { rec_misses++; rec_note_miss(r.pc, start); break; }
+        if (!next) { rec_misses++; rec_note_miss(r.pc, start); if (collect_jr) note_jr(r.pc); break; }
         rt = next;
     }
     rec_bails++;

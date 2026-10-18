@@ -583,7 +583,7 @@ static void *gs_worker(void *arg) {
 
 #include <time.h>
 double g_prof[8];   /* 0 dma1, 1 sprite, 2 tri, 3 pool wait, 4 vu1, 5 gif */
-static inline double pnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static inline double pnow(void) { struct timespec t; clock_gettime(CLOCK_UPTIME_RAW, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
 static void parallel_rows(int y0, int y1, int width, RowFn fn, void *ctx) {
     if (nworkers < 0) {

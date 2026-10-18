@@ -36,18 +36,35 @@ double g_gif_s = 0, g_display_s = 0, g_download_s = 0;
 double secs() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 // GIF data often arrives one quadword at a time (GIF FIFO writes, VIF DIRECT); the GPU code
-// queues one upload per call, so consecutive data on the same path is gathered first.  A single
-// pending run keeps the global order of the paths.
-std::vector<std::uint8_t> g_pend;
-int g_pend_path = -1;
+// queues one upload per call, so data is gathered first, as runs per path in arrival order.
+// Gathering has its own short lock (g_pend_lock), so the EE does not wait while the vblank thread
+// holds g_lock to submit a frame; whoever renders the gathered data takes it under g_pend_lock and
+// then g_lock before releasing g_pend_lock, so batches reach the GPU code in order.
+struct Run { int path; std::uint32_t qwc; };
+struct Pending { std::vector<std::uint8_t> data; std::vector<Run> runs; };
+std::mutex g_pend_lock;
+Pending g_pend;
 
-void flush_pending() {
-    if (g_pend.empty()) return;
+void render_batch(Pending &b) {   // g_lock held
     const double t0 = secs();
-    ps2::gif::render(g_pend_path + 1, g_pend.data(), static_cast<std::uint32_t>(g_pend.size() / 16));
-    g_pend.clear();
+    std::size_t off = 0;
+    for (const Run &r : b.runs) {
+        ps2::gif::render(r.path + 1, b.data.data() + off, r.qwc);
+        off += static_cast<std::size_t>(r.qwc) * 16;
+    }
+    b.data.clear();
+    b.runs.clear();
     g_gif_s += secs() - t0;
 }
+
+// Takes the gathered data and returns with g_lock held (caller unlocks), batch in `out`.
+std::unique_lock<std::mutex> take_pending(Pending &out) {
+    std::unique_lock<std::mutex> pl(g_pend_lock);
+    std::swap(out, g_pend);
+    std::unique_lock<std::mutex> lk(g_lock);
+    return lk;
+}
+
 }
 
 extern "C" {
@@ -79,21 +96,26 @@ int gsb_init(void) {
 
 /* GIF data in hp's path numbering (0 = PATH1/VU1, 1 = PATH2/VIF1 DIRECT, 2 = PATH3/GIF DMA). */
 void gsb_gif(int path, const void *data, uint32_t qwc) {
-    std::lock_guard<std::mutex> lk(g_lock);
-    if (path != g_pend_path) {
-        flush_pending();
-        g_pend_path = path;
-    }
+    if (!qwc) return;
+    std::unique_lock<std::mutex> pl(g_pend_lock);
+    if (!g_pend.runs.empty() && g_pend.runs.back().path == path) g_pend.runs.back().qwc += qwc;
+    else g_pend.runs.push_back(Run{path, qwc});
     const auto *p = static_cast<const std::uint8_t *>(data);
-    g_pend.insert(g_pend.end(), p, p + static_cast<std::size_t>(qwc) * 16);
-    if (g_pend.size() >= (1u << 20)) flush_pending();
+    g_pend.data.insert(g_pend.data.end(), p, p + static_cast<std::size_t>(qwc) * 16);
+    if (g_pend.data.size() < (1u << 20)) return;
+    Pending b;
+    std::swap(b, g_pend);
+    std::unique_lock<std::mutex> lk(g_lock);
+    pl.unlock();
+    render_batch(b);
 }
 
 /* Next `qwords` of a local->host transfer started by TRXDIR=1. */
 void gsb_read_image(uint8_t *dst, uint32_t qwords) {
-    std::lock_guard<std::mutex> lk(g_lock);
     const double t0 = secs();
-    flush_pending();
+    Pending b;
+    auto lk = take_pending(b);
+    render_batch(b);
     ps2::gs::read_image(dst, qwords);
     g_download_s += secs() - t0;
 }
@@ -101,9 +123,10 @@ void gsb_read_image(uint8_t *dst, uint32_t qwords) {
 /* The displayed frame as RGBA (R in the low byte), at most max_pixels; returns 0 if nothing is shown. */
 int gsb_display(uint64_t pmode, uint64_t smode2, const uint64_t dispfb[2], const uint64_t display[2], uint32_t *out,
                 uint32_t max_pixels, int *w, int *h) {
-    std::lock_guard<std::mutex> lk(g_lock);
     const double t0 = secs();
-    flush_pending();
+    Pending b;
+    auto lk = take_pending(b);
+    render_batch(b);
     // Same circuit/size rules as ps2::gs::display, but the readback is asynchronous: this returns
     // the newest finished frame (usually the previous vblank's) and never waits for the GPU.
     const int circuit = (pmode & 2u) ? 1 : (pmode & 1u) ? 0 : -1;

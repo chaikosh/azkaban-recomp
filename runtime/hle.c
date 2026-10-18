@@ -11,7 +11,7 @@ void hle_stream_done(EE *c) {
 
 /* ---- temporary tracing of the frame DMA queue ---- */
 #include <time.h>
-static double tnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static double tnow(void) { struct timespec t; clock_gettime(CLOCK_UPTIME_RAW, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static int qlog(void) { static int n = -1; if (n < 0) n = getenv("HP_QLOG") ? 100000 : 0; return n > 0 ? n-- : 0; }
 unsigned g_frames_queued;
 void hle_log_queue(EE *c) {

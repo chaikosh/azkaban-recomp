@@ -2,6 +2,8 @@
 #include "rt.h"
 #include <mach/mach.h>
 #include <pthread.h>
+#include <pthread/qos.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -12,6 +14,9 @@ static pthread_mutex_t tm = PTHREAD_MUTEX_INITIALIZER;
 
 void hp_thread_register(const char *name) {
     pthread_setname_np(name);
+    /* the emulation threads are latency-critical: keep them on the performance cores (with the
+       default QoS macOS moves them to the efficiency cores as soon as other work runs) */
+    if (!getenv("HP_NOQOS")) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     pthread_mutex_lock(&tm);
     if (nt < MAXT) { snprintf(tt[nt].name, sizeof tt[nt].name, "%s", name); tt[nt].port = pthread_mach_thread_np(pthread_self()); nt++; }
     pthread_mutex_unlock(&tm);
