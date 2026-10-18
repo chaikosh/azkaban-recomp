@@ -54,19 +54,24 @@ class Analyzer:
             for va in range(s.addr, s.addr + s.size - 3, 4):
                 w = self.elf.u32(va)
                 if self.in_text(w):
-                    seeds.setdefault(w, "data")
                     self.data_refs[w].append(va)
+                    if self.looks_like_entry(w):
+                        seeds.setdefault(w, "data")
         # Address constants built in code (lui/addiu pairs) that point at code.
         hi_regs = {}
         for pc in range(self.lo, self.hi, 4):
             i = self.insn(pc)
-            if i.op == "lui":
-                hi_regs[i.rt] = i.uimm << 16
-            elif i.op in ("addiu", "ori") and i.rs in hi_regs:
+            if i.op in ("addiu", "ori") and i.rs in hi_regs:
                 v = (hi_regs[i.rs] + (i.imm if i.op == "addiu" else i.uimm)) & 0xFFFFFFFF
                 if self.in_text(v) and self.looks_like_entry(v):
                     seeds.setdefault(v, "const")
-            if i.kind or i.op in ("jr", "jalr"):
+            if i.op == "lui":
+                hi_regs[i.rt] = i.uimm << 16
+            else:
+                for r in list(hi_regs):
+                    if self.writes(i, r):
+                        del hi_regs[r]
+            if i.op == "jr" and i.rs == RA:
                 hi_regs.clear()
         # Prologues right after a function end (possibly after nop padding).
         for pc in range(self.lo + 8, self.hi, 4):
@@ -81,12 +86,20 @@ class Analyzer:
         return seeds
 
     def looks_like_entry(self, va):
-        """The previous instruction pair ends a function (jr ra + delay slot) or is padding."""
+        """Code before `va` cannot fall through into it, or `va` starts with a prologue."""
         if va == self.lo:
             return True
         p2 = self.insn(va - 8) if va - 8 >= self.lo else None
         p1 = self.insn(va - 4)
-        return (p2 is not None and p2.op == "jr" and p2.rs == RA) or p1.raw == 0
+        if p1.raw == 0 or p1.op == "break":
+            return True
+        if p2 is not None and (p2.op in ("jr", "j", "b") or p2.op == "eret"):
+            return True
+        for k in range(3):
+            i = self.insn(va + 4 * k)
+            if i.op == "addiu" and i.rs == 29 and i.rt == 29 and i.imm < 0:
+                return True
+        return False
 
     # -- per-function CFG --------------------------------------------------
     def const_before(self, f, pc, reg, depth=0):

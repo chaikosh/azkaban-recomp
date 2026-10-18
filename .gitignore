@@ -2,3 +2,4 @@ disc/
 build/
 __pycache__/
 *.pkl
+iso/

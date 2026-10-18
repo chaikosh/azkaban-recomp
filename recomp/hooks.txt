@@ -1,0 +1,2 @@
+# guest address   host function     reason
+00304930          hle_stream_done   EA sound stream status (until the IOP sound driver runs)
