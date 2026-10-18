@@ -40,7 +40,7 @@ constexpr std::uint32_t kParamStride = 256;
 constexpr std::uint32_t kClutSlots = 2048;
 constexpr std::uint32_t kClutEntries = 512;
 constexpr std::uint32_t kPrimWords = 28;
-constexpr std::uint32_t kSetupWords = 25;
+constexpr std::uint32_t kSetupWords = 27;
 constexpr std::uint32_t kDecodedWords = 4u << 20;
 constexpr std::uint32_t kDecodePrims = 64;
 
@@ -1278,6 +1278,9 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w, 
     if ((c.tex0 >> 34) & 1u) flags |= 8192u;
     if ((c.tex1 >> 5) & 1u) flags |= 16384u;
     if ((st.texa >> 15) & 1u) flags |= 32768u;
+    const std::uint32_t fpsm = static_cast<std::uint32_t>(c.frame >> 24) & 0x3Fu;
+    const bool dither = (st.dthe & 1u) && (fpsm == PSMCT16 || fpsm == PSMCT16S || fpsm == PSMZ16 || fpsm == PSMZ16S);
+    if (dither) flags |= 65536u;   /* DTHE: only drawing into a 16-bit frame buffer dithers */
     const std::uint32_t zpsm = 0x30u | (static_cast<std::uint32_t>(c.zbuf >> 24) & 0xFu);
     w[0] = flags;
     w[1] = (static_cast<std::uint32_t>(c.frame) & 0x1FFu) * 32u;
@@ -1307,6 +1310,8 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w, 
     w[22] = g_clut_slot;
     w[23] = z_max(zpsm);
     w[24] = 0xFFFFFFFFu;
+    w[25] = dither ? static_cast<std::uint32_t>(st.dimx) : 0u;   /* DIMX rows 0-1 */
+    w[26] = dither ? static_cast<std::uint32_t>(st.dimx >> 32) : 0u;   /* rows 2-3 */
     if (level > 0) {   /* mip level `level`: base and width from MIPTBP1/2 (or MTBA), halved size and region */
         std::uint32_t tbp = 0, tbw = 0;
         if (((c.tex1 >> 9) & 1u) && level <= 3) {

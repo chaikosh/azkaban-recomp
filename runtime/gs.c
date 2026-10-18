@@ -361,6 +361,9 @@ typedef struct {
     int ate, atst, aref, afail, date, datm, zte, ztst;
     /* alpha */
     int ba, bb, bc, bd, fix, abe, pabe, fba, colclamp;
+    /* dithering (DTHE, only into 16-bit frame buffers): DIMX value per (y & 3) * 4 + (x & 3) */
+    int dthe;
+    int8_t dm[16];
     int tme, iip, fge, fst;
     uint32_t fogcol;
     TexState tex;
@@ -381,6 +384,9 @@ static void setup_ctx(DrawCtx *d) {
     d->date = bits(te, 14, 1); d->datm = bits(te, 15, 1); d->zte = bits(te, 16, 1); d->ztst = bits(te, 17, 2);
     d->ba = bits(al, 0, 2); d->bb = bits(al, 2, 2); d->bc = bits(al, 4, 2); d->bd = bits(al, 6, 2); d->fix = bits(al, 32, 8);
     d->pabe = gs.pabe & 1; d->fba = gs.fba[ctxt] & 1; d->colclamp = gs.colclamp & 1;
+    d->dthe = (gs.dthe & 1) && (d->fpsm == PSMCT16 || d->fpsm == PSMCT16S || d->fpsm == PSMZ16 || d->fpsm == PSMZ16S);
+    if (d->dthe)   /* DMyx: signed 3 bits at bit 16 * y + 4 * x */
+        for (int i = 0; i < 16; i++) { int v = (int)((gs.dimx >> (4 * i)) & 7); d->dm[i] = (int8_t)(v & 4 ? v - 8 : v); }
     d->fogcol = (uint32_t)gs.fogcol & 0xffffff;
     TexState *t = &d->tex;
     uint64_t t0 = gs.tex0[ctxt], t1 = gs.tex1[ctxt], cl = gs.clamp[ctxt];
@@ -514,11 +520,15 @@ static void put_pixel(const DrawCtx *d, int x, int y, uint32_t z, uint32_t col, 
             int A = d->ba == 0 ? cs[k] : d->ba == 1 ? cd[k] : 0;
             int B = d->bb == 0 ? cs[k] : d->bb == 1 ? cd[k] : 0;
             int D = d->bd == 0 ? cs[k] : d->bd == 1 ? cd[k] : 0;
-            int v2 = (((A - B) * cc) >> 7) + D;
-            cs[k] = d->colclamp ? clamp255(v2) : (v2 & 0xff);
+            cs[k] = (((A - B) * cc) >> 7) + D;
         }
         r = cs[0]; g = cs[1]; b = cs[2];
     }
+    /* like the GS: dither after blending, then COLCLAMP (clamp or keep the low 8 bits), and the
+       16-bit format keeps the top 5 bits */
+    if (d->dthe) { int dv = d->dm[((y & 3) << 2) | (x & 3)]; r += dv; g += dv; b += dv; }
+    if (d->colclamp) { r = clamp255(r); g = clamp255(g); b = clamp255(b); }
+    else { r &= 0xff; g &= 0xff; b &= 0xff; }
     if (d->fba) a |= 0x80;
     uint32_t out;
     switch (d->fpsm) {
@@ -711,7 +721,7 @@ static void draw_sprite(const DrawCtx *d, const Vtx *v0, const Vtx *v1) {
     j.fog = (int)v1->f;
     j.q = d->fst ? 1.0f : v1->q;
     /* plain fills: no texture, test, blend, fog, mask or depth work */
-    j.simple = !d->tme && !d->abe && !d->ate && !d->date && !d->fge && !d->fbmsk && !d->fba &&
+    j.simple = !d->tme && !d->abe && !d->ate && !d->date && !d->fge && !d->fbmsk && !d->fba && !d->dthe &&
                (!d->zte || (d->ztst == 1 && d->zmsk)) &&
                (d->fpsm == PSMCT32 || d->fpsm == PSMCT24 || d->fpsm == PSMCT16 || d->fpsm == PSMCT16S);
     if (j.simple) {
