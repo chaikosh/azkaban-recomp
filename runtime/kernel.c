@@ -99,6 +99,7 @@ static void wait_turn(int t) {
 
 static void deliver_locked(void);
 void iop_sif0_done(void);
+int iopb_enabled(void);
 
 /* Give the CPU to the best runnable thread; returns once this thread runs again
  * (or never, when `exiting`). */
@@ -195,7 +196,7 @@ static void deliver_locked(void) {
                 if (dmac_h[k].used && dmac_h[k].enabled && dmac_h[k].cause == ch) call_handler(&dmac_h[k], ch);
             if (ch == 5) {   /* SIF0 packet consumed: let the IOP send the next one */
                 pthread_mutex_unlock(&km);
-                iop_sif0_done();
+                if (!iopb_enabled()) iop_sif0_done();
                 pthread_mutex_lock(&km);
             }
         }
@@ -566,6 +567,12 @@ int64_t hw_sif_get_reg(uint32_t reg);
 void hw_sif_set_reg(uint32_t reg, uint32_t v);
 void hw_set_crt(int interlace, int mode, int field);
 void iop_sif_dma(uint32_t list, int count);
+int iopb_enabled(void);
+uint32_t iopb_sif_set_dma(uint32_t list, uint32_t count);
+int iopb_sif_dma_stat(uint32_t id);
+void iopb_sif_packet_processed(void);
+uint32_t iopb_sif_get_reg(uint32_t reg);
+void iopb_sif_set_reg(uint32_t reg, uint32_t v);
 
 static void unknown_syscall(EE *c, int n) {
     static int seen[512];
@@ -665,16 +672,27 @@ void rt_syscall(EE *c, uint32_t pc) {
         if (g_trace) LOG("[kern] SetSyscall(%d, %08x)\n", A0, A1);
         break;
     case 117: LOG("[print] %s", gstr(A0)); break;
-    case 118: r = -1; break;     /* sceSifDmaStat: always finished */
+    case 118:                    /* sceSifDmaStat */
+        if (iopb_enabled()) { pthread_mutex_unlock(&km); r = iopb_sif_dma_stat(A0); pthread_mutex_lock(&km); }
+        else r = -1;
+        break;
     case 119:                    /* sceSifSetDma(list, count) */
         pthread_mutex_unlock(&km);
-        iop_sif_dma(A0, A1);
+        if (iopb_enabled()) r = iopb_sif_set_dma(A0, A1);
+        else { iop_sif_dma(A0, A1); r = 1; }
         pthread_mutex_lock(&km);
-        r = 1;
         break;
-    case 120: break;             /* sceSifSetDChain */
-    case 121: hw_sif_set_reg(A0, A1); r = 1; break;
-    case 122: r = hw_sif_get_reg(A0); break;
+    case 120:                    /* sceSifSetDChain; the interrupt-side call re-arms SIF0: the EE took the packet */
+        if (iopb_enabled() && n < 0) { pthread_mutex_unlock(&km); iopb_sif_packet_processed(); pthread_mutex_lock(&km); }
+        break;
+    case 121:
+        if (iopb_enabled()) { pthread_mutex_unlock(&km); iopb_sif_set_reg(A0, A1); pthread_mutex_lock(&km); r = 0; }
+        else { hw_sif_set_reg(A0, A1); r = 1; }
+        break;
+    case 122:
+        if (iopb_enabled()) { pthread_mutex_unlock(&km); r = iopb_sif_get_reg(A0); pthread_mutex_lock(&km); }
+        else r = hw_sif_get_reg(A0);
+        break;
     case 124: r = -1; break;     /* Deci2Call: no debug host */
     case 125: r = 0; break;      /* PSMode */
     case 126: r = 0; break;      /* MachineType */

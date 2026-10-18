@@ -1,0 +1,5 @@
+Vendored from https://github.com/snuri00/ps2-web-recomp (MIT, Copyright (c) 2026 Samir Nuri):
+runtime/src/iop/*, runtime/src/disc.cpp, runtime/include/ps2/{disc,state}.hpp.
+Local changes: IOP SIF wakes queue threads that sleep in their own server loop and implements
+sceSifGetNextRequest/sceSifExecRequest (needed by EA SNDDRV). Shim headers in include/ps2/{memory,system}.hpp
+and src/hw.hpp adapt it to the hp runtime (runtime/iop_bridge.cpp).

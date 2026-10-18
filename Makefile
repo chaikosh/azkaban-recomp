@@ -21,6 +21,12 @@ CFLAGS   := $(OPT) -g -fno-strict-aliasing -fwrapv -w -Iruntime -I$(GEN) -I/opt/
 LDFLAGS  := -L/opt/homebrew/lib -lSDL3
 
 RT_SRC   := $(wildcard runtime/*.c)
+# low-level IOP (vendored from ps2-web-recomp, MIT) and its bridge
+IOP_DIR  := third_party/ps2iop
+CXX      := clang++
+CXXFLAGS := -std=c++20 -O2 -g -w -I$(IOP_DIR)/include -I$(IOP_DIR)/src -I$(IOP_DIR)/src/iop
+IOP_SRC  := $(wildcard $(IOP_DIR)/src/iop/*.cpp) $(IOP_DIR)/src/disc.cpp runtime/iop_bridge.cpp
+IOP_OBJ  := $(patsubst %.cpp,$(OBJDIR)/obj/%.o,$(IOP_SRC))
 GEN_SRC   = $(wildcard $(GEN)/*.c)
 RT_OBJ   := $(patsubst %.c,$(OBJDIR)/obj/%.o,$(RT_SRC))
 GEN_OBJ   = $(patsubst $(GEN)/%.c,$(OBJDIR)/obj/gen/%.o,$(GEN_SRC))
@@ -35,8 +41,12 @@ $(GEN)/funcs.h: recomp/*.py
 $(OUT)/hp: $(GEN)/funcs.h FORCE
 	@$(MAKE) --no-print-directory link
 
-link: $(RT_OBJ) $(GEN_OBJ)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $(OBJDIR)/hp $^
+link: $(RT_OBJ) $(GEN_OBJ) $(IOP_OBJ)
+	$(CXX) $(CFLAGS) $(LDFLAGS) -o $(OBJDIR)/hp $^
+
+$(OBJDIR)/obj/%.o: %.cpp $(IOP_DIR)/src/iop/*.hpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(OBJDIR)/obj/%.o: %.c runtime/*.h
 	@mkdir -p $(dir $@)

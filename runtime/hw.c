@@ -1,5 +1,8 @@
 /* EE hardware registers (0x1000xxxx), GS privileged registers (0x1200xxxx). */
 #include "rt.h"
+int iopb_enabled(void);
+uint32_t iopb_sif_get_reg(uint32_t reg);
+void iopb_sif_set_reg(uint32_t reg, uint32_t v);
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -147,10 +150,14 @@ uint32_t mmio_r32(uint32_t a) {
         case 0xe010: return kern_dmac_stat();
         case 0xf000: return kern_intc_stat();
         case 0xf010: return kern_intc_mask();
-        case 0xf200: return sif_mscom;
-        case 0xf210: return sif_smcom;
-        case 0xf220: return sif_msflg;
-        case 0xf230: sif_poll_reboot(); return sif_smflg;
+        case 0xf200: case 0xf210: case 0xf220: case 0xf230:
+            if (iopb_enabled()) return iopb_sif_get_reg(((off >> 4) & 7) + 1);
+            switch (off) {
+            case 0xf200: return sif_mscom;
+            case 0xf210: return sif_smcom;
+            case 0xf220: return sif_msflg;
+            default: sif_poll_reboot(); return sif_smflg;
+            }
         case 0xf240: return sif_ctrl;
         case 0xf260: return sif_bd6;
         case 0xf520: return sh32(eeregs, 0xf590);   /* D_ENABLER mirrors D_ENABLEW */
@@ -206,9 +213,12 @@ void mmio_w32(uint32_t a, uint32_t v) {
         case 0xe010: kern_dmac_write_stat(v); return;
         case 0xf000: kern_intc_ack(v); return;
         case 0xf010: kern_intc_toggle_mask(v); return;
-        case 0xf200: sif_mscom = v; return;
-        case 0xf220: sif_msflg |= v; return;
-        case 0xf230: sif_smflg &= ~v; return;
+        case 0xf200: case 0xf220: case 0xf230:
+            if (iopb_enabled()) { iopb_sif_set_reg(((off >> 4) & 7) + 1, v); return; }
+            if (off == 0xf200) sif_mscom = v;
+            else if (off == 0xf220) sif_msflg |= v;
+            else sif_smflg &= ~v;
+            return;
         case 0xf240: sif_ctrl = v; return;
         case 0xf260: sif_bd6 = v; return;
         }
@@ -338,6 +348,11 @@ void hw_set_crt(int interlace, int mode, int field) {
 
 void pad_vblank(void);
 void iop_tick(void);
+int iopb_enabled(void);
+void iopb_vblank(int start);
+void iopb_init(const char *iso, const char *memcard);
+uint32_t iopb_sif_get_reg(uint32_t reg);
+void iopb_sif_set_reg(uint32_t reg, uint32_t v);
 
 void display_vsync(void);
 
@@ -345,14 +360,14 @@ void hw_vblank(int start) {
     { extern volatile int g_usr1_req; extern void rt_usr1_work(void); if (g_usr1_req) { g_usr1_req = 0; rt_usr1_work(); } }
     if (start) {
         display_vsync();
-        pad_vblank();
-        iop_tick();
+        if (iopb_enabled()) iopb_vblank(1);
+        else { pad_vblank(); iop_tick(); }
         static int frames;
         extern void dma_stats(void);
         if (getenv("HP_STATS") && ++frames % 120 == 0) dma_stats();
         gs_csr ^= 0x2000;   /* FIELD */
         gs_csr |= 0x8;      /* VSINT */
-    }
+    } else if (iopb_enabled()) iopb_vblank(0);
 }
 
 /* GS SIGNAL/FINISH events -> CSR bits and the GS interrupt (INTC 0) */
@@ -375,7 +390,11 @@ void hw_init(void) {
     sw32(eeregs, 0xf590, 0x1201);
     extern void ipu_init(void);
     ipu_init();
-    iop_init();
+    if (iopb_enabled()) {
+        const char *iso = getenv("HP_ISO") ? getenv("HP_ISO") : "iso/Harry Potter and the Prisoner of Azkaban (USA).iso";
+        const char *mc = getenv("HP_MEMCARD") ? getenv("HP_MEMCARD") : "build/memcard0.ps2";
+        iopb_init(iso, mc);
+    } else iop_init();
 }
 
 /* Register write without side effects (used by the DMA engine). */

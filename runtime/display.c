@@ -133,11 +133,31 @@ static void poll_input(SDL_Gamepad *pad) {
             if (ax[i] > 4000 || ax[i] < -4000) *dst[i] = (ax[i] + 32768) >> 8;
     }
     uint8_t axes[4] = {(uint8_t)rx, (uint8_t)ry, (uint8_t)lx, (uint8_t)ly};
-    pad_set_state((uint16_t)~on, axes);
+    { extern int iopb_enabled(void); extern void iopb_set_pad(int, uint16_t, const uint8_t *);
+      if (iopb_enabled()) iopb_set_pad(0, (uint16_t)on, axes); else pad_set_state((uint16_t)~on, axes); }
+}
+
+/* SPU2 output from the IOP (48 kHz stereo s16) */
+static SDL_AudioStream *g_audio;
+static void audio_sink(const int16_t *samples, size_t frames) {
+    if (!g_audio) return;
+    if (SDL_GetAudioStreamQueued(g_audio) > 48000 * 4 / 2) return;   /* never queue more than 0.5 s */
+    SDL_PutAudioStreamData(g_audio, samples, (int)(frames * 4));
+}
+static void audio_open(void) {
+    extern int iopb_enabled(void);
+    extern void iopb_set_audio_sink(void (*)(const int16_t *, size_t));
+    if (!iopb_enabled() || getenv("HP_MUTE")) return;
+    SDL_AudioSpec spec = {SDL_AUDIO_S16, 2, 48000};
+    g_audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    if (!g_audio) { LOG("[audio] %s\n", SDL_GetError()); return; }
+    SDL_ResumeAudioStreamDevice(g_audio);
+    iopb_set_audio_sink(audio_sink);
 }
 
 void display_loop(void) {
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) { LOG("[display] SDL_Init: %s\n", SDL_GetError()); return; }
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) { LOG("[display] SDL_Init: %s\n", SDL_GetError()); return; }
+    audio_open();
     SDL_Window *win = SDL_CreateWindow("Harry Potter and the Prisoner of Azkaban", 960, 672, SDL_WINDOW_RESIZABLE);
     SDL_Renderer *ren = SDL_CreateRenderer(win, NULL);
     SDL_Texture *tex = NULL;

@@ -25,7 +25,7 @@ static void map_pages(uint32_t va, uint8_t *host, uint32_t size) {
 }
 
 static void mem_init(void) {
-    g_ram = mmap(NULL, RAM_SIZE + 0x10000, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    { extern uint8_t *iopb_ee_ram(void); g_ram = iopb_ee_ram(); }   /* shared with the IOP (runtime/iop_bridge.cpp) */
     g_spr = calloc(1, 0x10000);
     g_vumem = calloc(1, 0x10000);
     if (g_ram == MAP_FAILED || !g_spr || !g_vumem) { LOG("out of memory\n"); exit(1); }
@@ -213,6 +213,7 @@ volatile int g_usr1_req;
 static void on_usr1(int sig) { (void)sig; g_usr1_req = 1; }   /* the work runs on the vblank thread (LOG is not async-signal-safe) */
 void rt_usr1_work(void) {
     kern_dump_threads();
+    { extern int iopb_enabled(void); extern void iopb_dump(void); if (iopb_enabled()) iopb_dump(); }
     if (g_wrange_len) wrange_dump();
     rt_callhist_dump();
     const char *vd = getenv("HP_VRAMDUMP");
