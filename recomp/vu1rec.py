@@ -8,7 +8,8 @@ that runs the program natively, with the same semantics as the interpreter in ru
 
   - upper and lower instructions of a pair read the registers as they were before the pair;
     results commit lower first, then upper, then ACC, VI and I;
-  - Q, P, R, CLIP, MAC/status and data memory stores take effect immediately, upper before lower;
+  - P, R, CLIP, MAC/status and data memory stores take effect immediately, upper before lower;
+    Q arrives VU_QLAT_DIV (RSQRT: VU_QLAT_RSQRT) pairs after the FDIV instruction (vu_q_*);
   - branches and the E bit have one delay slot; XGKICK sends its packet one pair late.
 
 Control flow is resolved statically where possible (branch targets, fall-through, delay slots
@@ -341,13 +342,13 @@ class Gen:
                 L.append(f'vu_store((uint16_t)({VIT} - 1), &{S}, {dest});')
                 return L, None, (it, f'(uint16_t)({VIT} - 1)'), None
             if code == 56:
-                L.append(f's.q = vdiv(vin({S}.f[{fsf}]), vin({T}.f[{ftf}]));')
+                L.append(f'vu_q_start(&s, vdiv(vin({S}.f[{fsf}]), vin({T}.f[{ftf}])), VU_QLAT_DIV);')
                 return L, None, None, None
             if code == 57:
-                L.append(f's.q = sqrtf(fabsf(vin({T}.f[{ftf}])));')
+                L.append(f'vu_q_start(&s, sqrtf(fabsf(vin({T}.f[{ftf}]))), VU_QLAT_DIV);')
                 return L, None, None, None
             if code == 58:
-                L.append(f'{{ float d = sqrtf(fabsf(vin({T}.f[{ftf}]))); s.q = d == 0.0f ? 3.402823e38f : vclampf(vin({S}.f[{fsf}]) / d); }}')
+                L.append(f'{{ float d = sqrtf(fabsf(vin({T}.f[{ftf}]))); vu_q_start(&s, d == 0.0f ? 3.402823e38f : vclampf(vin({S}.f[{fsf}]) / d), VU_QLAT_RSQRT); }}')
                 return L, None, None, None
             if code == 59:
                 return L, None, None, None
@@ -470,6 +471,8 @@ class Gen:
         up, lo = self.img.up[n], self.img.lo[n]
         self.cur = n
         out = [f'/* {n:04x}: {up:08x} {lo:08x} */']
+        if not (up & I_BIT) and lower_waits_q(lo):
+            out.append('vu_q_flush(&s);   /* WAITQ / busy FDIV: the pair waits for Q */')
         ulines, ucommit = self.upper(up)
         out += ulines
         lcommit = vicommit = kick = None
@@ -499,6 +502,7 @@ class Gen:
             out.append(f's.vi[{vicommit[0]}] = viv;')
         if up & I_BIT:
             out.append(f'{{ union {{ uint32_t u; float f; }} c = {{{lo}u}}; s.i = c.f; }}')
+        out.append('vu_q_tick(&s);')
         if kick_check:
             out.append('if (due >= 0) { vu1_xgkick((uint32_t)due); due = -1; }')
         if kick:
@@ -583,6 +587,7 @@ class Gen:
         out.append('    return 1;')
         out.append('done:')
         out.append('    if (due >= 0) vu1_xgkick((uint32_t)due);')
+        out.append('    vu_q_flush(&s);')
         out.append('    s.pc = tpc;')
         out.append('    *g = s;')
         out.append('    return 0;')
@@ -608,6 +613,11 @@ class Gen:
         out.append(f'static const uint8_t labels_{img.hash}[256] = {{{", ".join(str(x) for x in bm)}}};')
         self.key = key
         return out, len(pcs)
+
+
+def lower_waits_q(lo):
+    """WAITQ, DIV, SQRT, RSQRT: the pair waits for a pending FDIV result (runtime/vu1_core.h)."""
+    return (lo >> 25) == 0x40 and (lo & 63) >= 0x3c and 56 <= ((((lo >> 6) & 31) << 2) | (lo & 3)) <= 59
 
 
 def lower_is_kick(self, n):
