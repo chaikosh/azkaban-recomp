@@ -44,3 +44,42 @@ void hle_log_vifirq(EE *c) {
         LOG("[vifirq %.3f] mark %04x stat %03x\n", tnow(), vif1_reg_read(0x30), vif1_reg_read(0));
     f_0013d9f8_orig(c);
 }
+
+void hle_log_addcmd(EE *c) {
+    extern unsigned long long g_vsyncs;
+    if (g_trace) LOG("[sif v%llu] AddCmdHandler cid %08x handler %08x data %08x\n", g_vsyncs, RW(4), RW(5), RW(6));
+    f_0044b210_orig(c);
+}
+
+void hle_log_sndcmd(EE *c) {
+    extern unsigned long long g_vsyncs;
+    uint32_t a = RW(4);
+    if (g_trace) LOG("[snd v%llu] cmd3 handler pkt %08x: %08x %08x %08x %08x %08x %08x data %08x\n", g_vsyncs, a,
+        ld32(a), ld32(a + 4), ld32(a + 8), ld32(a + 12), ld32(a + 16), ld32(a + 20), RW(5));
+    f_0032d120_orig(c);
+    if (g_trace) LOG("[snd] cmd3 handler done: flag %08x\n", ld32(0x484470u));
+}
+
+void hle_log_fopen(EE *c) {
+    extern unsigned long long g_vsyncs;
+    static int n = 0;
+    char name[96]; uint32_t a = RW(4);
+    for (int i = 0; i < 95; i++) { name[i] = (char)ld8(a + i); if (!name[i]) break; name[95] = 0; }
+    uint32_t a1 = RW(5), a2 = RW(6), a3 = RW(7);
+    if (g_trace && n < 400) LOG("[fopen+ v%llu] %s\n", g_vsyncs, name);
+    f_002bd678_orig(c);
+    if (g_trace && n < 400) { n++; LOG("[fopen v%llu] %s (%08x %08x %08x) -> %d\n", g_vsyncs, name, a1, a2, a3, (int)RW(2)); }
+}
+
+void hle_log_stream(EE *c) {
+    extern unsigned long long g_vsyncs;
+    static uint32_t last[4]; static int n = 0;
+    uint32_t h = RW(4);
+    f_00304930_orig(c);
+    /* the original leaves {obj, aux} on its (now popped) stack frame at sp-0x20 */
+    uint32_t sp = RW(29) - 0x20, obj = ld32(sp), aux = ld32(sp + 4);
+    uint32_t v[4] = { obj ? ld32(obj + 56) : 0xdead, aux ? ld32(aux + 8) : 0xdead, RW(2), h };
+    static int calls = 0; calls++;
+    if (g_trace && n < 300 && (memcmp(v, last, sizeof v) || calls % 50 == 0)) { n++; memcpy(last, v, sizeof v);
+        LOG("[stream v%llu] handle %08x obj %08x +56=%08x aux %08x +8=%08x -> %u\n", g_vsyncs, h, obj, v[0], aux, v[1], (unsigned)RW(2)); }
+}

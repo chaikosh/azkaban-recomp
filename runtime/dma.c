@@ -76,6 +76,8 @@ void dma_stats(void) {
         (unsigned long long)gs.frame[0], (unsigned long long)gs.frame[1],
         (unsigned long long)hw_gs_priv(0x70), (unsigned long long)hw_gs_priv(0x90), (unsigned long long)hw_gs_priv(0));
     lp = g_gs_prims; lpx = g_gs_pixels; lvu = g_vu1_insns; lvw = g_vif1_words;
+    extern unsigned g_snd_acks, g_snd_updates;
+    LOG("[stats] snd updates %u acks %u\n", g_snd_updates, g_snd_acks);
     extern void vif_stats(void), gs_fb_stats(void), ipu_stats(void);
     vif_stats();
     gs_fb_stats();

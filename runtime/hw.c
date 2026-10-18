@@ -342,6 +342,7 @@ void iop_tick(void);
 void display_vsync(void);
 
 void hw_vblank(int start) {
+    { extern volatile int g_usr1_req; extern void rt_usr1_work(void); if (g_usr1_req) { g_usr1_req = 0; rt_usr1_work(); } }
     if (start) {
         display_vsync();
         pad_vblank();

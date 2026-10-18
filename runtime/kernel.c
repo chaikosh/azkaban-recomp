@@ -188,6 +188,7 @@ static void deliver_locked(void) {
             if (line == 2 && vsync_flag_addr) { st32(vsync_flag_addr, 1); if (vsync_data_addr) st64(vsync_data_addr, 0); }
         } else {
             dmac_cis &= ~(1u << ch);
+            if (g_trace > 1 && ch == 5) LOG("[kern] dmac5 interrupt -> handlers\n");
             for (int k = 0; k < MAX_HANDLERS; k++)
                 if (dmac_h[k].used && dmac_h[k].enabled && dmac_h[k].cause == ch) call_handler(&dmac_h[k], ch);
             if (ch == 5) {   /* SIF0 packet consumed: let the IOP send the next one */
@@ -339,10 +340,25 @@ static int new_thread(void) {
 
 void kern_dump_threads(void) {
     for (int t = 1; t < MAX_THREADS; t++) {
-        if (!th[t].used) continue;
         EE *c = th[t].c;
-        LOG("[thread %d] status %d prio %d wait %d/%d pc %08x (%s) ra %08x sp %08x%s\n", t, th[t].status, th[t].prio,
+        if (!c) continue;
+        LOG("[thread %d] used %d status %d prio %d wait %d/%d pc %08x (%s) ra %08x sp %08x%s\n", t, th[t].used, th[t].status, th[t].prio,
             th[t].wait_type, th[t].wait_id, c->pc, rt_func_name(c->pc), RW(31), RW(29), t == cur ? " RUNNING" : "");
+        if (!th[t].used) continue;
+        if (getenv("HP_PCRING")) {
+            char last[96] = "";
+            char line[4096]; int n = 0;
+            uint32_t end = c->pcidx;   /* snapshot: the thread may still be running */
+            for (uint32_t k = end > 512 ? end - 512 : 0; k < end; k++) {
+                const char *nm = rt_func_name(c->pcring[k & 511]);
+                char fn[96]; snprintf(fn, sizeof fn, "%s", nm); char *pl = strchr(fn, '+'); if (pl) *pl = 0;
+                if (!strcmp(fn, last)) continue;
+                snprintf(last, sizeof last, "%s", fn);
+                n += snprintf(line + n, sizeof line - n, " %s", nm);
+                if (n > 3900) { LOG("[ring %d]%s\n", t, line); n = 0; }
+            }
+            if (n) LOG("[ring %d]%s\n", t, line);
+        }
     }
 }
 
@@ -560,7 +576,7 @@ static void unknown_syscall(EE *c, int n) {
 void rt_syscall(EE *c, uint32_t pc) {
     int n = (int)RSW(3);
     c->pc = pc;
-    if (g_trace > 1) LOG("[sys] %d a0=%08x a1=%08x a2=%08x from %s\n", n, A0, A1, A2, rt_func_name(pc));
+    if (g_trace > 1) LOG("[sys] %d a0=%08x a1=%08x a2=%08x from %s t%d ra %08x\n", n, A0, A1, A2, rt_func_name(pc), my_tid, RW(31));
     int an = n < 0 ? -n : n;
     if (an < 256) {
         /* handlers installed by the game (SetSyscall or a direct table patch) run as guest code */

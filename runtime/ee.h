@@ -34,6 +34,8 @@ typedef struct EE {
     uint32_t vstatus, vmac, vclip, vr;
     /* bookkeeping */
     uint32_t pc;          /* last syscall/trap site, for diagnostics */
+    uint32_t pcring[512]; /* TRACE_PC: recent basic-block starts */
+    uint32_t pcidx;
     uint32_t thread;      /* kernel thread id running on this context */
     void *host;           /* runtime-private */
 } EE;

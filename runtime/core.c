@@ -81,11 +81,25 @@ const char *rt_func_name(uint32_t addr) {
 static uint32_t g_calltrace_ra;
 uint32_t g_watch = 0xffffffffu;
 
+extern unsigned long long g_vsyncs;
 void rt_watch_hit(uint32_t a, uint64_t v, int size) {
     static int n;
     EE *c = kern_current_ctx();
-    if (n++ < 40) LOG("[watch] write%d %08x = %llx at %s (thread %u, ra %08x)\n", size * 8, a, (unsigned long long)v,
+    if (n++ < 40) LOG("[watch v%llu tick %u] write%d %08x = %llx at %s (thread %u, ra %08x)\n", g_vsyncs, ld32(0x483390u), size * 8, a, (unsigned long long)v,
                       c ? rt_func_name(c->pc) : "?", c ? c->thread : 0, c ? RW(31) : 0);
+    static const char *wr_val; if (!wr_val) wr_val = getenv("HP_WATCHRING") ? getenv("HP_WATCHRING") : "";
+    if (c && *wr_val && v == strtoull(wr_val, NULL, 16)) {   /* call chain leading here: last ring entries, function changes only */
+        char line[4096]; int k = 0; char last[64] = "";
+        uint32_t end = c->pcidx;
+        for (uint32_t i = end > 400 ? end - 400 : 0; i < end; i++) {
+            char fn[64]; snprintf(fn, sizeof fn, "%s", rt_func_name(c->pcring[i & 511])); char *pl = strchr(fn, '+'); if (pl) *pl = 0;
+            if (!strcmp(fn, last)) continue;
+            snprintf(last, sizeof last, "%s", fn);
+            k += snprintf(line + k, sizeof line - k, " %s", rt_func_name(c->pcring[i & 511]));
+            if (k > 3800) { LOG("[watchring]%s\n", line); k = 0; }
+        }
+        LOG("[watchring]%s\n", line);
+    }
 }
 
 /* HP_CALLHIST=<vsync>: histogram of indirect call targets during the 120 vsyncs from there */
@@ -168,8 +182,9 @@ void rt_trap(EE *c, uint32_t pc, const char *what) {
 }
 
 void kern_dump_threads(void);
-static void on_usr1(int sig) {
-    (void)sig;
+volatile int g_usr1_req;
+static void on_usr1(int sig) { (void)sig; g_usr1_req = 1; }   /* the work runs on the vblank thread (LOG is not async-signal-safe) */
+void rt_usr1_work(void) {
     kern_dump_threads();
     rt_callhist_dump();
     const char *vd = getenv("HP_VRAMDUMP");

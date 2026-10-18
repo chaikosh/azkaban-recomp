@@ -183,6 +183,8 @@ static int cd_diskready(uint32_t fno, uint8_t *in, uint32_t n, uint8_t *out, uin
     return 0;
 }
 
+uint64_t g_rpc_latency_ns;   /* set by a server to delay its RPC completion (emulated time) */
+
 static int cd_ncmd(uint32_t fno, uint8_t *in, uint32_t n, uint8_t *out, uint32_t cap, uint32_t *len) {
     switch (fno) {
     case 0x01: {   /* Read(lsn, sectors, ee buffer, mode) */
@@ -195,6 +197,12 @@ static int cd_ncmd(uint32_t fno, uint8_t *in, uint32_t n, uint8_t *out, uint32_t
         }
         if (buf + cnt * 2048 <= RAM_SIZE) cdvd_read_sectors(lsn, cnt, g_ram + buf);
         else LOG("[cdvd] read to bad buffer %08x\n", buf);
+        /* Emulated DVD latency: the game's loaders pace themselves on time passing while a read is
+           in flight (the loading-indicator stream is pumped from a timer tick), so an instant
+           completion deadlocks them.  HP_CDLAT=base_us,per_sector_us (default 1500,600). */
+        static int64_t base_us = -1, per_us;
+        if (base_us < 0) { base_us = 1500; per_us = 600; const char *e = getenv("HP_CDLAT"); if (e) { base_us = atoll(e); const char *q = strchr(e, ','); if (q) per_us = atoll(q + 1); } }
+        g_rpc_latency_ns = (uint64_t)(base_us + per_us * (int64_t)cnt) * 1000u;
         ret1(out, cap, len, 1);
         return 0;
     }

@@ -41,11 +41,13 @@ static int qhead, qtail;
 static pthread_mutex_t qm = PTHREAD_MUTEX_INITIALIZER;
 
 uint32_t hw_sif_sysreg(int k);
+static uint32_t rd(const uint8_t *p, int k);
 
 static void deliver_next(void) {
     /* qm held; the Sony SDK publishes its receive buffer in SIF system register 1 */
     uint32_t buf = ee_pktbuf ? ee_pktbuf : hw_sif_sysreg(1);
     if (qhead == qtail || !buf) return;
+    if (g_trace) { extern unsigned long long g_vsyncs; LOG("[sif v%llu] deliver cid %08x to %08x (queued %d)\n", g_vsyncs, rd(q[qhead], 2), buf, (qtail - qhead + QMAX) % QMAX); }
     memcpy(gptr(buf), q[qhead], qlen[qhead]);
     qhead = (qhead + 1) % QMAX;
     kern_raise_dmac(5);
@@ -160,9 +162,11 @@ static void snd_ack(uint32_t opt) {
     send_to_ee(r, sizeof r);
 }
 
+unsigned g_snd_acks, g_snd_updates;
 void iop_tick(void) {   /* called once per vblank */
     if (!snd_pending) return;
     snd_pending = 0;
+    g_snd_acks++;
     snd_process_update(g_iop_ram + snd_buf[snd_cur], 0x4000);
     snd_cur ^= 1;
     snd_ack(snd_buf[snd_cur]);
@@ -197,8 +201,22 @@ static void spu_command(const uint8_t *p) {
     snd_ack(snd_buf[snd_cur]);
 }
 
+/* RPC completions deferred by an emulated latency (see g_rpc_latency_ns) */
+extern uint64_t g_rpc_latency_ns;
+void kern_after(uint64_t ns, void (*fn)(int), int arg);
+#define RPC_PEND 4
+static struct { int used; uint8_t pkt[128]; } pend[RPC_PEND];
+static void rpc_end_later(int k) {
+    rpc_end(pend[k].pkt, CMD_RPC_CALL, 0, 0, 0);
+    pend[k].used = 0;
+}
+
 static void handle_cmd(const uint8_t *p) {
     uint32_t cid = rd(p, 2);
+    if (g_trace && cid < 0x80000000u) {
+        extern unsigned long long g_vsyncs;
+        LOG("[sifcmd v%llu] cid %u type %u: %08x %08x %08x %08x\n", g_vsyncs, cid, rd(p, 4), rd(p, 5), rd(p, 6), rd(p, 7), rd(p, 8));
+    }
     switch (cid) {
     case CMD_CHANGE_SADDR:
         ee_pktbuf = rd(p, 4);
@@ -244,8 +262,14 @@ static void handle_cmd(const uint8_t *p) {
         uint32_t out_len = 0;
         uint32_t cap = recv_size < sizeof out ? recv_size : sizeof out;
         if (g_trace) LOG("[rpc] call %s fn %u send %u recv %08x/%u\n", s->name, fno, send, recv_ee, recv_size);
+        g_rpc_latency_ns = 0;
         s->fn(fno, g_iop_ram + s->buf, send, out, cap, &out_len);
         if (recv_ee && out_len) memcpy(gptr(recv_ee), out, out_len < recv_size ? out_len : recv_size);
+        if (g_rpc_latency_ns) {
+            int k;
+            for (k = 0; k < RPC_PEND && pend[k].used; k++) ;
+            if (k < RPC_PEND) { pend[k].used = 1; memcpy(pend[k].pkt, p, 128); kern_after(g_rpc_latency_ns, rpc_end_later, k); return; }
+        }
         rpc_end(p, CMD_RPC_CALL, 0, 0, 0);
         return;
     }
@@ -275,7 +299,7 @@ void iop_sif_dma(uint32_t list, int count) {
         if (dst + size > IOP_RAM_SIZE) { LOG("[sif] dma to bad IOP address %08x+%x\n", dst, size); continue; }
         memcpy(g_iop_ram + dst, gptr(src), size);
         if (dst == IOP_CMDBUF) handle_cmd(g_iop_ram + dst);
-        else if (dst == snd_buf[0] || dst == snd_buf[1]) snd_pending = 1;
+        else if (dst == snd_buf[0] || dst == snd_buf[1]) { snd_pending = 1; g_snd_updates++; }
         else if (g_trace) {
             LOG("[sif] dma %08x -> IOP %06x (%u bytes):", src, dst, size);
             for (uint32_t k = 0; k < size / 4 && k < 12; k++) LOG(" %08x", g32(src + 4 * k));
