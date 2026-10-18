@@ -398,6 +398,7 @@ void hw_vblank(int start) {
             static long long ea = -2; if (ea == -2) ea = getenv("HP_EXITAT") ? atoll(getenv("HP_EXITAT")) : -1;
             if (ea >= 0 && (long long)g_vsyncs >= ea) { LOG("[exit] HP_EXITAT reached at vsync %llu\n", g_vsyncs); fflush(NULL); _exit(0); }
         }
+        { extern void fastboot_vblank(void); fastboot_vblank(); }   /* HP_FASTBOOT pad in headless runs */
         if (iopb_enabled()) iopb_vblank(1);
         else { pad_vblank(); iop_tick(); }
         static int frames;

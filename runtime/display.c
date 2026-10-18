@@ -110,7 +110,9 @@ static void poll_input(SDL_Gamepad *pad) {
             char name[16]; double at = 0;
             if (sscanf(p, "%15[a-z]@%lf", name, &at) == 2 && now - t0 >= at && now - t0 < at + 0.3) {
                 int b = !strcmp(name, "start") ? B_START : !strcmp(name, "cross") ? B_CRO : !strcmp(name, "circle") ? B_CIR :
-                        !strcmp(name, "select") ? B_SELECT : !strcmp(name, "down") ? B_DOWN : !strcmp(name, "up") ? B_UP : B_START;
+                        !strcmp(name, "select") ? B_SELECT : !strcmp(name, "down") ? B_DOWN : !strcmp(name, "up") ? B_UP :
+                        !strcmp(name, "left") ? B_LEFT : !strcmp(name, "right") ? B_RIGHT : !strcmp(name, "triangle") ? B_TRI :
+                        !strcmp(name, "square") ? B_SQU : !strcmp(name, "lone") ? B_L1 : !strcmp(name, "rone") ? B_R1 : B_START;
                 on |= 1u << b;
             }
             p = strchr(p, ',');
@@ -118,6 +120,7 @@ static void poll_input(SDL_Gamepad *pad) {
             p++;
         }
     }
+    { extern uint16_t fastboot_buttons(void); on |= fastboot_buttons(); }   /* HP_FASTBOOT: skips cutscenes */
 #define KEY(sc, b) if (k[sc]) on |= 1u << (b)
     KEY(SDL_SCANCODE_RETURN, B_START); KEY(SDL_SCANCODE_RSHIFT, B_SELECT);
     KEY(SDL_SCANCODE_UP, B_UP); KEY(SDL_SCANCODE_DOWN, B_DOWN); KEY(SDL_SCANCODE_LEFT, B_LEFT); KEY(SDL_SCANCODE_RIGHT, B_RIGHT);

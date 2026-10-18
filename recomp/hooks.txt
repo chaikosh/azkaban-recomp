@@ -18,3 +18,6 @@
 002c9468          hle_log_mprest    debug: movie: restore bitstream DMA after CSC
 002c7268          hle_log_mpbits    debug: movie: get bits from the IPU
 002c75b0          hle_log_mppic     debug: movie: picture decode entry (dump frame stores)
+003480d0          hle_runtime_get   NRuntime::Get(option): HP_FASTBOOT / HP_ARGS add game options (runtime/fastboot.c)
+0010d2e0          hle_fscommand     Apt FSCommand dispatch (HP_FSLOG logs them; runtime/fastboot.c)
+0017ab48          hle_orc_play_scene  Orchestrator PlayScene: HP_FASTBOOT makes cutscenes skippable (runtime/fastboot.c)
