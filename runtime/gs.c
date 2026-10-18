@@ -1101,7 +1101,20 @@ void gs_write_reg(int reg, uint64_t v) {
     case 0x03: gs.uv = v; break;
     case 0x04: gs.fog = (v >> 56) << 56; vertex_kick(make_vertex(v, 1, (uint8_t)(v >> 56)), 1); break;
     case 0x05: vertex_kick(make_vertex(v, 0, 0), 1); break;
-    case 0x06: case 0x07: gs.tex0[reg - 6] = v; clut_load(v); break;
+    case 0x06: case 0x07:
+        {   /* HP_TBP0LOG: report indexed textures set up with TBP0 = 0 (and a CLUT elsewhere); the first
+               one from PATH1 also saves the VU1 snapshot (HP_VUSNAP) of the run that made it */
+            static int n = -1; if (n < 0) n = getenv("HP_TBP0LOG") ? 40 : 0;
+            uint32_t psm = bits(v, 20, 6);
+            if (n > 0 && !(v & 0x3fff) && bits(v, 37, 14) && (psm == PSMT4 || psm == PSMT8)) {
+                n--; extern unsigned long long g_vsyncs; extern uint32_t g_dma_src;
+                LOG("[tbp0 v%llu] TEX0_%d %016llx via path %d (last xgkick %03x, VU1 start %04x, dma src %08x)\n", g_vsyncs, reg - 5,
+                    (unsigned long long)v, cur_path, g_last_xgkick, g_last_vu1_start, g_dma_src);
+                if (cur_path == 0) { extern void vu1_snapshot_save(void); vu1_snapshot_save(); }
+                static int dumped; if (!dumped++ && getenv("HP_RAMDUMP")) { extern void rt_usr1_work(void); rt_usr1_work(); }
+            }
+        }
+        gs.tex0[reg - 6] = v; clut_load(v); break;
     case 0x08: case 0x09: gs.clamp[reg - 8] = v; break;
     case 0x0a: gs.fog = v; break;
     case 0x0c: gs.fog = (v >> 56) << 56; vertex_kick(make_vertex(v, 1, (uint8_t)(v >> 56)), 0); break;

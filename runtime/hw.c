@@ -132,6 +132,8 @@ static void note(const char *what, uint32_t a, uint64_t v) {
 static uint32_t sh32(uint8_t *base, uint32_t off) { uint32_t v; memcpy(&v, base + off, 4); return v; }
 static void sw32(uint8_t *base, uint32_t off, uint32_t v) { memcpy(base + off, &v, 4); }
 
+void gs_priv_write(uint32_t off, uint64_t v);
+
 /* ---- 32-bit register file -------------------------------------------------- */
 uint32_t mmio_r32(uint32_t a) {
     uint32_t p = a & 0x1fffffffu;
@@ -238,6 +240,7 @@ void mmio_w32(uint32_t a, uint32_t v) {
             return;
         }
         sw32(gspriv, off, v);
+        { uint64_t q; memcpy(&q, gspriv + (off & ~7u), 8); gs_priv_write(off & ~7u, q); }   /* debug hooks see 32-bit writes too */
         return;
     }
     note("write (unmapped page)", p & ~0xffffu, v);
@@ -252,8 +255,6 @@ uint64_t mmio_r64(uint32_t a) {
     }
     return mmio_r32(a) | ((uint64_t)mmio_r32(a + 4) << 32);
 }
-
-void gs_priv_write(uint32_t off, uint64_t v);
 
 void mmio_w64(uint32_t a, uint64_t v) {
     uint32_t p = a & 0x1fffffffu;
