@@ -138,19 +138,22 @@ void hle_log_mpcsc(EE *c) {
         }
         last_dst = ld32(RW(4) + 216) & 0x0fffffffu;
     }
-    /* HP_MPDUMP=dir: save the raw8 YUV macroblocks of the first pictures handed to CSC */
-    static int n;
+    /* HP_MPDUMP=dir: save the raw8 YUV macroblocks of the pictures handed to CSC (HP_MPDUMPN of them,
+       default 8, after skipping HP_MPDUMPSKIP); the log line gives the vsync and the IPU VLC errors since the last one */
+    static int n, nmax = -1, nskip;
+    extern unsigned g_ipu_vlc_errors; static unsigned last_err;
+    if (nmax < 0) { nmax = getenv("HP_MPDUMPN") ? atoi(getenv("HP_MPDUMPN")) : 8; nskip = getenv("HP_MPDUMPSKIP") ? atoi(getenv("HP_MPDUMPSKIP")) : 0; }
     const char *dir = getenv("HP_MPDUMP");
     uint32_t p = RW(5), src = ld32(p) & 0x01fffff0u, mbs = ld32(p + 12) * ld32(p + 16);
-    if (dir && mbs && n < 8) {
-        char path[512]; snprintf(path, sizeof path, "%s/pic%d_%ux%u.yuv", dir, n++, ld32(p + 12), ld32(p + 16));
+    if (dir && mbs && nskip > 0) { nskip--; last_err = g_ipu_vlc_errors; }
+    else if (dir && mbs && n < nmax) {
+        extern unsigned long long g_vsyncs;
+        char path[512]; snprintf(path, sizeof path, "%s/pic%04d_%ux%u.yuv", dir, n, ld32(p + 12), ld32(p + 16));
         FILE *f = fopen(path, "wb");
-        if (f) { fwrite(g_ram + src, 1, mbs * 384, f); fclose(f); LOG("[mp] dumped %s from %08x\n", path, src); }
-        for (int b = 0; b < 3 && n == 2; b++) {   /* all three frame stores at the second conversion */
-            snprintf(path, sizeof path, "%s/buf%d_32x32.yuv", dir, b);
-            f = fopen(path, "wb");
-            if (f) { fwrite(g_ram + 0x119b440 + b * 0x60000, 1, 0x60000, f); fclose(f); }
-        }
+        if (f) { fwrite(g_ram + src, 1, mbs * 384, f); fclose(f); }
+        LOG("[mp] dumped pic %d v%llu from %08x, %u VLC errors\n", n, g_vsyncs, src, g_ipu_vlc_errors - last_err);
+        last_err = g_ipu_vlc_errors;
+        n++;
     }
     f_002c9008_orig(c);
 }
