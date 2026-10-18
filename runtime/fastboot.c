@@ -149,7 +149,7 @@ uint16_t fastboot_buttons(void) {
     }
     if (!fb_skip || !scene || !ld32(ORC_OBJ + 156)) return 0;
     unsigned long long d = g_vsyncs - since;
-    return d >= 30 && (d / 12) % 2 == 0 ? 1u << 14 : 0;   /* Cross: 12 vsyncs down, 12 up */
+    return d >= 15 && (d / 12) % 2 == 1 ? 1u << 14 : 0;   /* Cross: 12 vsyncs down, 12 up */
 }
 
 /* Called at each vblank: headless runs poll no input, so the fast boot sets the pad here. */
