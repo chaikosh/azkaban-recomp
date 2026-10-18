@@ -55,6 +55,7 @@ struct Item { Batch batch; bool show = false; Show regs{}; };
 // --- gathering (any thread) ---
 std::mutex g_pend_lock;
 Batch g_pend;
+bool g_new_since_show = false;   // a batch was posted since the last frame request (g_pend_lock)
 
 // --- the queue to the GS thread ---
 std::mutex g_q_lock;
@@ -102,7 +103,10 @@ void show_frame(const Show &r) {   // g_lock held
     if (source_of(r, src)) {
         static std::vector<std::uint32_t> rgba;
         std::uint32_t w = 0, h = 0;
-        static const bool sync = std::getenv("HP_GSSYNC") != nullptr;   // exact frame, waits for the GPU
+        // The asynchronous readback keeps up to three copies in flight and waits for the oldest when
+        // all are busy (gpu.cpp), which bounds the GPU queue; HP_GSSYNC=1 reads every frame exactly
+        // (the GS thread then waits for the GPU each time: slower).
+        static const bool sync = std::getenv("HP_GSSYNC") != nullptr;
         const bool ok = sync ? ps2::gs::gpu::display(src, rgba, w, h) : ps2::gs::gpu::display_async(src, rgba, w, h);
         if (ok && w && h && rgba.size() >= static_cast<std::size_t>(w) * h) {
             std::lock_guard<std::mutex> fl(g_frame_lock);
@@ -207,7 +211,7 @@ void gsb_gif(int path, const void *data, uint32_t qwc) {
     else g_pend.runs.push_back(Run{path, qwc});
     const auto *p = static_cast<const std::uint8_t *>(data);
     g_pend.data.insert(g_pend.data.end(), p, p + static_cast<std::size_t>(qwc) * 16);
-    if (g_pend.data.size() >= (256u << 10)) post_locked(false, nullptr);
+    if (g_pend.data.size() >= (256u << 10)) { post_locked(false, nullptr); g_new_since_show = true; }
 }
 
 /* Next `qwords` of a local->host transfer started by TRXDIR=1: everything issued before it is drawn first. */
@@ -229,8 +233,24 @@ int gsb_display(uint64_t pmode, uint64_t smode2, const uint64_t dispfb[2], const
                 uint32_t max_pixels, int *w, int *h) {
     const Show regs{pmode, smode2, {dispfb[0], dispfb[1]}, {display[0], display[1]}};
     {
+        // A new frame can only differ when GIF data arrived or the display registers changed (a
+        // buffer flip); the game draws at 30 fps or less, so about every other vblank is skipped.
+        // A new frame can only differ when GIF data arrived or the display registers changed (a
+        // buffer flip): vblanks with neither are skipped.
+        static Show last{};
+        static bool have_last = false;
+        static unsigned since = 0;
         std::lock_guard<std::mutex> pl(g_pend_lock);
-        post_locked(true, &regs);
+        const bool flip = !have_last || std::memcmp(&last, &regs, sizeof regs);
+        const bool drawn = !g_pend.data.empty() || g_new_since_show;
+        ++since;
+        if (flip || drawn) {
+            post_locked(true, &regs);
+            last = regs;
+            have_last = true;
+            g_new_since_show = false;
+            since = 0;
+        }
     }
     static std::uint64_t seen = 0;
     std::lock_guard<std::mutex> fl(g_frame_lock);

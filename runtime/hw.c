@@ -1,5 +1,6 @@
 /* EE hardware registers (0x1000xxxx), GS privileged registers (0x1200xxxx). */
 #include "rt.h"
+#include <mach/mach.h>
 int iopb_enabled(void);
 uint32_t iopb_sif_get_reg(uint32_t reg);
 void iopb_sif_set_reg(uint32_t reg, uint32_t v);
@@ -390,7 +391,12 @@ void hw_vblank(int start) {
                 extern unsigned g_frames_queued;
                 struct timespec t; clock_gettime(CLOCK_UPTIME_RAW, &t);
                 double wall = lt.tv_sec ? (t.tv_sec - lt.tv_sec) + (t.tv_nsec - lt.tv_nsec) * 1e-9 : 5.0;
-                LOG("[fps] %.1f game fps, %.1f vsync/s\n", (g_frames_queued - lf) / wall, 300 / wall);
+                extern unsigned g_audio_underruns, g_pace[5];
+                task_vm_info_data_t vmi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+                double mb = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) == KERN_SUCCESS ? vmi.phys_footprint / 1048576.0 : 0;
+                LOG("[fps] %.1f game fps, %.1f vsync/s, audio underruns %u, shown after 1/2/3/4+ vblanks: %u/%u/%u/%u, memory %.0f MB\n", (g_frames_queued - lf) / wall, 300 / wall,
+                    g_audio_underruns, g_pace[1], g_pace[2], g_pace[3], g_pace[4], mb);
+                memset(g_pace, 0, sizeof g_pace);
                 lf = g_frames_queued; lt = t;
             }
         }

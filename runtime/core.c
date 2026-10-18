@@ -282,6 +282,7 @@ int main(int argc, char **argv) {
     signal(SIGBUS, on_signal);
     signal(SIGILL, on_signal);
     signal(SIGFPE, on_signal);
+    signal(SIGABRT, on_signal);   /* e.g. a wgpu panic or a C++ exception: say so in the log */
     signal(SIGUSR1, on_usr1);
     mem_init();
     dispatch_init();

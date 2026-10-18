@@ -1855,6 +1855,9 @@ struct Copy {
     std::uint64_t size = 0, order = 0;
     std::uint32_t width = 0, height = 0;
     bool busy = false, ready = false;
+#ifndef __EMSCRIPTEN__
+    WGPUSubmissionIndex submission = 0;   // hp: the submit that fills it
+#endif
 };
 Copy g_copies[3];
 std::uint64_t g_copy_order = 0;
@@ -1864,10 +1867,44 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
     wgpuInstanceProcessEvents(g_instance);
 #else
     wgpuDevicePoll(g_device, false, nullptr);
+    // hp: with every copy still in flight, wait for the GPU instead of piling up more work: the
+    // queue (and wgpu's memory) otherwise grows without bound when the GPU falls behind, and
+    // frames came back once in ~60 calls.
+    for (;;) {
+        bool free_or_ready = false;
+        Copy *oldest = nullptr;
+        for (Copy &c : g_copies) {
+            free_or_ready |= !c.busy || c.ready;
+            if (c.busy && !c.ready && (!oldest || c.order < oldest->order)) oldest = &c;
+        }
+        if (free_or_ready || !oldest) break;
+        // only until the oldest copy is through, so the GPU keeps the newer work queued
+        wgpuDevicePoll(g_device, true, &oldest->submission);
+    }
 #endif
+    // hp: a copy older than the last frame returned is stale (copies may finish out of order)
+    static std::uint32_t returned_order = 0;
+    for (Copy &c : g_copies)
+        if (c.ready && c.order <= returned_order) {
+            wgpuBufferUnmap(c.buffer);
+            c.ready = c.busy = false;
+        }
     Copy *newest = nullptr;
     for (Copy &c : g_copies)
         if (c.ready && (!newest || c.order > newest->order)) newest = &c;
+    if (newest) returned_order = newest->order;
+    {   // hp: HP_GSASYNCLOG counts how the asynchronous readback copies come back
+        static const bool on = std::getenv("HP_GSASYNCLOG") != nullptr;
+        static unsigned calls, got, busy_all;
+        if (on) {
+            ++calls;
+            if (newest) ++got;
+            bool any_free = false;
+            for (Copy &c : g_copies) any_free |= !c.busy;
+            if (!any_free) ++busy_all;
+            if (calls % 300 == 0) { std::fprintf(stderr, "[gpu] async display: %u calls, %u frames back, %u calls with every copy busy\n", calls, got, busy_all); calls = got = busy_all = 0; }
+        }
+    }
     if (newest) {
         const std::uint64_t bytes = static_cast<std::uint64_t>(newest->width) * newest->height * 4;
         const void *mapped = wgpuBufferGetConstMappedRange(newest->buffer, 0, bytes);
@@ -1901,7 +1938,11 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
         WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
         wgpuCommandEncoderCopyBufferToBuffer(enc, g_scratch, 0, slot->buffer, 0, bytes);
         WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
+#ifdef __EMSCRIPTEN__
         wgpuQueueSubmit(g_queue, 1, &cmd);
+#else
+        slot->submission = wgpuQueueSubmitForIndex(g_queue, 1, &cmd);
+#endif
         wgpuCommandBufferRelease(cmd);
         wgpuCommandEncoderRelease(enc);
         slot->busy = true;

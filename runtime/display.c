@@ -10,12 +10,13 @@
 #include "ios/touchpad.h"
 #endif
 
-#define MAXW 1024
-#define MAXH 1024
+#define MAXW 2048   /* up to 3x GPU render scale (PS2_SCALE) */
+#define MAXH 2048
 static uint32_t frame_buf[MAXW * MAXH];
 static int frame_w = 640, frame_h = 448, frame_new;
 static pthread_mutex_t fm = PTHREAD_MUTEX_INITIALIZER;
 unsigned long long g_vsyncs;
+unsigned g_pace[5];   /* new frames shown after 1, 2, 3, 4+ vblanks (index 0 unused) */
 
 static inline uint64_t fld(uint64_t v, int lo, int n) { return (v >> lo) & ((1ull << n) - 1); }
 
@@ -39,6 +40,11 @@ void display_vsync(void) {
     if (g_gs_gpu) {   /* the GPU renderer hands back the displayed frame */
         uint64_t fb2[2] = {hw_gs_priv(0x0070), hw_gs_priv(0x0090)}, disp2[2] = {hw_gs_priv(0x0080), hw_gs_priv(0x00a0)};
         if (!gsb_display(pmode, hw_gs_priv(0x0020), fb2, disp2, frame_buf, MAXW * MAXH, &w, &h)) { pthread_mutex_unlock(&fm); return; }
+        {   /* frame pacing: vblanks between the frames handed to the window (HP_FPSLOG prints it) */
+            extern unsigned g_pace[5]; static unsigned long long last;
+            unsigned long long d = g_vsyncs - last; last = g_vsyncs;
+            g_pace[d >= 4 ? 4 : d]++;
+        }
     } else
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++) {
@@ -168,10 +174,25 @@ static void poll_input(SDL_Gamepad *pad) {
 
 /* SPU2 output from the IOP (48 kHz stereo s16) */
 static SDL_AudioStream *g_audio;
+/* The IOP produces sound in short bursts as it catches up with the emulated clock, so the stream
+   keeps a margin: playback (re)starts only once ~100 ms is queued, and pauses when the queue runs
+   dry instead of stuttering on every late burst.  g_audio_underruns counts the dry spells. */
+unsigned g_audio_underruns;
+static int g_audio_paused = 1;
 static void audio_sink(const int16_t *samples, size_t frames) {
     if (!g_audio) return;
-    if (SDL_GetAudioStreamQueued(g_audio) > 48000 * 4 / 2) return;   /* never queue more than 0.5 s */
+    int queued = SDL_GetAudioStreamQueued(g_audio);
+    if (queued > 48000 * 4 / 2) return;   /* never queue more than 0.5 s */
+    if (!g_audio_paused && queued == 0) {
+        SDL_PauseAudioStreamDevice(g_audio);
+        g_audio_paused = 1;
+        g_audio_underruns++;
+    }
     SDL_PutAudioStreamData(g_audio, samples, (int)(frames * 4));
+    if (g_audio_paused && queued + (int)(frames * 4) >= 48000 * 4 / 10) {
+        SDL_ResumeAudioStreamDevice(g_audio);
+        g_audio_paused = 0;
+    }
 }
 static void audio_open(void) {
     extern int iopb_enabled(void);
@@ -180,8 +201,7 @@ static void audio_open(void) {
     SDL_AudioSpec spec = {SDL_AUDIO_S16, 2, 48000};
     g_audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
     if (!g_audio) { LOG("[audio] %s\n", SDL_GetError()); return; }
-    SDL_ResumeAudioStreamDevice(g_audio);
-    iopb_set_audio_sink(audio_sink);
+    iopb_set_audio_sink(audio_sink);   /* playback starts once the margin is queued */
 }
 
 #if TARGET_OS_IOS
@@ -214,7 +234,7 @@ void display_loop(void) {
     for (;;) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_EVENT_QUIT) { fflush(stderr); _exit(0); }
+            if (e.type == SDL_EVENT_QUIT) { LOG("[display] quit event\n"); fflush(stderr); _exit(0); }
             if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) pad = SDL_OpenGamepad(e.gdevice.which);
             if (e.type == SDL_EVENT_GAMEPAD_REMOVED && pad && e.gdevice.which == SDL_GetGamepadID(pad)) { SDL_CloseGamepad(pad); pad = NULL; }
             touchpad_event(&e);
@@ -266,7 +286,10 @@ void display_loop(void) {
     for (;;) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_EVENT_LOW_MEMORY) LOG("[ios] low memory warning\n");
+            if (e.type == SDL_EVENT_TERMINATING) LOG("[ios] terminating\n");
             if (e.type == SDL_EVENT_QUIT) {   /* a save made just before must still reach the card file */
+                LOG("[ios] quit event\n");
                 extern int iopb_enabled(void); extern void iopb_mc_flush(void);
                 if (iopb_enabled()) iopb_mc_flush();
                 fflush(stderr); _exit(0);

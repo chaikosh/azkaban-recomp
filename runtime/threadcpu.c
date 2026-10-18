@@ -1,5 +1,6 @@
 /* Per-thread CPU accounting for speed work: threads register under a name; HP_STATS prints usage. */
 #include "rt.h"
+#include <TargetConditionals.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <pthread/qos.h>
@@ -28,7 +29,12 @@ void hp_thread_register(const char *name) {
             if (!e) break;
             p = e + 1;
         }
+#if TARGET_OS_IOS
+        /* two performance cores on iPhones: the GS thread must not sink to an efficiency core */
+        pthread_set_qos_class_self_np(is_low ? QOS_CLASS_USER_INITIATED : QOS_CLASS_USER_INTERACTIVE, 0);
+#else
         pthread_set_qos_class_self_np(is_low ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     }
     pthread_mutex_lock(&tm);
     if (nt < MAXT) { snprintf(tt[nt].name, sizeof tt[nt].name, "%s", name); tt[nt].port = pthread_mach_thread_np(pthread_self()); nt++; }
