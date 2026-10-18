@@ -70,11 +70,14 @@ static void spr_transfer(int ch) {
 /* HP_SYNCLOG=vsync: log VIF1/GIF synchronisation events (kicks, I-bit stalls, STC, FLUSHA, job
    and channel completion) for 30 vsyncs from there, with the guest context that caused them. */
 #include <stdarg.h>
-void synclog(const char *fmt, ...) {
+extern unsigned long long g_vsyncs;
+static int synclog_on(void) {
     static long long from = -2;
-    extern unsigned long long g_vsyncs;
     if (from == -2) from = getenv("HP_SYNCLOG") ? atoll(getenv("HP_SYNCLOG")) : -1;
-    if (from < 0 || (long long)g_vsyncs < from || (long long)g_vsyncs >= from + 30) return;
+    return from >= 0 && (long long)g_vsyncs >= from && (long long)g_vsyncs < from + 30;
+}
+void synclog(const char *fmt, ...) {
+    if (!synclog_on()) return;
     char buf[400];
     va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
     EE *c = kern_current_ctx();
@@ -169,9 +172,9 @@ static void render_channel(int ch) {
                              mmio_r32(base[1] + 0x20), mmio_r32(base[1] + 0x30));
         dma_run(1, vif1_sink, (chcr_now(1) >> 6) & 1);
     } else {
-        synclog("gif job start tadr %08x", mmio_r32(base[2] + 0x30));
+        if (synclog_on()) synclog("gif job start tadr %08x", mmio_r32(base[2] + 0x30));
         dma_run(2, gif_sink, 0);
-        synclog("gif job end tadr %08x", mmio_r32(base[2] + 0x30));
+        if (synclog_on()) synclog("gif job end tadr %08x", mmio_r32(base[2] + 0x30));
         if (__atomic_sub_fetch(&path3_pending, 1, __ATOMIC_SEQ_CST) == 0) { extern void vif1_path3_idle(void); vif1_path3_idle(); }
     }
     uint32_t q = g_dma_qwords;
@@ -273,7 +276,7 @@ void dma_start(int ch) {
             p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
     }
     if (ch == 2) __atomic_add_fetch(&path3_pending, 1, __ATOMIC_SEQ_CST);
-    if (ch == 1 || ch == 2) { synclog("kick ch%d chcr %08x tadr %08x madr %08x qwc %u", ch, mmio_r32(base[ch]), mmio_r32(base[ch] + 0x30), mmio_r32(base[ch] + 0x10), mmio_r32(base[ch] + 0x20) & 0xffff); render_post(ch); return; }
+    if (ch == 1 || ch == 2) { if (synclog_on()) synclog("kick ch%d chcr %08x tadr %08x madr %08x qwc %u", ch, mmio_r32(base[ch]), mmio_r32(base[ch] + 0x30), mmio_r32(base[ch] + 0x10), mmio_r32(base[ch] + 0x20) & 0xffff); render_post(ch); return; }
     g_dma_qwords = 0;
     if (ch == 8 || ch == 9) spr_transfer(ch);
     if (ch == 4) {   /* toIPU is pulled by the IPU as its input FIFO drains */
