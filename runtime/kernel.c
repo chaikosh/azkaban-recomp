@@ -45,6 +45,7 @@ static uint64_t seq_ctr;
 static __thread int my_tid = -1;
 static int in_irq, need_resched, irq_enabled = 1;
 static uint32_t intc_stat, intc_mask, dmac_cis, dmac_cim;
+static uint64_t irq_seq, intc_seq[16], dmac_seq[16];   /* arrival order of pending interrupts */
 static uint32_t heap_start, heap_end, main_stack, main_stack_size;
 static uint32_t vsync_flag_addr, vsync_data_addr;
 static uint32_t gs_imr = 0x7f00;
@@ -175,14 +176,17 @@ static void deliver_locked(void) {
             continue;
         }
         if (!p && !d) break;
-        if (p) {
-            int line = __builtin_ctz(p);
+        /* deliver the oldest pending interrupt first, like the hardware would */
+        int line = -1, ch = -1;
+        uint64_t best = ~0ull;
+        for (uint32_t m = p; m; m &= m - 1) { int k = __builtin_ctz(m); if (intc_seq[k] < best) { best = intc_seq[k]; line = k; } }
+        for (uint32_t m = d; m; m &= m - 1) { int k = __builtin_ctz(m); if (dmac_seq[k] < best) { best = dmac_seq[k]; line = -1; ch = k; } }
+        if (line >= 0) {
             intc_stat &= ~(1u << line);
             for (int k = 0; k < MAX_HANDLERS; k++)
                 if (intc_h[k].used && intc_h[k].enabled && intc_h[k].cause == line) call_handler(&intc_h[k], line);
             if (line == 2 && vsync_flag_addr) { st32(vsync_flag_addr, 1); if (vsync_data_addr) st64(vsync_data_addr, 0); }
         } else {
-            int ch = __builtin_ctz(d);
             dmac_cis &= ~(1u << ch);
             for (int k = 0; k < MAX_HANDLERS; k++)
                 if (dmac_h[k].used && dmac_h[k].enabled && dmac_h[k].cause == ch) call_handler(&dmac_h[k], ch);
@@ -208,6 +212,7 @@ void rt_irq_poll(EE *c) {
 
 void kern_raise_intc(int line) {
     pthread_mutex_lock(&km);
+    if (!(intc_stat & (1u << line))) intc_seq[line] = ++irq_seq;
     intc_stat |= 1u << line;
     if (intc_stat & intc_mask) { g_irq_pending = 1; pthread_cond_signal(&idle_cv); }
     pthread_mutex_unlock(&km);
@@ -215,11 +220,13 @@ void kern_raise_intc(int line) {
 
 void kern_raise_dmac(int ch) {
     pthread_mutex_lock(&km);
+    if (!(dmac_cis & (1u << ch))) dmac_seq[ch] = ++irq_seq;
     dmac_cis |= 1u << ch;
     if (dmac_cis & dmac_cim) { g_irq_pending = 1; pthread_cond_signal(&idle_cv); }
     pthread_mutex_unlock(&km);
 }
 
+uint64_t kern_gs_imr(void) { return gs_imr; }
 uint32_t kern_intc_stat(void) { return intc_stat; }
 void kern_intc_ack(uint32_t bits) { pthread_mutex_lock(&km); intc_stat &= ~bits; pthread_mutex_unlock(&km); }
 uint32_t kern_intc_mask(void) { return intc_mask; }
@@ -250,14 +257,36 @@ static uint64_t host_ns(void) {
 }
 static uint64_t t0_ns;
 static uint32_t count_bias;
+/* Emulated time: wall time minus the time spent emulating GS/VU work, so the
+ * game's timers see rendering as (nearly) free, as on the real hardware. */
+static uint64_t g_stolen_ns, g_freeze_at;
+static int g_freeze_depth;
+static pthread_mutex_t vm = PTHREAD_MUTEX_INITIALIZER;
+uint64_t virt_ns(void) {
+    pthread_mutex_lock(&vm);
+    uint64_t v = (g_freeze_depth ? g_freeze_at : host_ns()) - g_stolen_ns;
+    pthread_mutex_unlock(&vm);
+    return v;
+}
+/* While frozen the emulated clock stands still (monotonic, never steps back). */
+void kern_freeze_begin(void) {
+    pthread_mutex_lock(&vm);
+    if (g_freeze_depth++ == 0) g_freeze_at = host_ns();
+    pthread_mutex_unlock(&vm);
+}
+void kern_freeze_end(void) {
+    pthread_mutex_lock(&vm);
+    if (--g_freeze_depth == 0) g_stolen_ns += host_ns() - g_freeze_at;
+    pthread_mutex_unlock(&vm);
+}
 
 uint32_t rt_mfc0(EE *c, int reg, int sel) {
     switch (reg) {
-    case 9: return (uint32_t)((host_ns() - t0_ns) * 294912 / 1000000) + count_bias;   /* 294.912 MHz */
+    case 9: return (uint32_t)((virt_ns() - t0_ns) * 294912 / 1000000) + count_bias;   /* 294.912 MHz */
     case 12: return 0x70020c11u | (irq_enabled ? 0x10000 : 0);   /* CU0-2, EDI, IM2/3, user mode */
     case 15: return 0x2e20;
     case 16: return 0x440;
-    case 25: return (uint32_t)((host_ns() - t0_ns) * 294912 / 1000000);
+    case 25: return (uint32_t)((virt_ns() - t0_ns) * 294912 / 1000000);
     default: return 0;
     }
 }
@@ -591,7 +620,7 @@ void rt_syscall(EE *c, uint32_t pc) {
         r = -1;
         for (int k = 0; k < MAX_ALARMS; k++)
             if (!alarms[k].used) {
-                alarms[k] = (KAlarm){1, 0, host_ns() + (uint64_t)(A0 & 0xffff) * HSYNC_NS, A1, A2, RW(28), A0 & 0xffff};
+                alarms[k] = (KAlarm){1, 0, virt_ns() + (uint64_t)(A0 & 0xffff) * HSYNC_NS, A1, A2, RW(28), A0 & 0xffff};
                 pthread_cond_signal(&alarm_cv);
                 r = k;
                 break;
@@ -637,21 +666,48 @@ void rt_syscall(EE *c, uint32_t pc) {
 }
 
 /* ---- boot ---------------------------------------------------------------- */
+/* Sleep until the emulated clock reaches `target` (it stands still while frozen). */
+static void sleep_until_virt(uint64_t target) {
+    for (;;) {
+        uint64_t now = virt_ns();
+        if (now >= target) return;
+        uint64_t d = target - now;
+        if (d > 2000000) d = 2000000;
+        struct timespec ts = {0, (long)d};
+        nanosleep(&ts, NULL);
+    }
+}
+
+static void *clock_monitor(void *arg) {
+    (void)arg;
+    extern unsigned long long g_vsyncs;
+    uint64_t lw = host_ns(), lv = virt_ns();
+    unsigned long long ls = g_vsyncs;
+    for (;;) {
+        struct timespec ts = {2, 0};
+        nanosleep(&ts, NULL);
+        uint64_t w = host_ns(), v = virt_ns();
+        extern double g_prof[8];
+        LOG("[clock] wall %.2fs: virtual %.2fs, vsyncs %llu | dma1 %.2f sprite %.2f tri %.2f poolwait %.2f\n", (w - lw) / 1e9, (v - lv) / 1e9,
+            g_vsyncs - ls, g_prof[0], g_prof[1], g_prof[2], g_prof[3]);
+        for (int k = 0; k < 8; k++) g_prof[k] = 0;
+        lw = w; lv = v; ls = g_vsyncs;
+    }
+    return NULL;
+}
+
 static void *vblank_thread(void *arg) {
     (void)arg;
-    uint64_t next = host_ns();
-    const uint64_t period = 16683333;   /* 59.94 Hz */
+    uint64_t next = virt_ns();
+    const uint64_t period = 16683333;   /* 59.94 Hz of emulated time */
     for (;;) {
         next += period;
-        uint64_t now = host_ns();
-        if (next > now) {
-            struct timespec ts = {(time_t)((next - now) / 1000000000ull), (long)((next - now) % 1000000000ull)};
-            nanosleep(&ts, NULL);
-        } else next = now;
+        uint64_t now = virt_ns();
+        if (next + 4 * period < now) next = now;   /* never try to catch up on many frames */
+        sleep_until_virt(next);
         hw_vblank(1);
         kern_raise_intc(2);
-        struct timespec vb = {0, 1300000};
-        nanosleep(&vb, NULL);
+        sleep_until_virt(next + 1300000);
         hw_vblank(0);
         kern_raise_intc(3);
     }
@@ -660,6 +716,22 @@ static void *vblank_thread(void *arg) {
 
 uint64_t hw_timers_next(void);
 void hw_timers_fire(void);
+
+/* Deferred host callbacks (hardware completion events), run by the alarm thread. */
+typedef struct { int used; uint64_t due; void (*fn)(int); int arg; } KEvent;
+#define MAX_EVENTS 64
+static KEvent events[MAX_EVENTS];
+
+void kern_after(uint64_t ns, void (*fn)(int), int arg) {
+    pthread_mutex_lock(&km);
+    int slot = -1;
+    for (int k = 0; k < MAX_EVENTS; k++)
+        if (!events[k].used) { slot = k; break; }
+    if (slot >= 0) events[slot] = (KEvent){1, virt_ns() + ns, fn, arg};
+    else LOG("[kern] event table full, dropping event\n");
+    pthread_cond_signal(&alarm_cv);
+    pthread_mutex_unlock(&km);
+}
 
 void kern_timers_changed(void) {
     pthread_mutex_lock(&km);
@@ -671,8 +743,21 @@ static void *alarm_thread(void *arg) {
     (void)arg;
     pthread_mutex_lock(&km);
     for (;;) {
-        uint64_t now = host_ns(), next = 0;
+        uint64_t now = virt_ns(), next = 0;
         int fired = 0;
+        int best = -1;
+        for (int k = 0; k < MAX_EVENTS; k++)
+            if (events[k].used && events[k].due <= now && (best < 0 || events[k].due < events[best].due)) best = k;
+        if (best >= 0) {
+            KEvent e = events[best];
+            events[best].used = 0;
+            pthread_mutex_unlock(&km);
+            e.fn(e.arg);
+            pthread_mutex_lock(&km);
+            continue;
+        }
+        for (int k = 0; k < MAX_EVENTS; k++)
+            if (events[k].used && (!next || events[k].due < next)) next = events[k].due;
         uint64_t tn = hw_timers_next();
         if (tn && tn <= now) {
             pthread_mutex_unlock(&km);
@@ -680,7 +765,7 @@ static void *alarm_thread(void *arg) {
             pthread_mutex_lock(&km);
             continue;
         }
-        if (tn) next = tn;
+        if (tn && (!next || tn < next)) next = tn;
         for (int k = 0; k < MAX_ALARMS; k++) {
             KAlarm *a = &alarms[k];
             if (!a->used || a->fired) continue;
@@ -701,7 +786,7 @@ static void *alarm_thread(void *arg) {
 }
 
 void kern_run_main(uint32_t entry) {
-    t0_ns = host_ns();
+    t0_ns = virt_ns();
     for (int n = 0; n < 256; n++) st32(KSYSCALL_TAB + 4u * (uint32_t)n, KFAKE_FN(n));
     irqc.vf[0].f[3] = 1.0f;
     int t = new_thread();
@@ -717,6 +802,7 @@ void kern_run_main(uint32_t entry) {
     pthread_t vb, at;
     pthread_create(&vb, NULL, vblank_thread, NULL);
     pthread_create(&at, NULL, alarm_thread, NULL);
+    if (getenv("HP_CLOCK")) { pthread_t cm; pthread_create(&cm, NULL, clock_monitor, NULL); }
     GuestFn fn = rt_lookup(entry);
     if (!fn) rt_fatal(c, "entry point is not code");
     fn(c);

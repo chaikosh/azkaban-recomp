@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "gs.h"
 
 static uint8_t eeregs[0x10000];   /* shadow of 0x10000000..0x1000ffff */
 static uint8_t gspriv[0x2000];    /* shadow of 0x12000000..0x12001fff */
@@ -15,11 +16,13 @@ uint32_t kern_dmac_stat(void);
 void kern_dmac_write_stat(uint32_t v);
 void dma_start(int ch);
 
-static uint64_t now_ns(void) {
+static uint64_t wall_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
+uint64_t virt_ns(void);
+static uint64_t now_ns(void) { return virt_ns(); }   /* timers run on emulated time */
 
 /* ---- timers -------------------------------------------------------------- */
 /* count(t) = base + ticks since t0, with compare/overflow events computed
@@ -90,18 +93,27 @@ void hw_timers_fire(void) {
         if (!(t->mode & 0x80)) continue;
         uint64_t ticks = ticks_since(t, now);
         uint64_t cper = ((t->mode & 0x40) && t->comp) ? (uint64_t)t->comp + 1 : 0x10000;
+        /* the interrupt is raised when EQUF/OVFF goes from 0 to 1; while the game
+         * leaves a flag set, further compares/overflows stay silent */
         if (t->next_cmp && ticks >= t->next_cmp) {
+            if (!(t->mode & 0x400) && (t->mode & 0x100)) raise[k] = 1;
             t->mode |= 0x400;
-            if (t->mode & 0x100) raise[k] = 1;
             while (t->next_cmp <= ticks) t->next_cmp += cper;
         }
         if (t->next_ovf && ticks >= t->next_ovf) {
-            if (!(t->mode & 0x40)) { t->mode |= 0x800; if (t->mode & 0x200) raise[k] = 1; }
+            if (!(t->mode & 0x40)) {
+                if (!(t->mode & 0x800) && (t->mode & 0x200)) raise[k] = 1;
+                t->mode |= 0x800;
+            }
             while (t->next_ovf <= ticks) t->next_ovf += 0x10000;
         }
     }
     pthread_mutex_unlock(&tm);
-    for (int k = 0; k < 4; k++) if (raise[k]) kern_raise_intc(9 + k);
+    for (int k = 0; k < 4; k++) if (raise[k]) {
+        if (g_trace > 2 && k == 0) LOG("[timer] T0 irq at %llu ns (mode %x comp %x base %x next %llu)\n",
+                                       (unsigned long long)now, tim[0].mode, tim[0].comp, tim[0].base, (unsigned long long)tim[0].next_cmp);
+        kern_raise_intc(9 + k);
+    }
 }
 
 /* ---- logging of unknown registers ---------------------------------------- */
@@ -130,6 +142,7 @@ uint32_t mmio_r32(uint32_t a) {
             case 0x30: return tim[k].hold;
             }
         }
+        if (off >= 0x3c00 && off < 0x3e00) { extern uint32_t vif1_reg_read(uint32_t); return vif1_reg_read(off - 0x3c00); }
         switch (off) {
         case 0xe010: return kern_dmac_stat();
         case 0xf000: return kern_intc_stat();
@@ -144,7 +157,7 @@ uint32_t mmio_r32(uint32_t a) {
         case 0x3020: return 0;                       /* GIF_STAT: idle */
         case 0x3c00: return 0;                       /* VIF1_STAT: idle */
         case 0x3800: return 0;                       /* VIF0_STAT */
-        case 0x2010: return sh32(eeregs, off) & ~0x80000000u;  /* IPU_CTRL: not busy */
+        case 0x2000: case 0x2010: case 0x2020: case 0x2030: { extern uint32_t ipu_read(uint32_t); return ipu_read(off - 0x2000); }
         }
         uint32_t v = sh32(eeregs, off);
         if (g_trace) note("read", p, v);
@@ -168,6 +181,7 @@ void mmio_w32(uint32_t a, uint32_t v) {
         uint32_t off = p & 0xffff;
         if (off < 0x2000) {
             int k = off >> 11;
+            if (g_trace > 1) LOG("[timer] T%d reg %02x = %08x\n", k, off & 0x7f0, v);
             pthread_mutex_lock(&tm);
             switch (off & 0x7f0) {
             case 0x00: timer_set(k, v); break;
@@ -184,6 +198,10 @@ void mmio_w32(uint32_t a, uint32_t v) {
             kern_timers_changed();
             return;
         }
+        if (off >= 0x3c00 && off < 0x3e00) { extern void vif1_reg_write(uint32_t, uint32_t); vif1_reg_write(off - 0x3c00, v); }
+        if ((off == 0x2000 || off == 0x2010) && g_trace) LOG("[ipu] %s = %08x\n", off == 0x2000 ? "CMD" : "CTRL", v);
+        if (off == 0x2000) { extern void ipu_write_cmd(uint32_t); ipu_write_cmd(v); return; }
+        if (off == 0x2010) { extern void ipu_write_ctrl(uint32_t); ipu_write_ctrl(v); return; }
         switch (off) {
         case 0xe010: kern_dmac_write_stat(v); return;
         case 0xf000: kern_intc_ack(v); return;
@@ -256,6 +274,7 @@ U128 mmio_r128(uint32_t a) {
     U128 v;
     uint32_t p = a & 0x1fffffffu;
     memset(&v, 0, sizeof v);
+    if (p >= 0x10007000u && p < 0x10007010u) { extern uint32_t ipu_out_qwords(uint8_t *, uint32_t); ipu_out_qwords((uint8_t *)&v, 1); return v; }
     if (p >= 0x10004000u && p < 0x10008000u) { note("fifo read", p, 0); return v; }
     for (int k = 0; k < 4; k++) v.w[k] = mmio_r32(a + 4 * k);
     return v;
@@ -274,9 +293,9 @@ void mmio_w128(uint32_t a, U128 v) {
 
 /* ---- SIF registers through syscalls --------------------------------------- */
 static uint64_t iop_reboot_at;   /* IOP "finishes" rebooting a little after the reset command */
-void hw_sif_iop_reset(void) { iop_reboot_at = now_ns() + 5000000ull; }
+void hw_sif_iop_reset(void) { iop_reboot_at = wall_ns() + 5000000ull; }
 static void sif_poll_reboot(void) {
-    if (iop_reboot_at && now_ns() >= iop_reboot_at) { sif_smflg |= 0x70000; iop_reboot_at = 0; }
+    if (iop_reboot_at && wall_ns() >= iop_reboot_at) { sif_smflg |= 0x70000; iop_reboot_at = 0; }
 }
 
 int64_t hw_sif_get_reg(uint32_t reg) {
@@ -320,8 +339,11 @@ void hw_set_crt(int interlace, int mode, int field) {
 void pad_vblank(void);
 void iop_tick(void);
 
+void display_vsync(void);
+
 void hw_vblank(int start) {
     if (start) {
+        display_vsync();
         pad_vblank();
         iop_tick();
         static int frames;
@@ -332,8 +354,26 @@ void hw_vblank(int start) {
     }
 }
 
+/* GS SIGNAL/FINISH events -> CSR bits and the GS interrupt (INTC 0) */
+uint64_t kern_gs_imr(void);
+void gs_signal(uint64_t v) {
+    uint32_t id = (uint32_t)v, mask = (uint32_t)(v >> 32);
+    uint32_t cur = (uint32_t)hw_gs_priv(0x1080);
+    cur = (cur & ~mask) | (id & mask);
+    memcpy(gspriv + 0x1080, &cur, 4);
+    gs_csr |= 1;
+    if (!(kern_gs_imr() & 0x100)) kern_raise_intc(0);
+}
+void gs_finish(void) {
+    gs_csr |= 2;
+    if (!(kern_gs_imr() & 0x200)) kern_raise_intc(0);
+}
+uint64_t hw_gs_priv(uint32_t off) { uint64_t v; memcpy(&v, gspriv + (off & 0x1ff8), 8); return v; }
+
 void hw_init(void) {
     sw32(eeregs, 0xf590, 0x1201);
+    extern void ipu_init(void);
+    ipu_init();
     iop_init();
 }
 

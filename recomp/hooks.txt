@@ -1,2 +1,7 @@
 # guest address   host function     reason
 00304930          hle_stream_done   EA sound stream status (until the IOP sound driver runs)
+0013c150          hle_log_queue     debug: frame queued
+0013dce0          hle_log_kick      debug: timer kicks queued DMA
+0013dd48          hle_log_done      debug: VIF1 DMA completion
+00143608          hle_log_gifkick   debug: GIF DMA chain kick
+0013d9f8          hle_log_vifirq    debug: VIF1 interrupt handler (mark)

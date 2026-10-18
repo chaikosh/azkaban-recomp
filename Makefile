@@ -8,8 +8,8 @@ PY       := python3 -I
 CC       := clang
 DEBUGFLAGS ?= -DWATCH
 OPT      ?= -O1
-CFLAGS   := $(OPT) -g -fno-strict-aliasing -fwrapv -w -Iruntime -I$(GEN) -DRA_CHECK -DTRACE_PC $(DEBUGFLAGS)
-LDFLAGS  :=
+CFLAGS   := $(OPT) -g -fno-strict-aliasing -fwrapv -w -Iruntime -I$(GEN) -I/opt/homebrew/include -DRA_CHECK -DTRACE_PC $(DEBUGFLAGS)
+LDFLAGS  := -L/opt/homebrew/lib -lSDL3
 
 RT_SRC   := $(wildcard runtime/*.c)
 GEN_SRC   = $(wildcard $(GEN)/*.c)
@@ -31,7 +31,7 @@ link: $(RT_OBJ) $(GEN_OBJ)
 
 $(OUT)/obj/%.o: %.c runtime/*.h
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -O2 -c $< -o $@
 
 $(OUT)/obj/gen/%.o: $(GEN)/%.c runtime/ee.h runtime/ee_gen.h
 	@mkdir -p $(dir $@)

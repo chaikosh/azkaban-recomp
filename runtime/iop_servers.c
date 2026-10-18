@@ -94,6 +94,56 @@ int iso_find(const char *path, uint32_t *lsn, uint32_t *size) {
     }
 }
 
+/* LSN -> file name map for diagnostics (walks the ISO directory tree once). */
+typedef struct { uint32_t lsn, sectors; char name[64]; } IsoFile;
+static IsoFile isofiles[256];
+static int nisofiles;
+
+static void iso_scan_dir(uint32_t dlsn, uint32_t dsize, const char *prefix, int depth) {
+    if (depth > 4) return;
+    for (uint32_t off = 0; off < dsize; off += 2048) {
+        uint8_t blk[2048];
+        if (!cdvd_read_sectors(dlsn + off / 2048, 1, blk)) return;
+        for (uint32_t k = 0; k < 2048 - 33;) {
+            uint8_t len = blk[k];
+            if (!len) break;
+            uint8_t nlen = blk[k + 32], flags = blk[k + 25];
+            uint32_t lsn, size;
+            memcpy(&lsn, blk + k + 2, 4);
+            memcpy(&size, blk + k + 10, 4);
+            char name[64];
+            int m = 0;
+            for (int j = 0; j < nlen && m < 40; j++) name[m++] = (char)blk[k + 33 + j];
+            name[m] = 0;
+            if (nlen > 1) {
+                char full[64];
+                snprintf(full, sizeof full, "%s\\%s", prefix, name);
+                if (flags & 2) iso_scan_dir(lsn, size, full, depth + 1);
+                else if (nisofiles < 256) isofiles[nisofiles++] = (IsoFile){lsn, (size + 2047) / 2048, ""}, snprintf(isofiles[nisofiles - 1].name, 64, "%s", full);
+            }
+            k += len;
+        }
+    }
+}
+
+const char *iso_name_of(uint32_t lsn, uint32_t *offset) {
+    if (!nisofiles) {
+        uint8_t sec[2048];
+        if (cdvd_read_sectors(16, 1, sec)) {
+            uint32_t dlsn, dsize;
+            memcpy(&dlsn, sec + 156 + 2, 4);
+            memcpy(&dsize, sec + 156 + 10, 4);
+            iso_scan_dir(dlsn, dsize, "", 0);
+        }
+    }
+    for (int k = 0; k < nisofiles; k++)
+        if (lsn >= isofiles[k].lsn && lsn < isofiles[k].lsn + isofiles[k].sectors) {
+            if (offset) *offset = (lsn - isofiles[k].lsn) * 2048;
+            return isofiles[k].name;
+        }
+    return "?";
+}
+
 /* ---- CDVD servers --------------------------------------------------------- */
 static int cd_init(uint32_t fno, uint8_t *in, uint32_t n, uint8_t *out, uint32_t cap, uint32_t *len) {
     iso_open();
@@ -137,7 +187,12 @@ static int cd_ncmd(uint32_t fno, uint8_t *in, uint32_t n, uint8_t *out, uint32_t
     switch (fno) {
     case 0x01: {   /* Read(lsn, sectors, ee buffer, mode) */
         uint32_t lsn = in32(in, 0), cnt = in32(in, 1), buf = in32(in, 2) & 0x1fffffffu;
-        if (g_trace) LOG("[cdvd] read lsn %u x%u -> %08x\n", lsn, cnt, buf);
+        if (g_trace) {
+            uint32_t off = 0;
+            const char *nm = iso_name_of(lsn, &off);
+            struct timespec tq; clock_gettime(CLOCK_MONOTONIC, &tq);
+            LOG("[cdvd %.4f] read lsn %u x%u -> %08x (%s +%#x)\n", tq.tv_sec + tq.tv_nsec * 1e-9, lsn, cnt, buf, nm, off);
+        }
         if (buf + cnt * 2048 <= RAM_SIZE) cdvd_read_sectors(lsn, cnt, g_ram + buf);
         else LOG("[cdvd] read to bad buffer %08x\n", buf);
         ret1(out, cap, len, 1);
@@ -337,6 +392,22 @@ static int mc_rpc(uint32_t fno, uint8_t *in, uint32_t n, uint8_t *out, uint32_t 
         if (cap >= 12) { out32(out, 0, 0); out32(out, 1, 0x20b); out32(out, 2, 0x20f); }
         return 0;
     }
+    if (fno == 0x01) {   /* GetInfo: {port, slot, ?, want type, want free, want format, ?, ee param} */
+        uint32_t port = in32(in, 0), param = in32(in, 7) & 0x1fffffffu;
+        static int seen_card[2];
+        if (port == 0) {
+            if (param + 148 <= RAM_SIZE) {
+                uint32_t type = 2, free_kb = 8000, fmt = 1;
+                memcpy(g_ram + param + 0, &type, 4);
+                memcpy(g_ram + param + 4, &free_kb, 4);
+                memcpy(g_ram + param + 144, &fmt, 4);
+            }
+            if (cap >= 4) out32(out, 0, seen_card[0]++ ? 0 : (uint32_t)-1);   /* -1 once: new formatted card */
+        } else if (cap >= 4) out32(out, 0, (uint32_t)-10);   /* no card in slot 2 */
+        return 0;
+    }
+    if (fno == 0x0c) { if (cap >= 4) out32(out, 0, 0); return 0; }   /* ChDir: ok */
+    if (fno == 0x0d) { if (cap >= 4) out32(out, 0, 0); return 0; }   /* GetDir: no saves yet */
     static int seen[256];
     if (fno < 256 && seen[fno]++ < 3) {
         LOG("[mc] fn %#x (in %u):", fno, n);

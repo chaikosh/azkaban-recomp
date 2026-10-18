@@ -36,6 +36,8 @@ static void mem_init(void) {
     map_pages(0x70000000u, g_spr, 0x10000);   /* 16 KiB scratchpad, mirrored inside the page */
     map_pages(0x11000000u, g_vumem, 0x10000);
     g_vu0_mem = g_vumem + 0x4000;
+    extern void vu1_init(uint8_t *);
+    vu1_init(g_vumem);
 }
 
 uint8_t *gptr(uint32_t a) {
@@ -86,7 +88,29 @@ void rt_watch_hit(uint32_t a, uint64_t v, int size) {
                       c ? rt_func_name(c->pc) : "?", c ? c->thread : 0, c ? RW(31) : 0);
 }
 
+/* HP_CALLHIST=<vsync>: histogram of indirect call targets during the 120 vsyncs from there */
+static long g_callhist_start = -1;
+static struct { uint32_t addr; unsigned n; } callhist[4096];
+extern unsigned long long g_vsyncs;
+void rt_callhist_dump(void) {
+    for (int pass = 0; pass < 40; pass++) {
+        int best = -1;
+        for (int k = 0; k < 4096; k++) if (callhist[k].n && (best < 0 || callhist[k].n > callhist[best].n)) best = k;
+        if (best < 0) break;
+        LOG("[callhist] %6u  f_%08x\n", callhist[best].n, callhist[best].addr);
+        callhist[best].n = 0;
+    }
+}
+
 void rt_call(EE *c, uint32_t addr) {
+    if (UNLIKELY(g_callhist_start >= 0) && (long long)g_vsyncs >= g_callhist_start && (long long)g_vsyncs < g_callhist_start + 120) {
+        uint32_t h = (addr >> 2) & 4095;
+        for (int k = 0; k < 4096; k++) {
+            uint32_t i = (h + k) & 4095;
+            if (callhist[i].n == 0) { callhist[i].addr = addr; callhist[i].n = 1; break; }
+            if (callhist[i].addr == addr) { callhist[i].n++; break; }
+        }
+    }
     if (UNLIKELY(g_calltrace_ra) && RW(31) == g_calltrace_ra) {
         static int n;
         if (n++ < 10) LOG("[calltrace] %08x -> %08x (a0=%08x)\n", g_calltrace_ra, addr, RW(4));
@@ -147,6 +171,13 @@ void kern_dump_threads(void);
 static void on_usr1(int sig) {
     (void)sig;
     kern_dump_threads();
+    rt_callhist_dump();
+    const char *vd = getenv("HP_VRAMDUMP");
+    if (vd) {
+        extern uint8_t *g_vram;
+        FILE *f = fopen(vd, "wb");
+        if (f) { fwrite(g_vram, 1, 4u << 20, f); fclose(f); LOG("[gs] VRAM dumped to %s\n", vd); }
+    }
     const char *peek = getenv("HP_PEEK");   /* "addr:len,addr:len" (hex) */
     while (peek && *peek) {
         char *end;
@@ -173,11 +204,15 @@ static void load_image(const char *path) {
     LOG("[load] %zu bytes at %08x, entry %08x, %u functions\n", n, IMAGE_BASE, g_entry_point, g_func_count);
 }
 
+#include "gs.h"
+static void *guest_main(void *arg) { (void)arg; kern_run_main(g_entry_point); return NULL; }
+
 int main(int argc, char **argv) {
     const char *image = argc > 1 ? argv[1] : "build/recomp/image.bin";
     if (argc > 2) snprintf(g_disc_dir, sizeof g_disc_dir, "%s", argv[2]);
     g_trace = getenv("HP_TRACE") ? atoi(getenv("HP_TRACE")) : 0;
     if (getenv("HP_WATCH")) g_watch = (uint32_t)strtoul(getenv("HP_WATCH"), NULL, 16) & 0x1ffffff0u;
+    g_callhist_start = getenv("HP_CALLHIST") ? atol(getenv("HP_CALLHIST")) : -1;
     g_calltrace_ra = getenv("HP_CALLTRACE") ? (uint32_t)strtoul(getenv("HP_CALLTRACE"), NULL, 16) : 0;
     signal(SIGSEGV, on_signal);
     signal(SIGBUS, on_signal);
@@ -188,6 +223,14 @@ int main(int argc, char **argv) {
     dispatch_init();
     load_image(image);
     hw_init();
-    kern_run_main(g_entry_point);
+    gs_init();
+    if (getenv("HP_HEADLESS")) kern_run_main(g_entry_point);
+    /* guest code runs on its own thread; the main thread owns the window */
+    pthread_t gt;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, 64u << 20);
+    pthread_create(&gt, &a, guest_main, NULL);
+    display_loop();
     return 0;
 }
