@@ -22,7 +22,7 @@ void dma_start(int ch);
 
 static uint64_t wall_ns(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
 uint64_t virt_ns(void);

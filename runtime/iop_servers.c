@@ -192,7 +192,7 @@ static int cd_ncmd(uint32_t fno, uint8_t *in, uint32_t n, uint8_t *out, uint32_t
         if (g_trace) {
             uint32_t off = 0;
             const char *nm = iso_name_of(lsn, &off);
-            struct timespec tq; clock_gettime(CLOCK_MONOTONIC, &tq);
+            struct timespec tq; clock_gettime(CLOCK_UPTIME_RAW, &tq);
             LOG("[cdvd %.4f] read lsn %u x%u -> %08x (%s +%#x)\n", tq.tv_sec + tq.tv_nsec * 1e-9, lsn, cnt, buf, nm, off);
         }
         if (buf + cnt * 2048 <= RAM_SIZE) cdvd_read_sectors(lsn, cnt, g_ram + buf);

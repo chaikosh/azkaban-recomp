@@ -257,7 +257,7 @@ void rt_eret(EE *c, uint32_t pc) { LOG("[kern] eret at %08x\n", pc); }
 /* ---- COP0 --------------------------------------------------------------- */
 static uint64_t host_ns(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
 static uint64_t t0_ns;
