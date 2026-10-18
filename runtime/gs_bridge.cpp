@@ -145,6 +145,11 @@ void gs_thread() {
 
 // Hands the gathered data (and optionally a frame request) on; the caller holds g_pend_lock,
 // which keeps the batches in arrival order.
+bool queue_full() {   // g_pend_lock held; checks the GS thread's backlog without waiting
+    std::lock_guard<std::mutex> ql(g_q_lock);
+    return g_threaded && g_queued_bytes >= (4u << 20);
+}
+
 void post_locked(bool show, const Show *regs) {
     if (!g_threaded) {
         std::lock_guard<std::mutex> lk(g_lock);
@@ -243,13 +248,14 @@ int gsb_display(uint64_t pmode, uint64_t smode2, const uint64_t dispfb[2], const
     const Show regs{pmode, smode2, {dispfb[0], dispfb[1]}, {display[0], display[1]}};
     {
         // A new frame can only differ when GIF data arrived or the display registers changed (a
-        // buffer flip); the game draws at 30 fps or less, so about every other vblank is skipped.
-        // A new frame can only differ when GIF data arrived or the display registers changed (a
         // buffer flip): vblanks with neither are skipped.
         static Show last{};
         static bool have_last = false;
         static unsigned since = 0;
         std::lock_guard<std::mutex> pl(g_pend_lock);
+        // the vblank thread never waits for the GS: it also drives the IOP's vblank interrupts and
+        // the timers, and a late vblank there broke the sound on the iPhone (padman VBLANK OVERLAP)
+        if (queue_full()) goto pick_up;
         const bool flip = !have_last || std::memcmp(&last, &regs, sizeof regs);
         const bool drawn = !g_pend.data.empty() || g_new_since_show;
         ++since;
@@ -261,6 +267,7 @@ int gsb_display(uint64_t pmode, uint64_t smode2, const uint64_t dispfb[2], const
             since = 0;
         }
     }
+pick_up:
     static std::uint64_t seen = 0;
     std::lock_guard<std::mutex> fl(g_frame_lock);
     if (g_frame_serial == seen || !g_frame_w || static_cast<std::size_t>(g_frame_w) * g_frame_h > max_pixels) return 0;

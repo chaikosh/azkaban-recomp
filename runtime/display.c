@@ -178,11 +178,17 @@ static SDL_AudioStream *g_audio;
    keeps a margin: playback (re)starts only once ~100 ms is queued, and pauses when the queue runs
    dry instead of stuttering on every late burst.  g_audio_underruns counts the dry spells. */
 unsigned g_audio_underruns;
+/* for HP_FPSLOG: frames produced, dropped (queue full), and the queue's low and high water marks */
+unsigned long long g_audio_frames, g_audio_dropped;
+int g_audio_qmin = 1 << 30, g_audio_qmax;
 static int g_audio_paused = 1;
 static void audio_sink(const int16_t *samples, size_t frames) {
     if (!g_audio) return;
     int queued = SDL_GetAudioStreamQueued(g_audio);
-    if (queued > 48000 * 4 / 2) return;   /* never queue more than 0.5 s */
+    g_audio_frames += frames;
+    if (queued < g_audio_qmin) g_audio_qmin = queued;
+    if (queued > g_audio_qmax) g_audio_qmax = queued;
+    if (queued > 48000 * 4 / 2) { g_audio_dropped += frames; return; }   /* never queue more than 0.5 s */
     if (!g_audio_paused && queued == 0) {
         SDL_PauseAudioStreamDevice(g_audio);
         g_audio_paused = 1;

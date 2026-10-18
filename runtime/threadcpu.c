@@ -29,11 +29,14 @@ void hp_thread_register(const char *name) {
             if (!e) break;
             p = e + 1;
         }
+        /* the heavy threads (EE, render) sit a little below the light timing ones (vblank, alarm,
+           IOP: sound, pads, timers) in the same class, so those preempt them when they wake */
+        int heavy = !strncmp(name, "ee", 2) || !strcmp(name, "render");
 #if TARGET_OS_IOS
         /* two performance cores on iPhones: the GS thread must not sink to an efficiency core */
-        pthread_set_qos_class_self_np(is_low ? QOS_CLASS_USER_INITIATED : QOS_CLASS_USER_INTERACTIVE, 0);
+        pthread_set_qos_class_self_np(is_low ? QOS_CLASS_USER_INITIATED : QOS_CLASS_USER_INTERACTIVE, heavy ? -4 : 0);
 #else
-        pthread_set_qos_class_self_np(is_low ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INTERACTIVE, 0);
+        pthread_set_qos_class_self_np(is_low ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INTERACTIVE, heavy ? -4 : 0);
 #endif
     }
     pthread_mutex_lock(&tm);

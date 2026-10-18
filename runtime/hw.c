@@ -394,8 +394,12 @@ void hw_vblank(int start) {
                 extern unsigned g_audio_underruns, g_pace[5];
                 task_vm_info_data_t vmi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
                 double mb = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) == KERN_SUCCESS ? vmi.phys_footprint / 1048576.0 : 0;
-                LOG("[fps] %.1f game fps, %.1f vsync/s, audio underruns %u, shown after 1/2/3/4+ vblanks: %u/%u/%u/%u, memory %.0f MB\n", (g_frames_queued - lf) / wall, 300 / wall,
-                    g_audio_underruns, g_pace[1], g_pace[2], g_pace[3], g_pace[4], mb);
+                extern unsigned long long g_audio_frames, g_audio_dropped; extern int g_audio_qmin, g_audio_qmax;
+                static unsigned long long laf, lad;
+                LOG("[fps] %.1f game fps, %.1f vsync/s, shown after 1/2/3/4+ vblanks: %u/%u/%u/%u, memory %.0f MB | audio %.0f Hz in, queue %d-%d ms, dropped %llu, underruns %u\n",
+                    (g_frames_queued - lf) / wall, 300 / wall, g_pace[1], g_pace[2], g_pace[3], g_pace[4], mb,
+                    (g_audio_frames - laf) / wall, g_audio_qmin == (1 << 30) ? 0 : g_audio_qmin / 192, g_audio_qmax / 192, g_audio_dropped - lad, g_audio_underruns);
+                laf = g_audio_frames; lad = g_audio_dropped; g_audio_qmin = 1 << 30; g_audio_qmax = 0;
                 memset(g_pace, 0, sizeof g_pace);
                 lf = g_frames_queued; lt = t;
             }
