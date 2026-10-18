@@ -49,7 +49,7 @@ GEN_OBJ   = $(patsubst $(GEN)/%.c,$(OBJDIR)/obj/gen/%.o,$(GEN_SRC))
 all: $(OUT)/hp
 
 recomp: $(GEN)/funcs.h
-$(GEN)/funcs.h: recomp/*.py
+$(GEN)/funcs.h: recomp/*.py recomp/hooks.txt
 	$(PY) recomp/main.py $(ELF) $(REC)
 
 $(OUT)/hp: $(GEN)/funcs.h FORCE

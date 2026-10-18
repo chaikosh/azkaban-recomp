@@ -125,7 +125,7 @@ void dma_stats(void) {
             double fr = g_frames_queued - lf;
             if (fr > 0)
                 LOG("[frame] ms per game frame: vif1 %.1f, vu1 %.1f, vu1 kicks %.1f | gpu gif parse %.1f, display %.1f\n",
-                    1000 * ((g_prof[5] - lp[5]) - (g_prof[4] - lp[4]) - (g_vu1_kick_time - lk)) / fr, 1000 * (g_prof[4] - lp[4]) / fr,
+                    1000 * ((g_prof[5] - lp[5]) + (g_prof[0] - lp[0]) - (g_prof[4] - lp[4]) - (g_vu1_kick_time - lk)) / fr, 1000 * (g_prof[4] - lp[4]) / fr,
                     1000 * (g_vu1_kick_time - lk) / fr, 1000 * (g - lg) / fr, 1000 * (d - ld) / fr);
             lk = g_vu1_kick_time; lg = g; ld = d;
         }
@@ -148,6 +148,7 @@ void dma_stats(void) {
     if (getenv("HP_VUSTATS")) { extern void vu1_stats(void); vu1_stats(); }
     { extern void vu1rec_stats(void); vu1rec_stats(); }
     { extern void mmio_stats_report(void); mmio_stats_report(); }
+    { extern void vif_slow_report(void); vif_slow_report(); }
     gs_fb_stats();
     ipu_stats();
 }
@@ -166,8 +167,8 @@ int dma_path3_busy(void) { return __atomic_load_n(&path3_pending, __ATOMIC_SEQ_C
 static void render_channel(int ch) {
     extern double g_prof[8];
     struct timespec pa, pb;
-    clock_gettime(CLOCK_UPTIME_RAW, &pa);
     pthread_mutex_lock(&g_gs_lock);
+    clock_gettime(CLOCK_UPTIME_RAW, &pa);
     g_dma_qwords = 0;
     if (ch == 1 && !(chcr_now(1) & 1)) {   /* VIF1 to memory: a GS local->host download, ordered after earlier GS work */
         extern void gs_read_image(uint8_t *dst, uint32_t qwords);

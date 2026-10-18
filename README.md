@@ -18,7 +18,7 @@ Early work in progress.
 - Loads the front-end packages.
 - No menu and no gameplay yet.
 - Sound is stubbed: there is no audio output.
-- macOS only so far (SDL3 window). The Metal renderer for iOS is not written.
+- macOS (SDL3 window) and iOS (see [iOS](#ios); simulator-tested).
 
 ## How it works
 
@@ -116,6 +116,68 @@ opens the pause menu as soon as Harry can move. Steps: `wait:TEXT`,
 `press:BUTTON=TEXT` (press until TEXT is reported), `press:BUTTON`,
 `sleep:SECONDS`, `exit`; the events are the FSCommands `HP_FSLOG=1` prints, and
 `card_written`. See `runtime/fastboot.c`.
+
+## iOS
+
+`Makefile.ios` builds a native arm64 app for the iOS Simulator or an iPhone/iPad
+from the same generated C (run `make recomp` or a desktop build first). It needs
+Xcode; `ios/deps.sh` (run automatically) fetches wgpu-native for iOS and copies
+SDL3 for iOS from a sibling port, or builds it from the SDL release source.
+
+On iOS the paths default to the app sandbox (`runtime/ios/ios.c`):
+
+| Data | Location |
+| --- | --- |
+| Recompiled image | bundled in the app (`image.bin`) |
+| Disc image | `Documents/Harry Potter and the Prisoner of Azkaban (USA).iso` (or any `*.iso` there) |
+| Memory card | `Documents/memcard0.ps2` |
+| Log (stderr) | `Documents/hp.log` (`HP_STDERR=1` keeps stderr) |
+| Extracted files | `Documents/disc/`, only read with `HP_IOP=hle` |
+
+`HP_GS` defaults to `gpu`. The app enables iTunes/Finder file sharing: on a Mac,
+select the device in Finder, open Files and drag the ISO onto *HP Azkaban*. If
+there is no ISO the app says so and waits (Retry). The ISO is never bundled.
+
+The picture is shown at 4:3 in landscape with an on-screen PS2 controller
+(`runtime/ios/touchpad.c`: D-pad, left stick, face buttons, L1/L2/R1/R2,
+SELECT/START, multi-touch); it hides while a hardware controller is connected
+and comes back on a touch.
+
+```sh
+# Simulator (an arm64 iOS Simulator must be booted)
+make -f Makefile.ios -j4                 # build/ios-iphonesimulator/HPAzkaban.app
+make -f Makefile.ios sim-install sim-data sim-run   # SIM=<udid> instead of the booted one
+make -f Makefile.ios sim-log             # Documents/hp.log
+# game variables go through SIMCTL_CHILD_*, e.g.
+SIMCTL_CHILD_HP_AUTOKEY=start@40 make -f Makefile.ios sim-run
+
+# Device
+make -f Makefile.ios SDK=iphoneos -j4    # build/ios-iphoneos/HPAzkaban.app
+python3 -I ios/sign_device.py            # signs with an existing local development profile
+xcrun devicectl list devices
+python3 -I ios/install_device.py --device <id> [--iso "iso/Harry Potter and the Prisoner of Azkaban (USA).iso"]
+# or sign and run from Xcode:
+make -f Makefile.ios SDK=iphoneos lib xcode && open ios/HPAzkaban.xcodeproj
+```
+
+Status of the iOS port (paused, October 2026):
+
+- Works in the simulator (iPhone 17 Pro, iOS 26): the app builds and links,
+  installs, finds the ISO in Documents, loads the image, opens the disc and the
+  memory card, starts the IOP and the GS, and writes `Documents/hp.log`.
+- Broken: the GPU renderer aborts within seconds. The simulator's Metal adapter
+  falls short of some WebGPU default limits, so wgpu-native creates the device
+  with its downlevel limits (4 storage buffers per shader stage; the GS shaders
+  bind 7). Pipeline creation fails, and the first `wgpuQueueSubmit` panics.
+  Next step: in `third_party/ps2gs/src/gs/gpu/gpu.cpp` `init()`, request
+  `min(supported, WebGPU default)` for the limits the GS needs
+  (`maxStorageBuffersPerShaderStage` first). On a Mac that requests exactly the
+  defaults, so nothing changes there. Untested: `SIMCTL_CHILD_HP_GS=soft`
+  should select the software GS instead.
+- Not tested yet: the touch overlay and the 4:3 presentation on screen, audio,
+  pause/resume in the background, the "no ISO" dialog, the device build
+  (`SDK=iphoneos`), signing, and Xcode project generation. The macOS build is
+  unchanged; every iOS path is behind `TARGET_OS_IOS`.
 
 ## Debugging knobs
 

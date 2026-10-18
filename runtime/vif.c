@@ -135,8 +135,19 @@ static int elem_bits(void) {
 static uint8_t ub[32];
 static int ubn;
 
+/* HP_VIFSTATS: which UNPACK formats take the per-element path (vn, vl, mask, mode, wl > cl) */
+static unsigned long long slow_fmt[4][4][2][4][2];
+void vif_slow_report(void) {
+    if (!getenv("HP_VIFSTATS")) return;
+    for (int a = 0; a < 4; a++) for (int b = 0; b < 4; b++) for (int m = 0; m < 2; m++) for (int md = 0; md < 4; md++) for (int f = 0; f < 2; f++)
+        if (slow_fmt[a][b][m][md][f]) {
+            LOG("[vif1] slow unpack V%d-%d mask %d mode %d %s: %llu elements\n", a + 1, b == 3 ? 5 : 32 >> b, m, md, f ? "fill" : "skip", slow_fmt[a][b][m][md][f]);
+            slow_fmt[a][b][m][md][f] = 0;
+        }
+}
 static void unpack_element(const uint8_t *e) {
     uint32_t c[4];
+    slow_fmt[v1.up_vn & 3][v1.up_vl & 3][(v1.up_m && v1.mask) ? 1 : 0][v1.mode & 3][(v1.wl ? v1.wl : 1) > (v1.cl ? v1.cl : 1)]++;
     int ncomp = (int)v1.up_vn + 1;
     if (v1.up_vl == 3) {
         uint32_t v = e[0] | (e[1] << 8);
@@ -415,9 +426,7 @@ int vif1_dma_done(uint32_t qwords) {
 void vif1_words(const uint32_t *w, uint32_t n) {
     if (!vq) vq = malloc(VQ_SIZE * sizeof(uint32_t));
     uint32_t i = 0;
-    double t0 = vnow();
-    if (!stalled && !path3_wait && vq_head == vq_tail) i = vif1_exec_block(w, n);
-    g_prof[5] += vnow() - t0;
+    if (!stalled && !path3_wait && vq_head == vq_tail) i = vif1_exec_block(w, n);   /* timed by the DMA caller (g_prof[0]) */
     for (; i < n; i++) vif1_word(w[i]);   /* the rest waits in the queue */
 }
 

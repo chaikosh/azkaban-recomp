@@ -4,21 +4,32 @@
 // hp's own GS front end (runtime/gs.c) still parses every GIF packet for the privileged side
 // (SIGNAL/FINISH/LABEL, CSR, interrupts) but stops rasterizing; the same packets are handed here
 // in the same order.  Downloads (local->host transfers) and the displayed frame come back from the
-// GPU.  The vendored GS is single-threaded, so every entry point takes one lock.
+// GPU.
+//
+// Like the real GS, the renderer runs beside the rest of the machine: GIF data is gathered into
+// batches (runs per path, in arrival order) and a GS thread parses and draws them; showing a
+// frame is a request in the same queue, and the vblank thread picks up the newest finished frame.
+// Only a download (local->host transfer) waits for the queue to drain.  The vendored GS is
+// single-threaded: everything that touches it holds g_lock.  HP_GSTHREAD=0 renders on the calling
+// threads instead.
 
 #include "gs/gif.hpp"
 #include "gs/gs.hpp"
 #include "gs/gpu/gpu.hpp"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 extern "C" unsigned long long g_vsyncs;
+extern "C" void hp_thread_register(const char *name);
 namespace ps2 {
 std::uint64_t frame_count() { return g_vsyncs; }
 }
@@ -28,24 +39,37 @@ extern std::uint64_t g_hp_image_calls, g_hp_image_bytes, g_hp_emits, g_hp_pre_to
 }
 
 namespace {
-std::mutex g_lock;
+std::mutex g_lock;   // the vendored GS
 bool g_ready = false;
-std::vector<std::uint32_t> g_rgba;
 double g_gif_s = 0, g_display_s = 0, g_download_s = 0;
 
 double secs() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-// GIF data often arrives one quadword at a time (GIF FIFO writes, VIF DIRECT); the GPU code
-// queues one upload per call, so data is gathered first, as runs per path in arrival order.
-// Gathering has its own short lock (g_pend_lock), so the EE does not wait while the vblank thread
-// holds g_lock to submit a frame; whoever renders the gathered data takes it under g_pend_lock and
-// then g_lock before releasing g_pend_lock, so batches reach the GPU code in order.
 struct Run { int path; std::uint32_t qwc; };
-struct Pending { std::vector<std::uint8_t> data; std::vector<Run> runs; };
-std::mutex g_pend_lock;
-Pending g_pend;
+struct Batch { std::vector<std::uint8_t> data; std::vector<Run> runs; };
 
-void render_batch(Pending &b) {   // g_lock held
+// What a frame shows (from the privileged registers).
+struct Show { std::uint64_t pmode, smode2, dispfb[2], display[2]; };
+struct Item { Batch batch; bool show = false; Show regs{}; };
+
+// --- gathering (any thread) ---
+std::mutex g_pend_lock;
+Batch g_pend;
+
+// --- the queue to the GS thread ---
+std::mutex g_q_lock;
+std::condition_variable g_q_cv, g_q_done_cv;
+std::deque<Item> g_queue;
+std::size_t g_queued_bytes = 0;
+bool g_gs_busy = false, g_threaded = false;
+
+// --- the newest finished frame ---
+std::mutex g_frame_lock;
+std::vector<std::uint32_t> g_frame;
+std::uint32_t g_frame_w = 0, g_frame_h = 0;
+std::uint64_t g_frame_serial = 0;
+
+void render_batch(Batch &b) {   // g_lock held
     const double t0 = secs();
     std::size_t off = 0;
     for (const Run &r : b.runs) {
@@ -57,14 +81,86 @@ void render_batch(Pending &b) {   // g_lock held
     g_gif_s += secs() - t0;
 }
 
-// Takes the gathered data and returns with g_lock held (caller unlocks), batch in `out`.
-std::unique_lock<std::mutex> take_pending(Pending &out) {
-    std::unique_lock<std::mutex> pl(g_pend_lock);
-    std::swap(out, g_pend);
-    std::unique_lock<std::mutex> lk(g_lock);
-    return lk;
+bool source_of(const Show &r, ps2::gs::gpu::DisplaySource &src) {
+    const int circuit = (r.pmode & 2u) ? 1 : (r.pmode & 1u) ? 0 : -1;
+    if (circuit < 0) return false;
+    const std::uint64_t fb = r.dispfb[circuit], disp = r.display[circuit];
+    const std::uint32_t magh = (static_cast<std::uint32_t>(disp >> 23) & 0xFu) + 1, magv = (static_cast<std::uint32_t>(disp >> 27) & 3u) + 1;
+    const std::uint32_t sw = ((static_cast<std::uint32_t>(disp >> 32) & 0xFFFu) + 1) / magh, sh = ((static_cast<std::uint32_t>(disp >> 44) & 0x7FFu) + 1) / magv;
+    if (!sw || !sh || sw > 2048 || sh > 2048) return false;
+    src = ps2::gs::gpu::DisplaySource{(static_cast<std::uint32_t>(fb) & 0x1FFu) * 32, static_cast<std::uint32_t>(fb >> 9) & 0x3Fu,
+                                      static_cast<std::uint32_t>(fb >> 15) & 0x1Fu, static_cast<std::uint32_t>(fb >> 32) & 0x7FFu,
+                                      static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, sw, sh, (r.smode2 & 3u) == 3u};
+    return true;
 }
 
+// Reads back the displayed buffer (asynchronously: the newest finished copy) into g_frame.
+void show_frame(const Show &r) {   // g_lock held
+    const double t0 = secs();
+    ps2::gs::gpu::DisplaySource src;
+    if (source_of(r, src)) {
+        static std::vector<std::uint32_t> rgba;
+        std::uint32_t w = 0, h = 0;
+        static const bool sync = std::getenv("HP_GSSYNC") != nullptr;   // exact frame, waits for the GPU
+        const bool ok = sync ? ps2::gs::gpu::display(src, rgba, w, h) : ps2::gs::gpu::display_async(src, rgba, w, h);
+        if (ok && w && h && rgba.size() >= static_cast<std::size_t>(w) * h) {
+            std::lock_guard<std::mutex> fl(g_frame_lock);
+            g_frame.assign(rgba.begin(), rgba.begin() + static_cast<std::ptrdiff_t>(w) * h);
+            g_frame_w = w;
+            g_frame_h = h;
+            ++g_frame_serial;
+        }
+    }
+    g_display_s += secs() - t0;
+}
+
+void gs_thread() {
+    hp_thread_register("gs");
+    std::unique_lock<std::mutex> ql(g_q_lock);
+    for (;;) {
+        g_q_cv.wait(ql, [] { return !g_queue.empty(); });
+        Item it = std::move(g_queue.front());
+        g_queue.pop_front();
+        g_queued_bytes -= it.batch.data.size();
+        g_gs_busy = true;
+        ql.unlock();
+        {
+            std::lock_guard<std::mutex> lk(g_lock);
+            render_batch(it.batch);
+            if (it.show) show_frame(it.regs);
+        }
+        ql.lock();
+        g_gs_busy = false;
+        g_q_done_cv.notify_all();
+    }
+}
+
+// Hands the gathered data (and optionally a frame request) on; the caller holds g_pend_lock,
+// which keeps the batches in arrival order.
+void post_locked(bool show, const Show *regs) {
+    Item it;
+    std::swap(it.batch, g_pend);
+    if (show) { it.show = true; it.regs = *regs; }
+    if (!g_threaded) {
+        std::lock_guard<std::mutex> lk(g_lock);
+        render_batch(it.batch);
+        if (it.show) show_frame(it.regs);
+        return;
+    }
+    if (it.batch.data.empty() && !it.show) return;
+    std::unique_lock<std::mutex> ql(g_q_lock);
+    // a GS far behind holds up the producers, like a full GIF FIFO
+    g_q_done_cv.wait(ql, [] { return g_queued_bytes < (16u << 20); });
+    g_queued_bytes += it.batch.data.size();
+    g_queue.push_back(std::move(it));
+    g_q_cv.notify_one();
+}
+
+void wait_idle() {
+    if (!g_threaded) return;
+    std::unique_lock<std::mutex> ql(g_q_lock);
+    g_q_done_cv.wait(ql, [] { return g_queue.empty() && !g_gs_busy; });
+}
 }
 
 extern "C" {
@@ -90,77 +186,66 @@ int gsb_init(void) {
     ps2::gs::reset();
     ps2::gif::reset();
     g_ready = true;
-    std::fprintf(stderr, "[gsgpu] GPU renderer active\n");
+    const char *t = std::getenv("HP_GSTHREAD");
+    g_threaded = !t || std::string(t) != "0";
+    if (g_threaded) std::thread(gs_thread).detach();
+    std::fprintf(stderr, "[gsgpu] GPU renderer active%s\n", g_threaded ? " (GS thread)" : "");
     return 1;
 }
 
 /* GIF data in hp's path numbering (0 = PATH1/VU1, 1 = PATH2/VIF1 DIRECT, 2 = PATH3/GIF DMA). */
 void gsb_gif(int path, const void *data, uint32_t qwc) {
     if (!qwc) return;
-    std::unique_lock<std::mutex> pl(g_pend_lock);
+    std::lock_guard<std::mutex> pl(g_pend_lock);
     if (!g_pend.runs.empty() && g_pend.runs.back().path == path) g_pend.runs.back().qwc += qwc;
     else g_pend.runs.push_back(Run{path, qwc});
     const auto *p = static_cast<const std::uint8_t *>(data);
     g_pend.data.insert(g_pend.data.end(), p, p + static_cast<std::size_t>(qwc) * 16);
-    if (g_pend.data.size() < (1u << 20)) return;
-    Pending b;
-    std::swap(b, g_pend);
-    std::unique_lock<std::mutex> lk(g_lock);
-    pl.unlock();
-    render_batch(b);
+    if (g_pend.data.size() >= (256u << 10)) post_locked(false, nullptr);
 }
 
-/* Next `qwords` of a local->host transfer started by TRXDIR=1. */
+/* Next `qwords` of a local->host transfer started by TRXDIR=1: everything issued before it is drawn first. */
 void gsb_read_image(uint8_t *dst, uint32_t qwords) {
     const double t0 = secs();
-    Pending b;
-    auto lk = take_pending(b);
-    render_batch(b);
+    {
+        std::lock_guard<std::mutex> pl(g_pend_lock);
+        post_locked(false, nullptr);
+    }
+    wait_idle();
+    std::lock_guard<std::mutex> lk(g_lock);
     ps2::gs::read_image(dst, qwords);
     g_download_s += secs() - t0;
 }
 
-/* The displayed frame as RGBA (R in the low byte), at most max_pixels; returns 0 if nothing is shown. */
+/* Called every vblank: asks for the displayed buffer and returns the newest finished frame as RGBA
+   (R in the low byte), at most max_pixels; returns 0 if no new frame is ready. */
 int gsb_display(uint64_t pmode, uint64_t smode2, const uint64_t dispfb[2], const uint64_t display[2], uint32_t *out,
                 uint32_t max_pixels, int *w, int *h) {
-    const double t0 = secs();
-    Pending b;
-    auto lk = take_pending(b);
-    render_batch(b);
-    // Same circuit/size rules as ps2::gs::display, but the readback is asynchronous: this returns
-    // the newest finished frame (usually the previous vblank's) and never waits for the GPU.
-    const int circuit = (pmode & 2u) ? 1 : (pmode & 1u) ? 0 : -1;
-    if (circuit < 0) return 0;
-    const std::uint64_t fb = dispfb[circuit], disp = display[circuit];
-    const std::uint32_t magh = (static_cast<std::uint32_t>(disp >> 23) & 0xFu) + 1, magv = (static_cast<std::uint32_t>(disp >> 27) & 3u) + 1;
-    const std::uint32_t sw = ((static_cast<std::uint32_t>(disp >> 32) & 0xFFFu) + 1) / magh, sh = ((static_cast<std::uint32_t>(disp >> 44) & 0x7FFu) + 1) / magv;
-    if (!sw || !sh || sw > 2048 || sh > 2048) return 0;
-    const ps2::gs::gpu::DisplaySource src{(static_cast<std::uint32_t>(fb) & 0x1FFu) * 32, static_cast<std::uint32_t>(fb >> 9) & 0x3Fu,
-                                          static_cast<std::uint32_t>(fb >> 15) & 0x1Fu, static_cast<std::uint32_t>(fb >> 32) & 0x7FFu,
-                                          static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, sw, sh, (smode2 & 3u) == 3u};
-    std::uint32_t width = 0, height = 0;
-    static const bool sync = std::getenv("HP_GSSYNC") != nullptr;   // exact frame, waits for the GPU
-    const bool ok = sync ? ps2::gs::gpu::display(src, g_rgba, width, height) : ps2::gs::gpu::display_async(src, g_rgba, width, height);
-    g_display_s += secs() - t0;
-    if (!ok || !width || !height || static_cast<std::size_t>(width) * height > max_pixels || g_rgba.size() < static_cast<std::size_t>(width) * height)
-        return 0;
-    std::memcpy(out, g_rgba.data(), static_cast<std::size_t>(width) * height * 4);
-    *w = static_cast<int>(width);
-    *h = static_cast<int>(height);
+    const Show regs{pmode, smode2, {dispfb[0], dispfb[1]}, {display[0], display[1]}};
+    {
+        std::lock_guard<std::mutex> pl(g_pend_lock);
+        post_locked(true, &regs);
+    }
+    static std::uint64_t seen = 0;
+    std::lock_guard<std::mutex> fl(g_frame_lock);
+    if (g_frame_serial == seen || !g_frame_w || static_cast<std::size_t>(g_frame_w) * g_frame_h > max_pixels) return 0;
+    seen = g_frame_serial;
+    std::memcpy(out, g_frame.data(), static_cast<std::size_t>(g_frame_w) * g_frame_h * 4);
+    *w = static_cast<int>(g_frame_w);
+    *h = static_cast<int>(g_frame_h);
     return 1;
+}
+
+/* iOS: hold the GS while the app is inactive (no GPU work may be submitted in the background);
+   every thread that reaches the GS waits.  Called on the main thread: 1 locks, 0 unlocks. */
+void gsb_pause(int on) {
+    if (on) g_lock.lock();
+    else g_lock.unlock();
 }
 
 /* Seconds spent in GIF processing, display readback and downloads since start. */
 void gsb_times(double *gif, double *display, double *download) {
     std::lock_guard<std::mutex> lk(g_lock);
-    {
-        using namespace ps2::gs::gpu;
-        static std::uint64_t lc, lb, le, lp;
-        std::fprintf(stderr, "[gpu] image_data %llu calls %llu KB, emits %llu, pre ops %llu (max %llu)\n",
-                     (unsigned long long)(g_hp_image_calls - lc), (unsigned long long)((g_hp_image_bytes - lb) >> 10),
-                     (unsigned long long)(g_hp_emits - le), (unsigned long long)(g_hp_pre_total - lp), (unsigned long long)g_hp_pre_max);
-        lc = g_hp_image_calls; lb = g_hp_image_bytes; le = g_hp_emits; lp = g_hp_pre_total;
-    }
     *gif = g_gif_s;
     *display = g_display_s;
     *download = g_download_s;
@@ -168,6 +253,10 @@ void gsb_times(double *gif, double *display, double *download) {
 
 void gsb_stats(void) {
     std::lock_guard<std::mutex> lk(g_lock);
+    using namespace ps2::gs::gpu;
+    std::fprintf(stderr, "[gpu] image_data %llu calls %llu KB, emits %llu, pre ops %llu (max %llu)\n",
+                 (unsigned long long)g_hp_image_calls, (unsigned long long)(g_hp_image_bytes >> 10),
+                 (unsigned long long)g_hp_emits, (unsigned long long)g_hp_pre_total, (unsigned long long)g_hp_pre_max);
     ps2::gs::stats();
 }
 

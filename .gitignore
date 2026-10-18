@@ -4,3 +4,7 @@ __pycache__/
 *.pkl
 iso/
 third_party/wgpu-native/lib*/
+deps/
+ios/*.xcodeproj/
+/disc
+/iso

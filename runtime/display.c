@@ -5,6 +5,10 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IOS
+#include "ios/touchpad.h"
+#endif
 
 #define MAXW 1024
 #define MAXH 1024
@@ -153,6 +157,10 @@ static void poll_input(SDL_Gamepad *pad) {
         for (int i = 0; i < 4; i++)
             if (ax[i] > 4000 || ax[i] < -4000) *dst[i] = (ax[i] + 32768) >> 8;
     }
+#if TARGET_OS_IOS
+    on |= touchpad_buttons();
+    { uint8_t tx, ty; if (touchpad_stick(&tx, &ty)) { lx = tx; ly = ty; } }
+#endif
     uint8_t axes[4] = {(uint8_t)rx, (uint8_t)ry, (uint8_t)lx, (uint8_t)ly};
     { extern int iopb_enabled(void); extern void iopb_set_pad(int, uint16_t, const uint8_t *);
       if (iopb_enabled()) iopb_set_pad(0, (uint16_t)on, axes); else pad_set_state((uint16_t)~on, axes); }
@@ -176,6 +184,76 @@ static void audio_open(void) {
     iopb_set_audio_sink(audio_sink);
 }
 
+#if TARGET_OS_IOS
+/* iOS: full-screen landscape, the picture at 4:3 in the middle, the touch controller on top.
+   Between resign-active and become-active the GS is held (gsb_pause): iOS forbids GPU work in
+   the background, and every guest thread that reaches the GS parks there. */
+static volatile int g_paused;
+static bool SDLCALL app_events(void *userdata, SDL_Event *e) {
+    (void)userdata;
+    extern void gsb_pause(int);
+    if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND && !g_paused) { g_paused = 1; gsb_pause(1); LOG("[ios] paused\n"); }
+    else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND && g_paused) { gsb_pause(0); g_paused = 0; LOG("[ios] resumed\n"); }
+    return true;
+}
+
+void display_loop(void) {
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    SDL_SetHint(SDL_HINT_IOS_HIDE_HOME_INDICATOR, "2");   /* hidden; edge swipes reach the game first */
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) { LOG("[display] SDL_Init: %s\n", SDL_GetError()); return; }
+    audio_open();
+    SDL_AddEventWatch(app_events, NULL);
+    SDL_Window *win = SDL_CreateWindow("Harry Potter and the Prisoner of Azkaban", 0, 0,
+                                       SDL_WINDOW_FULLSCREEN | SDL_WINDOW_BORDERLESS | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    SDL_Renderer *ren = SDL_CreateRenderer(win, NULL);
+    SDL_SetRenderVSync(ren, 1);
+    SDL_Texture *tex = NULL;
+    int tw = 0, th = 0;
+    SDL_Gamepad *pad = NULL;
+    static uint32_t local[MAXW * MAXH];
+    for (;;) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_EVENT_QUIT) { fflush(stderr); _exit(0); }
+            if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) pad = SDL_OpenGamepad(e.gdevice.which);
+            if (e.type == SDL_EVENT_GAMEPAD_REMOVED && pad && e.gdevice.which == SDL_GetGamepadID(pad)) { SDL_CloseGamepad(pad); pad = NULL; }
+            touchpad_event(&e);
+        }
+        if (g_paused) { SDL_Delay(50); continue; }
+        int ow = 0, oh = 0;
+        SDL_GetCurrentRenderOutputSize(ren, &ow, &oh);
+        touchpad_layout(win, ow, oh);
+        touchpad_set_gamepad(pad != NULL);
+        poll_input(pad);
+        int w = 0, h = 0, have = 0;
+        pthread_mutex_lock(&fm);
+        if (frame_new) {
+            w = frame_w; h = frame_h;
+            memcpy(local, frame_buf, (size_t)w * h * 4);
+            frame_new = 0; have = 1;
+        }
+        pthread_mutex_unlock(&fm);
+        if (have) {
+            if (!tex || tw != w || th != h) {
+                if (tex) SDL_DestroyTexture(tex);
+                tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, w, h);
+                tw = w; th = h;
+            }
+            SDL_UpdateTexture(tex, NULL, local, w * 4);
+        }
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        SDL_RenderClear(ren);
+        if (tex) {   /* the PS2 picture is 4:3 whatever its resolution */
+            float dw = (float)ow, dh = (float)oh;
+            if (dw * 3 > dh * 4) dw = dh * 4 / 3; else dh = dw * 3 / 4;
+            const SDL_FRect dst = {(ow - dw) / 2, (oh - dh) / 2, dw, dh};
+            SDL_RenderTexture(ren, tex, NULL, &dst);
+        }
+        touchpad_draw(ren);
+        SDL_RenderPresent(ren);   /* paced by vsync */
+    }
+}
+#else
 void display_loop(void) {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) { LOG("[display] SDL_Init: %s\n", SDL_GetError()); return; }
     audio_open();
@@ -217,3 +295,4 @@ void display_loop(void) {
         } else SDL_Delay(2);
     }
 }
+#endif

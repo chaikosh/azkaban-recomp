@@ -6,6 +6,10 @@
 #include <sys/mman.h>
 #include <execinfo.h>
 #include <unistd.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IOS
+#include <SDL3/SDL_main.h>   /* main() becomes SDL_main, started by UIApplicationMain */
+#endif
 
 uint8_t *g_pt[65536];
 uint8_t *g_ram;
@@ -256,6 +260,14 @@ static void *guest_main(void *arg) { (void)arg; extern void hp_thread_register(c
 int main(int argc, char **argv) {
     const char *image = argc > 1 ? argv[1] : "build/recomp/image.bin";
     if (argc > 2) snprintf(g_disc_dir, sizeof g_disc_dir, "%s", argv[2]);
+#if TARGET_OS_IOS
+    {   /* no command line: bundled image, data in Documents (runtime/ios/ios.c) */
+        extern const char *hp_ios_setup(void), *hp_ios_disc_dir(void);
+        const char *def = hp_ios_setup();
+        if (argc <= 1) image = def;
+        if (argc <= 2) snprintf(g_disc_dir, sizeof g_disc_dir, "%s", hp_ios_disc_dir());
+    }
+#endif
     g_trace = getenv("HP_TRACE") ? atoi(getenv("HP_TRACE")) : 0;
     if (getenv("HP_WATCH")) g_watch = (uint32_t)strtoul(getenv("HP_WATCH"), NULL, 16) & 0x1ffffff0u;
     if (getenv("HP_WRANGE")) {
