@@ -10,6 +10,9 @@
 uint8_t *g_vram;
 /* HP_GS=gpu: the GPU renderer (gs_bridge.cpp) draws; this file only keeps the register side */
 int g_gs_gpu;
+/* HP_GS=both: this file draws and the GPU renderer gets a copy of every packet (gs_bridge.cpp) */
+int g_gs_mirror;
+int gsb_mirror(void);
 int gsb_enabled(void);
 int gsb_init(void);
 void gsb_gif(int path, const void *data, uint32_t qwc);
@@ -870,8 +873,156 @@ static void tex_dump_check(void) {
     count++;
 }
 
+/* HP_GSSTATS=1: census of the distinct GS drawing states (one per combination of primitive type,
+   PRIM attributes, frame/Z/texture formats, TEST, ALPHA, PABE/FBA/COLCLAMP/DTHE, TEX0/TEX1/CLAMP
+   modes, SCANMSK and render-to-texture), to see which features a scene relies on.  Each new state
+   is logged when first drawn ([gsstate v<vsync> #n]); gs_census_report() (HP_EXITAT, SIGUSR1)
+   prints all of them with primitive counts.  Works with both renderers (in GPU mode the packets
+   are then parsed here too).  Off by default. */
+int g_gs_census = -1;
+typedef struct { uint64_t k0, k1; unsigned long long prims; unsigned long long first; uint64_t dimx, fogcol; } CensusEnt;
+static CensusEnt census[2048];
+static int census_n;
+static uint32_t census_rt[32];   /* frame base blocks drawn to so far */
+static int census_nrt;
+static pthread_mutex_t census_m = PTHREAD_MUTEX_INITIALIZER;
+
+static const char *census_psm(uint32_t p) {
+    switch (p) {
+    case PSMCT32: return "CT32"; case PSMCT24: return "CT24"; case PSMCT16: return "CT16"; case PSMCT16S: return "CT16S";
+    case PSMT8: return "T8"; case PSMT4: return "T4"; case PSMT8H: return "T8H"; case PSMT4HL: return "T4HL"; case PSMT4HH: return "T4HH";
+    case PSMZ32: return "Z32"; case PSMZ24: return "Z24"; case PSMZ16: return "Z16"; case PSMZ16S: return "Z16S";
+    }
+    return "psm?";
+}
+
+static void census_describe(const CensusEnt *e, char *out, size_t n) {
+    static const char *pt[8] = {"POINT", "LINE", "LINESTRIP", "TRI", "TRISTRIP", "TRIFAN", "SPRITE", "PRIM7"};
+    static const char *tst[8] = {"NEVER", "ALWAYS", "LESS", "LEQUAL", "EQUAL", "GEQUAL", "GREATER", "NOTEQUAL"};
+    static const char *ztst[4] = {"NEVER", "ALWAYS", "GEQUAL", "GREATER"};
+    static const char *afail[4] = {"KEEP", "FB_ONLY", "ZB_ONLY", "RGB_ONLY"};
+    static const char *tfx[4] = {"MODULATE", "DECAL", "HIGHLIGHT", "HIGHLIGHT2"};
+    static const char *wm[4] = {"REPEAT", "CLAMP", "RCLAMP", "RREPEAT"};
+    static const char *abd[4] = {"Cs", "Cd", "0", "?"}, *cs[4] = {"As", "Ad", "FIX", "?"};
+    static const char *filt[8] = {"NEAREST", "LINEAR", "N_MIP_N", "N_MIP_L", "L_MIP_N", "L_MIP_L", "f6", "f7"};
+    uint64_t k = e->k0, k1 = e->k1;
+    int o = snprintf(out, n, "%s%s%s%s%s%s ctx%d | F %s%s",
+                     pt[k & 7], (k >> 3) & 1 ? " iip" : "", (k >> 4) & 1 ? " tme" : "", (k >> 5) & 1 ? " fge" : "",
+                     (k >> 6) & 1 ? " abe" : "", (k >> 7) & 1 ? " aa1" : "", (int)((k >> 9) & 1),
+                     census_psm((k >> 10) & 63), (k >> 21) & 1 ? " fbmsk" : "");
+    if ((k >> 30) & 1) o += snprintf(out + o, n - o, " | Z %s ztst %s%s", census_psm(0x30 | ((k >> 16) & 15)), ztst[(k >> 31) & 3], (k >> 20) & 1 ? " zmsk" : "");
+    if ((k >> 22) & 1) o += snprintf(out + o, n - o, " | ATST %s ref %d fail %s", tst[(k >> 23) & 7], (int)((k1 >> 20) & 255), afail[(k >> 26) & 3]);
+    if ((k >> 28) & 1) o += snprintf(out + o, n - o, " | DATE datm %d", (int)((k >> 29) & 1));
+    if ((k >> 6) & 1) {
+        int a = (k >> 33) & 3, b = (k >> 35) & 3, c = (k >> 37) & 3, d = (k >> 39) & 3;
+        o += snprintf(out + o, n - o, " | blend (%s-%s)*%s+%s", abd[a], abd[b], cs[c], abd[d]);
+        if (c == 2) o += snprintf(out + o, n - o, " fix %d", (int)((k1 >> 12) & 255));
+        if ((k >> 41) & 1) o += snprintf(out + o, n - o, " pabe");
+    }
+    if ((k >> 42) & 1) o += snprintf(out + o, n - o, " | fba");
+    o += snprintf(out + o, n - o, " | %s", (k >> 43) & 1 ? "clamp" : "WRAP");
+    if ((k >> 44) & 1) o += snprintf(out + o, n - o, " dthe dimx %016llx", (unsigned long long)e->dimx);
+    if ((k >> 4) & 1) {
+        uint32_t tp = (k >> 45) & 63;
+        o += snprintf(out + o, n - o, " | T %s", census_psm(tp));
+        if (tp == PSMT8 || tp == PSMT4 || tp == PSMT8H || tp == PSMT4HL || tp == PSMT4HH)
+            o += snprintf(out + o, n - o, "/%s%s", census_psm((k >> 54) & 15), (k >> 58) & 1 ? " csm2" : "");
+        o += snprintf(out + o, n - o, " %s%s mag %s min %s", tfx[(k >> 52) & 3], (k >> 51) & 1 ? " tcc" : "", (k >> 59) & 1 ? "LINEAR" : "NEAREST", filt[(k >> 60) & 7]);
+        if (k1 & 7) o += snprintf(out + o, n - o, " mxl %d%s", (int)(k1 & 7), (k1 >> 3) & 1 ? " lcm" : "");
+        o += snprintf(out + o, n - o, " %s/%s", wm[(k1 >> 4) & 3], wm[(k1 >> 6) & 3]);
+        if ((k1 >> 28) & 1) o += snprintf(out + o, n - o, " aem");
+        if ((k1 >> 10) & 1) o += snprintf(out + o, n - o, " TEX=FRAME");
+        if ((k1 >> 11) & 1) o += snprintf(out + o, n - o, " TEX=ZBUF");
+        if ((k1 >> 29) & 1) o += snprintf(out + o, n - o, " TEX=RT");
+    }
+    if ((k >> 5) & 1) o += snprintf(out + o, n - o, " | fogcol %06llx", (unsigned long long)e->fogcol);
+    if ((k1 >> 8) & 3) snprintf(out + o, n - o, " | scanmsk %d", (int)((k1 >> 8) & 3));
+}
+
+static void census_note(void) {
+    uint64_t prim = gs.prim, attr = (gs.prmodecont & 1) ? prim : ((prim & 7) | (gs.prmode & ~7ull));
+    int c = (int)bits(attr, 9, 1);
+    uint64_t fr = gs.frame[c], zb = gs.zbuf[c], te = gs.test[c], al = gs.alpha[c], t0 = gs.tex0[c], t1 = gs.tex1[c], cl = gs.clamp[c];
+    uint32_t fpsm = bits(fr, 24, 6), fbp = bits(fr, 0, 9) * 32, zbp = bits(zb, 0, 9) * 32;
+    int tme = bits(attr, 4, 1), abe = bits(attr, 6, 1), ate = bits(te, 0, 1), zte = bits(te, 16, 1);
+    int dthe = (gs.dthe & 1) && (fpsm == PSMCT16 || fpsm == PSMCT16S || fpsm == PSMZ16 || fpsm == PSMZ16S);
+    uint64_t k0 = (prim & 7) | (attr & 0x3f8) | ((uint64_t)fpsm << 10) | ((uint64_t)(bits(fr, 32, 32) != 0) << 21) |
+                  ((uint64_t)ate << 22) | ((uint64_t)dthe << 44) | ((uint64_t)(gs.colclamp & 1) << 43) | ((uint64_t)(gs.fba[c] & 1) << 42);
+    uint64_t k1 = ((uint64_t)(gs.scanmsk & 3) << 8);
+    if (zte) k0 |= (1ull << 30) | (bits(te, 17, 2) << 31) | (bits(zb, 24, 4) << 16) | (bits(zb, 32, 1) << 20);
+    if (ate) { k0 |= (bits(te, 1, 3) << 23) | (bits(te, 12, 2) << 26); if (bits(te, 1, 3) >= 2) k1 |= bits(te, 4, 8) << 20; }
+    if (bits(te, 14, 1)) k0 |= (1ull << 28) | (bits(te, 15, 1) << 29);
+    if (abe) { k0 |= (bits(al, 0, 8) << 33) | ((uint64_t)(gs.pabe & 1) << 41); if (bits(al, 4, 2) == 2) k1 |= bits(al, 32, 8) << 12; }
+    pthread_mutex_lock(&census_m);
+    if (census_nrt < 32) {
+        int seen = 0;
+        for (int i = 0; i < census_nrt; i++) seen |= census_rt[i] == fbp;
+        if (!seen) census_rt[census_nrt++] = fbp;
+    }
+    if (tme) {
+        uint32_t tpsm = bits(t0, 20, 6), tbp = bits(t0, 0, 14);
+        k0 |= ((uint64_t)tpsm << 45) | (bits(t0, 34, 3) << 51) | (bits(t1, 5, 4) << 59);
+        if (tpsm == PSMT8 || tpsm == PSMT4 || tpsm == PSMT8H || tpsm == PSMT4HL || tpsm == PSMT4HH) k0 |= (bits(t0, 51, 4) << 54) | (bits(t0, 55, 1) << 58);
+        k1 |= bits(t1, 2, 3) | (bits(t1, 0, 1) << 3) | (bits(cl, 0, 4) << 4) | ((uint64_t)(bits(gs.texa, 15, 1)) << 28);
+        if (tbp == fbp) k1 |= 1ull << 10;
+        else if (zte && tbp == zbp) k1 |= 1ull << 11;
+        else for (int i = 0; i < census_nrt; i++) if (census_rt[i] == tbp) { k1 |= 1ull << 29; break; }
+    }
+    extern unsigned long long g_vsyncs;
+    unsigned h = (unsigned)((k0 * 0x9E3779B97F4A7C15ull) ^ (k1 * 0xC2B2AE3D27D4EB4Full)) >> 3;
+    for (int i = 0; i < 2048; i++) {
+        CensusEnt *e = &census[(h + i) & 2047];
+        if (e->prims && e->k0 == k0 && e->k1 == k1) { e->prims++; break; }
+        if (!e->prims) {
+            if (census_n >= 1536) break;   /* table full: stop adding */
+            e->k0 = k0; e->k1 = k1; e->prims = 1; e->first = g_vsyncs; e->dimx = gs.dimx; e->fogcol = gs.fogcol & 0xffffff;
+            census_n++;
+            char d[600];
+            census_describe(e, d, sizeof d);
+            LOG("[gsstate v%llu #%d] %s\n", g_vsyncs, census_n, d);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&census_m);
+}
+
+/* counts the vertices like the GS queue so that only completed primitives are noted */
+static int census_vc;
+static void census_kick(int draw) {
+    if (g_gs_census < 0) g_gs_census = getenv("HP_GSSTATS") != NULL;
+    if (!g_gs_census) return;
+    int type = (int)(gs.prim & 7);
+    static const int need[8] = {1, 2, 2, 3, 3, 3, 2, 99};
+    if (++census_vc < need[type]) return;
+    if (draw) census_note();
+    census_vc = type == 2 ? 1 : (type == 4 || type == 5) ? 2 : 0;
+}
+
+static int census_cmp(const void *a, const void *b) {
+    const CensusEnt *x = a, *y = b;
+    return x->prims < y->prims ? 1 : x->prims > y->prims ? -1 : 0;
+}
+
+void gs_census_report(void) {
+    if (g_gs_census <= 0) return;
+    pthread_mutex_lock(&census_m);
+    static CensusEnt sorted[2048];
+    int n = 0;
+    for (int i = 0; i < 2048; i++) if (census[i].prims) sorted[n++] = census[i];
+    qsort(sorted, n, sizeof sorted[0], census_cmp);
+    extern unsigned long long g_vsyncs;
+    LOG("[gsstate report v%llu] %d distinct states\n", g_vsyncs, n);
+    for (int i = 0; i < n; i++) {
+        char d[600];
+        census_describe(&sorted[i], d, sizeof d);
+        LOG("[gsstate] %10llu prims (from v%llu) %s\n", sorted[i].prims, sorted[i].first, d);
+    }
+    pthread_mutex_unlock(&census_m);
+}
+
 static int primlog = -1;
 static void vertex_kick(Vtx v, int draw) {
+    if (g_gs_census) census_kick(draw);
     if (g_gs_gpu) { g_gs_prims += draw; return; }
     uint64_t prim = gs.prim;
     int type = bits(prim, 0, 3);
@@ -1105,7 +1256,7 @@ void gs_write_reg(int reg, uint64_t v) {
         LOG("[gs] ctx2 reg %02x = %016llx\n", reg, (unsigned long long)v);
     }
     switch (reg) {
-    case 0x00: gs.prim = v; vcount = 0; break;
+    case 0x00: gs.prim = v; vcount = 0; census_vc = 0; break;
     case 0x01: gs.rgbaq = v; break;
     case 0x02: gs.st = v; break;
     case 0x03: gs.uv = v; break;
@@ -1272,10 +1423,11 @@ static void gif_scan(GifPath *p, const U128 *q, uint32_t n) {
 void gif_feed(int pi, const U128 *q, uint32_t n) {
     if (g_gs_gpu) {
         static int full = -1;
-        if (full < 0) full = getenv("HP_GSPARSE") != NULL;   /* keep the full register parse (debug logs) */
+        if (full < 0) full = getenv("HP_GSPARSE") != NULL || getenv("HP_GSSTATS") != NULL;   /* keep the full register parse (debug logs) */
         gsb_gif(pi, q, n);
         if (!full) { cur_path = pi; gif_scan(&paths[pi], q, n); return; }
     }
+    if (g_gs_mirror) gsb_gif(pi, q, n);
     GifPath *p = &paths[pi];
     cur_path = pi;
     for (uint32_t i = 0; i < n; i++) {
@@ -1325,7 +1477,11 @@ int gif_path_idle(int pi) { return !paths[pi].active; }
 
 void gs_init(void) {
     g_vram = calloc(1, 4u << 20);
-    if (gsb_enabled()) g_gs_gpu = gsb_init();
+    if (gsb_enabled()) {
+        int ok = gsb_init();
+        if (gsb_mirror()) g_gs_mirror = ok;
+        else g_gs_gpu = ok;
+    }
     memset(&gs, 0, sizeof gs);
     gs.prmodecont = 1;   /* reset value: primitive attributes come from PRIM */
 }

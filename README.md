@@ -217,6 +217,8 @@ a diagnostic dump.
 | `HP_HEADLESS` | core.c | Run without a window |
 | `HP_GS_THREADS` | gs.c | Number of rasterizer worker threads |
 | `HP_GS=gpu`, `HP_GSSYNC` | gs_bridge.cpp | GPU renderer; `HP_GSSYNC` waits for each displayed frame instead of showing the newest finished one |
+| `HP_GS=both` | gs_bridge.cpp, display.c | The software GS draws and is shown, the GPU renderer gets the same packets; with `HP_SHOT` every screenshot `frame_<v>.ppm` gets a `gpu_<v>.ppm` of the same frame (exact renderer comparisons) |
+| `HP_GSSTATS` | gs.c | Census of the distinct GS drawing states (prim type, formats, TEST, ALPHA, DTHE, texture modes, render-to-texture): each new one is logged when first drawn, all with primitive counts at `HP_EXITAT` / `SIGUSR1`; both renderers |
 | `HP_CDLAT`, `HP_CDSEEK` | iop_servers.c | Emulated disc read latency / seek time |
 | `HP_ISO` | iop_servers.c | Path to the ISO image |
 

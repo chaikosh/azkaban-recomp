@@ -73,6 +73,20 @@ void display_vsync(void) {
             for (int i = 0; i < w * h; i++) { uint32_t c = frame_buf[i]; uint8_t px[3] = {(uint8_t)c, (uint8_t)(c >> 8), (uint8_t)(c >> 16)}; fwrite(px, 1, 3, f); }
             fclose(f);
         }
+        extern int g_gs_mirror;
+        if (g_gs_mirror) {   /* HP_GS=both: the GPU renderer's frame from the same packets, gpu_<vsync>.ppm */
+            static uint32_t gbuf[MAXW * MAXH];
+            int gw = 0, gh = 0;
+            uint64_t fb2[2] = {hw_gs_priv(0x0070), hw_gs_priv(0x0090)}, disp2[2] = {hw_gs_priv(0x0080), hw_gs_priv(0x00a0)};
+            if (gsb_display(pmode, hw_gs_priv(0x0020), fb2, disp2, gbuf, MAXW * MAXH, &gw, &gh)) {
+                snprintf(path, sizeof path, "%s/gpu_%05llu.ppm", shot, g_vsyncs / every * every);
+                if ((f = fopen(path, "wb"))) {
+                    fprintf(f, "P6\n%d %d\n255\n", gw, gh);
+                    for (int i = 0; i < gw * gh; i++) { uint32_t c = gbuf[i]; uint8_t px[3] = {(uint8_t)c, (uint8_t)(c >> 8), (uint8_t)(c >> 16)}; fwrite(px, 1, 3, f); }
+                    fclose(f);
+                }
+            }
+        }
     }
     /* HP_SHOTFB=fbp,fbw,psm,w,h (hex fbp in 2048-word pages): also dump that buffer */
     static const char *fb = (const char *)1;
