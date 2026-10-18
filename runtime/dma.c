@@ -128,6 +128,10 @@ static pthread_mutex_t rq_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t rq_cv = PTHREAD_COND_INITIALIZER;
 static int rq[32], rq_head, rq_tail, rthread_started;
 
+/* GIF DMA transfers started but not yet run by the render thread: PATH3 is busy (VIF1 FLUSHA). */
+static int path3_pending;
+int dma_path3_busy(void) { return __atomic_load_n(&path3_pending, __ATOMIC_SEQ_CST) > 0; }
+
 static void render_channel(int ch) {
     extern double g_prof[8];
     struct timespec pa, pb;
@@ -148,7 +152,10 @@ static void render_channel(int ch) {
         if (g_trace > 1) LOG("[dma1] start CHCR %08x MADR %08x QWC %u TADR %08x\n", mmio_r32(base[1]), mmio_r32(base[1] + 0x10),
                              mmio_r32(base[1] + 0x20), mmio_r32(base[1] + 0x30));
         dma_run(1, vif1_sink, (chcr_now(1) >> 6) & 1);
-    } else dma_run(2, gif_sink, 0);
+    } else {
+        dma_run(2, gif_sink, 0);
+        if (__atomic_sub_fetch(&path3_pending, 1, __ATOMIC_SEQ_CST) == 0) { extern void vif1_path3_idle(void); vif1_path3_idle(); }
+    }
     uint32_t q = g_dma_qwords;
     extern int vif1_dma_done(uint32_t qwords);
     int complete = ch == 1 ? vif1_dma_done(q) : 1;
@@ -203,6 +210,7 @@ void dma_start(int ch) {
         LOG("[ipu] dma %s CHCR %08x MADR %08x QWC %u data %02x%02x%02x%02x %02x%02x%02x%02x\n", chname[ch], mmio_r32(base[ch]), madr, qwc,
             p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
     }
+    if (ch == 2) __atomic_add_fetch(&path3_pending, 1, __ATOMIC_SEQ_CST);
     if (ch == 1 || ch == 2) { render_post(ch); return; }
     g_dma_qwords = 0;
     if (ch == 8 || ch == 9) spr_transfer(ch);
