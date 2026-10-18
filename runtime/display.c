@@ -96,7 +96,7 @@ enum { B_SELECT = 0, B_L3, B_R3, B_START, B_UP, B_RIGHT, B_DOWN, B_LEFT, B_L2, B
 static void poll_input(SDL_Gamepad *pad) {
     const bool *k = SDL_GetKeyboardState(NULL);
     uint16_t on = 0;
-    /* HP_AUTOKEY="start@8,cross@12": press a button for ~0.3 s at the given second */
+    /* HP_AUTOKEY="start@8,cross@12:1.5": press a button at the given second for 0.3 s (or the given hold time) */
     static const char *ak = (const char *)1;
     static double t0 = -1;
     if (ak == (const char *)1) ak = getenv("HP_AUTOKEY");
@@ -107,8 +107,8 @@ static void poll_input(SDL_Gamepad *pad) {
         if (t0 < 0) t0 = now;
         const char *p = ak;
         while (*p) {
-            char name[16]; double at = 0;
-            if (sscanf(p, "%15[a-z]@%lf", name, &at) == 2 && now - t0 >= at && now - t0 < at + 0.3) {
+            char name[16]; double at = 0, hold = 0.3;   /* "name@second" or "name@second:holdseconds" */
+            if (sscanf(p, "%15[a-z]@%lf:%lf", name, &at, &hold) >= 2 && now - t0 >= at && now - t0 < at + hold) {
                 int b = !strcmp(name, "start") ? B_START : !strcmp(name, "cross") ? B_CRO : !strcmp(name, "circle") ? B_CIR :
                         !strcmp(name, "select") ? B_SELECT : !strcmp(name, "down") ? B_DOWN : !strcmp(name, "up") ? B_UP :
                         !strcmp(name, "left") ? B_LEFT : !strcmp(name, "right") ? B_RIGHT : !strcmp(name, "triangle") ? B_TRI :
