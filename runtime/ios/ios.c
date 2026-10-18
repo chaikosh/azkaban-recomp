@@ -77,6 +77,7 @@ const char *hp_ios_setup(void) {
         if (freopen(log, "w", stderr)) setvbuf(stderr, NULL, _IONBF, 0);
     }
     setenv("HP_GS", "gpu", 0);
+    setenv("HP_FPSLOG", "1", 0);   /* a [fps] line in hp.log every 5 s */
     snprintf(memcard, sizeof memcard, "%s/memcard0.ps2", docs);
     setenv("HP_MEMCARD", memcard, 0);
     snprintf(disc, sizeof disc, "%s/disc", docs);

@@ -383,6 +383,17 @@ void display_vsync(void);
 void hw_vblank(int start) {
     { extern volatile int g_usr1_req; extern void rt_usr1_work(void); if (g_usr1_req) { g_usr1_req = 0; rt_usr1_work(); } }
     if (start) {
+        {   /* HP_FPSLOG (default on iOS): game frames per second every 300 vsyncs */
+            static int on = -1; static unsigned long long n; static unsigned lf; static struct timespec lt;
+            if (on < 0) on = getenv("HP_FPSLOG") != NULL;
+            if (on && ++n % 300 == 0) {
+                extern unsigned g_frames_queued;
+                struct timespec t; clock_gettime(CLOCK_UPTIME_RAW, &t);
+                double wall = lt.tv_sec ? (t.tv_sec - lt.tv_sec) + (t.tv_nsec - lt.tv_nsec) * 1e-9 : 5.0;
+                LOG("[fps] %.1f game fps, %.1f vsync/s\n", (g_frames_queued - lf) / wall, 300 / wall);
+                lf = g_frames_queued; lt = t;
+            }
+        }
         {   /* HP_DUMPAT=vsync[,vsync...]: run the SIGUSR1 diagnostic dump (HP_VRAMDUMP/HP_RAMDUMP/HP_PEEK) at those vsyncs */
             extern unsigned long long g_vsyncs; extern void rt_usr1_work(void);
             static const char *da = (const char *)1;

@@ -1191,6 +1191,24 @@ bool init(Mode m) {
     WGPULimits limits = WGPU_LIMITS_INIT;
     limits.maxStorageBufferBindingSize = supported.maxStorageBufferBindingSize;
     limits.maxBufferSize = supported.maxBufferSize;
+    // hp: left undefined, wgpu-native falls back to its downlevel limits on iOS (4 storage buffers
+    // per stage; the GS binds 7), so ask for the WebGPU defaults where the adapter has them.
+    auto want = [](std::uint32_t &field, std::uint32_t have, std::uint32_t standard) { field = have < standard ? have : standard; };
+    want(limits.maxStorageBuffersPerShaderStage, supported.maxStorageBuffersPerShaderStage, 8);
+    want(limits.maxStorageTexturesPerShaderStage, supported.maxStorageTexturesPerShaderStage, 4);
+    want(limits.maxUniformBuffersPerShaderStage, supported.maxUniformBuffersPerShaderStage, 12);
+    want(limits.maxSampledTexturesPerShaderStage, supported.maxSampledTexturesPerShaderStage, 16);
+    want(limits.maxSamplersPerShaderStage, supported.maxSamplersPerShaderStage, 16);
+    want(limits.maxBindGroups, supported.maxBindGroups, 4);
+    want(limits.maxBindingsPerBindGroup, supported.maxBindingsPerBindGroup, 1000);
+    want(limits.maxDynamicStorageBuffersPerPipelineLayout, supported.maxDynamicStorageBuffersPerPipelineLayout, 4);
+    want(limits.maxDynamicUniformBuffersPerPipelineLayout, supported.maxDynamicUniformBuffersPerPipelineLayout, 8);
+    want(limits.maxComputeWorkgroupStorageSize, supported.maxComputeWorkgroupStorageSize, 16384);
+    want(limits.maxComputeInvocationsPerWorkgroup, supported.maxComputeInvocationsPerWorkgroup, 256);
+    want(limits.maxComputeWorkgroupSizeX, supported.maxComputeWorkgroupSizeX, 256);
+    want(limits.maxComputeWorkgroupSizeY, supported.maxComputeWorkgroupSizeY, 256);
+    want(limits.maxComputeWorkgroupSizeZ, supported.maxComputeWorkgroupSizeZ, 64);
+    want(limits.maxComputeWorkgroupsPerDimension, supported.maxComputeWorkgroupsPerDimension, 65535);
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
     dd.requiredLimits = &limits;
     const WGPUFeatureName timestamp_feature = WGPUFeatureName_TimestampQuery;
