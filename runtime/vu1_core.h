@@ -63,6 +63,52 @@ static inline float vdiv(float a, float b) {   /* a, b already through vin() */
     return vclampf(a / b);
 }
 
+/* 4-wide FMAC for the recompiled programs; the same results as the scalar code (one rounding
+   for MADD/MSUB as the contracted scalar a*b+c, vin/vclampf per lane, max/min as compare+select). */
+#if defined(__aarch64__)
+#include <arm_neon.h>
+typedef float32x4_t vf4;
+static inline vf4 vld4(const V4 *p) { return vld1q_f32(p->f); }
+static inline void vst4(V4 *p, vf4 x) { vst1q_f32(p->f, x); }
+static inline vf4 vdup4(float x) { return vdupq_n_f32(x); }
+static inline vf4 vin4(vf4 x) {
+    uint32x4_t u = vreinterpretq_u32_f32(x);
+    uint32x4_t e = vandq_u32(u, vdupq_n_u32(0x7f800000u));
+    uint32x4_t sign = vandq_u32(u, vdupq_n_u32(0x80000000u));
+    u = vbslq_u32(vceqq_u32(e, vdupq_n_u32(0)), sign, u);
+    u = vbslq_u32(vceqq_u32(e, vdupq_n_u32(0x7f800000u)), vorrq_u32(sign, vdupq_n_u32(0x7f7fffffu)), u);
+    return vreinterpretq_f32_u32(u);
+}
+static inline vf4 vclamp4(vf4 x) {
+    uint32x4_t u = vreinterpretq_u32_f32(x);
+    uint32x4_t inf = vceqq_u32(vandq_u32(u, vdupq_n_u32(0x7f800000u)), vdupq_n_u32(0x7f800000u));
+    u = vbslq_u32(inf, vorrq_u32(vandq_u32(u, vdupq_n_u32(0x80000000u)), vdupq_n_u32(0x7f7fffffu)), u);
+    return vreinterpretq_f32_u32(u);
+}
+static inline vf4 vadd4(vf4 a, vf4 b) { return vclamp4(vaddq_f32(a, b)); }
+static inline vf4 vsub4(vf4 a, vf4 b) { return vclamp4(vsubq_f32(a, b)); }
+static inline vf4 vmadd4(vf4 c, vf4 a, vf4 b) { return vclamp4(vfmaq_f32(c, a, b)); }
+static inline vf4 vmsub4(vf4 c, vf4 a, vf4 b) { return vclamp4(vfmsq_f32(c, a, b)); }
+static inline vf4 vmul4(vf4 a, vf4 b) { return vclamp4(vmulq_f32(a, b)); }
+static inline vf4 vmax4(vf4 a, vf4 b) { return vbslq_f32(vcgtq_f32(a, b), a, b); }
+static inline vf4 vmin4(vf4 a, vf4 b) { return vbslq_f32(vcltq_f32(a, b), a, b); }
+#else
+typedef V4 vf4;
+static inline vf4 vld4(const V4 *p) { return *p; }
+static inline void vst4(V4 *p, vf4 x) { *p = x; }
+static inline vf4 vdup4(float x) { vf4 r; for (int k = 0; k < 4; k++) r.f[k] = x; return r; }
+#define VF4_MAP(expr) vf4 r; for (int k = 0; k < 4; k++) r.f[k] = (expr); return r
+static inline vf4 vin4(vf4 x) { VF4_MAP(vin(x.f[k])); }
+static inline vf4 vclamp4(vf4 x) { VF4_MAP(vclampf(x.f[k])); }
+static inline vf4 vadd4(vf4 a, vf4 b) { VF4_MAP(vclampf(a.f[k] + b.f[k])); }
+static inline vf4 vsub4(vf4 a, vf4 b) { VF4_MAP(vclampf(a.f[k] - b.f[k])); }
+static inline vf4 vmadd4(vf4 c, vf4 a, vf4 b) { VF4_MAP(vclampf(c.f[k] + a.f[k] * b.f[k])); }
+static inline vf4 vmsub4(vf4 c, vf4 a, vf4 b) { VF4_MAP(vclampf(c.f[k] - a.f[k] * b.f[k])); }
+static inline vf4 vmul4(vf4 a, vf4 b) { VF4_MAP(vclampf(a.f[k] * b.f[k])); }
+static inline vf4 vmax4(vf4 a, vf4 b) { VF4_MAP(a.f[k] > b.f[k] ? a.f[k] : b.f[k]); }
+static inline vf4 vmin4(vf4 a, vf4 b) { VF4_MAP(a.f[k] < b.f[k] ? a.f[k] : b.f[k]); }
+#endif
+
 /* MAC flags of the last FMAC result (per written component) and the status flags */
 static inline void vu_set_mac(VU1 *v, const V4 *r, int dest) {
     uint32_t mac = 0;

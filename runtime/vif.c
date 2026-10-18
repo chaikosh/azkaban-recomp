@@ -35,9 +35,15 @@ void kern_after(uint64_t ns, void (*fn)(int), int arg);
 void dma_finish(int ch);
 
 static int stalled, stall_next;
+/* FLUSHA waits until PATH3 is idle.  GIF DMA transfers run on the render thread, so one the game
+   has started may not have reached the GS yet when the VIF gets to the FLUSHA: the VIF then stops
+   (VGW) and the render thread resumes it once the transfer is through (vif1_path3_idle).  The movie
+   player depends on this: it kicks the upload of the last texture strips and draws them right after
+   a FLUSHA, with no VIF interrupt in between. */
+static int path3_wait;
 uint32_t vif1_reg_read(uint32_t off) {
     switch (off) {   /* register map per the EE manual: STAT 00 FBRST 10 ERR 20 MARK 30 CYCLE 40 MODE 50 NUM 60 MASK 70 CODE 80 ... */
-    case 0x00: return (stalled ? 0xc00 : 0) | (v1.mark_seen ? 0x40 : 0);   /* VIS+INT while stalled by an i bit, MRK */
+    case 0x00: return (stalled ? 0xc00 : 0) | (path3_wait ? 0x8 : 0) | (v1.mark_seen ? 0x40 : 0);   /* VIS+INT while stalled by an i bit, VGW, MRK */
     case 0x30: return v1.mark;
     case 0x40: return v1.cl | (v1.wl << 8);
     case 0x50: return v1.mode;
@@ -72,7 +78,7 @@ void vif1_reg_write(uint32_t off, uint32_t val) {
     if (off == 0x30) { v1.mark = val; v1.mark_seen = 0; }   /* writing MARK clears MRK */
     else if (off == 0x10) {
         pthread_mutex_lock(&g_gs_lock);
-        if (val & 1) { v1.need = 0; v1.cmd = 0; stalled = stall_next = 0; vq_head = vq_tail = 0; }   /* RST */
+        if (val & 1) { v1.need = 0; v1.cmd = 0; stalled = stall_next = path3_wait = 0; vq_head = vq_tail = 0; }   /* RST */
         int resume = 0;
         if (val & 8) {   /* STC: the VIF goes on with the queued data */
             { extern void synclog(const char *, ...); synclog("vif1 STC (queued %u words)", vq_tail - vq_head); }
@@ -224,8 +230,13 @@ static void vif1_command(uint32_t w) {
     case 0x05: v1.mode = imm & 3; break;
     case 0x06: break;   /* MSKPATH3 */
     case 0x07: v1.mark = imm; v1.mark_seen = 1; break;
-    case 0x10: case 0x11: break;   /* FLUSHE / FLUSH: VU runs synchronously */
-    case 0x13: { extern void synclog(const char *, ...); synclog("vif1 FLUSHA"); break; }
+    case 0x10: case 0x11: break;   /* FLUSHE / FLUSH: VU1 and PATH1/2 run synchronously */
+    case 0x13: {   /* FLUSHA: also PATH3 */
+        extern int dma_path3_busy(void); extern void synclog(const char *, ...);
+        if (dma_path3_busy()) path3_wait = 1;
+        synclog("vif1 FLUSHA%s", path3_wait ? " (waits for PATH3)" : "");
+        break;
+    }
     case 0x14: case 0x15: vif1_mscal(imm); break;
     case 0x17: { extern uint32_t vu1_tpc(void); vif1_mscal(vu1_tpc()); break; }   /* MSCNT: resume at the VU's TPC */
     case 0x20: v1.need = 1; break;
@@ -290,20 +301,28 @@ static void vif1_exec_word(uint32_t w) {
 }
 
 static void vif1_drain_locked(void) {
-    while (!stalled && vq_head != vq_tail) {
+    while (!stalled && !path3_wait && vq_head != vq_tail) {
         uint32_t w = vq[vq_head & (VQ_SIZE - 1)];
         vq_head++;
         vif1_exec_word(w);
     }
-    if (!stalled && vq_head == vq_tail && dma1_deferred) {
+    if (!stalled && !path3_wait && vq_head == vq_tail && dma1_deferred) {
         dma1_deferred = 0;
-        kern_after(10000 + (uint64_t)dma1_qwords * 8, dma_finish, 1);
+        extern void dma_complete_vif1(uint32_t qwords);
+        dma_complete_vif1(dma1_qwords);
     }
+}
+
+/* Render thread, g_gs_lock held: every GIF DMA transfer started so far has gone through. */
+void vif1_path3_idle(void) {
+    if (!path3_wait) return;
+    path3_wait = 0;
+    vif1_drain_locked();
 }
 
 void vif1_word(uint32_t w) {
     if (!vq) vq = malloc(VQ_SIZE * sizeof(uint32_t));
-    if (stalled || vq_head != vq_tail) {
+    if (stalled || path3_wait || vq_head != vq_tail) {
         if (vq_tail - vq_head >= VQ_SIZE) { LOG("[vif1] queue overflow\n"); return; }
         vq[vq_tail & (VQ_SIZE - 1)] = w;
         vq_tail++;
@@ -314,7 +333,7 @@ void vif1_word(uint32_t w) {
 
 /* Called by the DMA engine (lock held) once every qword of a VIF1 transfer was handed over. */
 int vif1_dma_done(uint32_t qwords) {
-    if (!stalled && vq_head == vq_tail) return 1;   /* fully consumed: complete now */
+    if (!stalled && !path3_wait && vq_head == vq_tail) return 1;   /* fully consumed: complete now */
     dma1_deferred = 1;
     dma1_qwords = qwords;
     return 0;

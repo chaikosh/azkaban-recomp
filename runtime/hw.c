@@ -135,10 +135,26 @@ static void sw32(uint8_t *base, uint32_t off, uint32_t v) { memcpy(base + off, &
 void gs_priv_write(uint32_t off, uint64_t v);
 
 /* ---- 32-bit register file -------------------------------------------------- */
+/* HP_MMIOSTATS: count EE reads of the hardware registers (0x10000000-0x1000ffff) */
+static int mmio_stats = -1;
+static unsigned long long mmio_reads[0x4000];
+void mmio_stats_report(void) {
+    if (mmio_stats <= 0) return;
+    for (int r = 0; r < 8; r++) {
+        int best = -1;
+        for (int k = 0; k < 0x4000; k++) if (mmio_reads[k] && (best < 0 || mmio_reads[k] > mmio_reads[best])) best = k;
+        if (best < 0) break;
+        LOG("[mmio] read 1000%04x x%llu\n", best * 4, mmio_reads[best]);
+        mmio_reads[best] = 0;
+    }
+    memset(mmio_reads, 0, sizeof mmio_reads);
+}
 uint32_t mmio_r32(uint32_t a) {
     uint32_t p = a & 0x1fffffffu;
     if (p >= 0x10000000u && p < 0x10010000u) {
         uint32_t off = p & 0xffff;
+        if (mmio_stats < 0) mmio_stats = getenv("HP_MMIOSTATS") != NULL;
+        if (mmio_stats) mmio_reads[off >> 2]++;
         if (off < 0x2000) {
             int k = off >> 11;
             switch (off & 0x7f0) {

@@ -7,6 +7,7 @@
  * delivered at safe points: syscalls and POLL() on backward branches.
  */
 #include "rt.h"
+#include <stdatomic.h>
 #include "ee_gen.h"
 #include <stdlib.h>
 #include <string.h>
@@ -263,24 +264,35 @@ static uint64_t t0_ns;
 static uint32_t count_bias;
 /* Emulated time: wall time minus the time spent emulating GS/VU work, so the
  * game's timers see rendering as (nearly) free, as on the real hardware. */
-static uint64_t g_stolen_ns, g_freeze_at;
-static int g_freeze_depth;
+/* Read on every timer/COUNT/IOP access from several threads: lock-free for readers (a sequence
+   counter around the rare freeze updates). */
+static _Atomic uint64_t g_stolen_ns, g_freeze_at;
+static _Atomic int g_freeze_depth;
+static _Atomic uint32_t vm_seq;
 static pthread_mutex_t vm = PTHREAD_MUTEX_INITIALIZER;
 uint64_t virt_ns(void) {
-    pthread_mutex_lock(&vm);
-    uint64_t v = (g_freeze_depth ? g_freeze_at : host_ns()) - g_stolen_ns;
-    pthread_mutex_unlock(&vm);
-    return v;
+    for (;;) {
+        uint32_t s0 = atomic_load_explicit(&vm_seq, memory_order_acquire);
+        if (s0 & 1) continue;
+        uint64_t v = (atomic_load_explicit(&g_freeze_depth, memory_order_relaxed) ? atomic_load_explicit(&g_freeze_at, memory_order_relaxed) : host_ns())
+                     - atomic_load_explicit(&g_stolen_ns, memory_order_relaxed);
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(&vm_seq, memory_order_relaxed) == s0) return v;
+    }
 }
 /* While frozen the emulated clock stands still (monotonic, never steps back). */
 void kern_freeze_begin(void) {
     pthread_mutex_lock(&vm);
+    atomic_fetch_add_explicit(&vm_seq, 1, memory_order_acq_rel);
     if (g_freeze_depth++ == 0) g_freeze_at = host_ns();
+    atomic_fetch_add_explicit(&vm_seq, 1, memory_order_release);
     pthread_mutex_unlock(&vm);
 }
 void kern_freeze_end(void) {
     pthread_mutex_lock(&vm);
+    atomic_fetch_add_explicit(&vm_seq, 1, memory_order_acq_rel);
     if (--g_freeze_depth == 0) g_stolen_ns += host_ns() - g_freeze_at;
+    atomic_fetch_add_explicit(&vm_seq, 1, memory_order_release);
     pthread_mutex_unlock(&vm);
 }
 
