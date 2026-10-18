@@ -127,6 +127,13 @@ int gsb_display(uint64_t pmode, uint64_t smode2, const uint64_t dispfb[2], const
     return 1;
 }
 
+/* iOS: hold the GS while the app is inactive (no GPU work may be submitted in the background);
+   every thread that reaches the GS waits.  Called on the main thread: 1 locks, 0 unlocks. */
+void gsb_pause(int on) {
+    if (on) g_lock.lock();
+    else g_lock.unlock();
+}
+
 /* Seconds spent in GIF processing, display readback and downloads since start. */
 void gsb_times(double *gif, double *display, double *download) {
     std::lock_guard<std::mutex> lk(g_lock);

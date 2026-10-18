@@ -1,0 +1,62 @@
+# XcodeGen spec for building, signing and running the app from Xcode:
+#   make -f Makefile.ios SDK=iphoneos lib xcode   ->  ios/HPAzkaban.xcodeproj
+# The game itself is the static library build/ios-<sdk>/libhp.a (it contains main(), which
+# SDL turns into UIApplicationMain).  The disc image is not bundled: it goes into Documents.
+name: HPAzkaban
+options:
+  bundleIdPrefix: com.chaikosh
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  HPAzkaban:
+    type: application
+    platform: iOS
+    sources:
+      - path: stub.c
+      - path: ../build/recomp/image.bin
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_NAME: HPAzkaban
+        PRODUCT_BUNDLE_IDENTIFIER: com.chaikosh.hp3
+        INFOPLIST_FILE: Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ARCHS: arm64
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 33UFZAL6L2
+        ENABLE_BITCODE: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        OTHER_LDFLAGS[sdk=iphoneos*]:
+          - -force_load
+          - $(PROJECT_DIR)/../build/ios-iphoneos/libhp.a
+          - $(PROJECT_DIR)/../third_party/wgpu-native/lib-ios/libwgpu_native.a
+          - -L$(PROJECT_DIR)/../deps/ios-iphoneos/lib
+          - -lSDL3
+          - -lc++
+        OTHER_LDFLAGS[sdk=iphonesimulator*]:
+          - -force_load
+          - $(PROJECT_DIR)/../build/ios-iphonesimulator/libhp.a
+          - $(PROJECT_DIR)/../third_party/wgpu-native/lib-ios-sim/libwgpu_native.a
+          - -L$(PROJECT_DIR)/../deps/ios-iphonesimulator/lib
+          - -lSDL3
+          - -lc++
+    dependencies:
+      - sdk: UIKit.framework
+      - sdk: Foundation.framework
+      - sdk: CoreFoundation.framework
+      - sdk: CoreGraphics.framework
+      - sdk: QuartzCore.framework
+      - sdk: Metal.framework
+      - sdk: IOSurface.framework
+      - sdk: AVFoundation.framework
+      - sdk: AudioToolbox.framework
+      - sdk: CoreAudio.framework
+      - sdk: CoreHaptics.framework
+      - sdk: CoreMotion.framework
+      - sdk: GameController.framework
+      - sdk: CoreBluetooth.framework
+      - sdk: OpenGLES.framework
+      - sdk: UniformTypeIdentifiers.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
