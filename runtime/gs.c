@@ -254,6 +254,10 @@ typedef struct {
     int ta0, ta1, aem;
     int linear;
     RdFn rd;
+    /* mipmapping (TEX1, MIPTBP1/2): mip is set when MMIN selects a mipmap filter and MXL > 0 */
+    int mip, mxl, mmin, lcm, lsh, minlin;
+    float k;
+    uint32_t mtbp[7], mtbw[7];
 } TexState;
 
 static inline uint32_t tex_texel(const TexState *t, int x, int y) {
@@ -314,6 +318,39 @@ static uint32_t tex_sample(const TexState *t, float u, float v) {
     return lerp_rgba(lerp_rgba(c00, c10, fu), lerp_rgba(c01, c11, fu), fv);
 }
 
+/* Sample mip level `lv` (base pointers from MIPTBP1/2, size and coordinates halved per level). */
+static uint32_t tex_sample_level(const TexState *t, int lv, float u, float v, int linear) {
+    TexState l = *t;
+    l.linear = linear;
+    if (lv > 0) {
+        l.tbp = t->mtbp[lv]; l.tbw = t->mtbw[lv];
+        l.tw = t->tw > (uint32_t)lv ? t->tw - lv : 0; l.th = t->th > (uint32_t)lv ? t->th - lv : 0;
+        l.minu >>= lv; l.maxu >>= lv; l.minv >>= lv; l.maxv >>= lv;
+        float sc = 1.0f / (float)(1 << lv);
+        u *= sc; v *= sc;
+    }
+    return tex_sample(&l, u, v);
+}
+
+/* Texture lookup with the GS level-of-detail rules: LOD = log2(1/|Q|) * 2^L + K (or K with LCM),
+   LOD < 0 magnifies level 0 (MMAG), otherwise MMIN picks and filters the levels up to MXL.  Games
+   stream only the levels a distant object needs and leave TBP0 pointing at nothing (0), so level 0
+   must not be sampled when the LOD says otherwise. */
+static uint32_t tex_sample_mip(const TexState *t, float u, float v, float q) {
+    float lod = t->lcm ? t->k : log2f(1.0f / fmaxf(fabsf(q), 1e-30f)) * (float)(1 << t->lsh) + t->k;
+    if (lod < 0.0f) return tex_sample_level(t, 0, u, v, t->linear);
+    if (t->mmin == 2 || t->mmin == 4) {
+        int lv = (int)(lod + 0.5f);
+        return tex_sample_level(t, lv > t->mxl ? t->mxl : lv, u, v, t->minlin);
+    }
+    int l0 = (int)lod;
+    if (l0 >= t->mxl) return tex_sample_level(t, t->mxl, u, v, t->minlin);
+    int f = (int)((lod - (float)l0) * 256.0f);
+    uint32_t a = tex_sample_level(t, l0, u, v, t->minlin);
+    if (f <= 0) return a;
+    return lerp_rgba(a, tex_sample_level(t, l0 + 1, u, v, t->minlin), f);
+}
+
 /* ---- drawing context ---------------------------------------------------------- */
 typedef struct {
     /* frame / z */
@@ -357,6 +394,29 @@ static void setup_ctx(DrawCtx *d) {
     t->ta0 = bits(gs.texa, 0, 8); t->aem = bits(gs.texa, 15, 1); t->ta1 = bits(gs.texa, 32, 8);
     t->linear = bits(t1, 5, 1);   /* MMAG */
     t->rd = rd_for(t->psm);
+    t->lcm = bits(t1, 0, 1); t->mxl = bits(t1, 2, 3); t->mmin = bits(t1, 6, 3); t->lsh = bits(t1, 19, 2);
+    t->k = (float)((int32_t)((uint32_t)bits(t1, 32, 12) << 20) >> 20) / 16.0f;
+    t->minlin = t->mmin == 1 || t->mmin == 4 || t->mmin == 5;
+    t->mip = t->mmin >= 2 && t->mmin <= 5 && t->mxl > 0;
+    if (t->mxl > 6) t->mxl = 6;
+    if (t->mip) {
+        t->mtbp[0] = t->tbp; t->mtbw[0] = t->tbw;
+        uint64_t m1 = gs.miptbp1[ctxt], m2 = gs.miptbp2[ctxt];
+        for (int k = 0; k < 3; k++) {
+            t->mtbp[1 + k] = bits(m1, 20 * k, 14); t->mtbw[1 + k] = bits(m1, 20 * k + 14, 6);
+            t->mtbp[4 + k] = bits(m2, 20 * k, 14); t->mtbw[4 + k] = bits(m2, 20 * k + 14, 6);
+        }
+        if (bits(t1, 9, 1)) {   /* MTBA: levels 1-3 follow level 0 in memory */
+            static const int bpp[64] = {[PSMCT32] = 32, [PSMCT24] = 32, [PSMCT16] = 16, [PSMCT16S] = 16, [PSMT8] = 8, [PSMT4] = 4,
+                                        [PSMT8H] = 32, [PSMT4HL] = 32, [PSMT4HH] = 32};
+            uint32_t bp = t->tbp, bw = t->tbw, w = 1u << t->tw, h = 1u << t->th, b = bpp[t->psm & 63] ? bpp[t->psm & 63] : 32;
+            for (int k = 1; k <= 3; k++) {
+                bp += (w * h * b / 8) >> 8;
+                w = w > 1 ? w >> 1 : 1; h = h > 1 ? h >> 1 : 1; bw = bw > 1 ? bw >> 1 : 1;
+                t->mtbp[k] = bp; t->mtbw[k] = bw;
+            }
+        }
+    }
     d->fbrd = rd_for(d->fpsm); d->fbwr = wr_for(d->fpsm);
     d->zrd = rd_for(d->zpsm); d->zwr = wr_for(d->zpsm);
 }
@@ -378,11 +438,11 @@ static inline uint32_t fb_to_rgba(const DrawCtx *d, uint32_t v) {
 }
 
 /* Draw one pixel with interpolated color c (RGBA), depth z, fog f, and texture coords. */
-static void put_pixel(const DrawCtx *d, int x, int y, uint32_t z, uint32_t col, int fog, float u, float v) {
+static void put_pixel(const DrawCtx *d, int x, int y, uint32_t z, uint32_t col, int fog, float u, float v, float q) {
     if (x < d->scx0 || x > d->scx1 || y < d->scy0 || y > d->scy1) return;
     int r = col & 0xff, g = (col >> 8) & 0xff, b = (col >> 16) & 0xff, a = col >> 24;
     if (d->tme) {
-        uint32_t t = tex_sample(&d->tex, u, v);
+        uint32_t t = d->tex.mip ? tex_sample_mip(&d->tex, u, v, q) : tex_sample(&d->tex, u, v);
         int tr = t & 0xff, tg = (t >> 8) & 0xff, tb = (t >> 16) & 0xff, ta = t >> 24;
         switch (d->tex.tfx) {
         case 0: r = (r * tr) >> 7; g = (g * tg) >> 7; b = (b * tb) >> 7; if (d->tex.tcc) a = (a * ta) >> 7; break;
@@ -608,7 +668,7 @@ void gs_fb_stats(void) {
 
 typedef struct {
     const DrawCtx *d;
-    float x0, y0, dx, dy, ua, ub, va, vb;
+    float x0, y0, dx, dy, ua, ub, va, vb, q;
     int ix0, ix1;
     uint32_t col, z, packed;
     int fog, simple;
@@ -625,7 +685,7 @@ static void sprite_row(void *ctx, int y) {
     float vv = j->va + (j->vb - j->va) * ty;
     float du = j->dx > 0 ? (j->ub - j->ua) / j->dx : 0;
     float uu = j->ua + du * (j->ix0 - j->x0);
-    for (int x = j->ix0; x <= j->ix1; x++, uu += du) put_pixel(d, x, y, j->z, j->col, j->fog, uu, vv);
+    for (int x = j->ix0; x <= j->ix1; x++, uu += du) put_pixel(d, x, y, j->z, j->col, j->fog, uu, vv, j->q);
 }
 
 static void draw_sprite(const DrawCtx *d, const Vtx *v0, const Vtx *v1) {
@@ -649,6 +709,7 @@ static void draw_sprite(const DrawCtx *d, const Vtx *v0, const Vtx *v1) {
     j.col = pack_color(v1->r, v1->g, v1->b, v1->a);
     j.z = v1->z > 4294967295.0 ? 0xffffffffu : (uint32_t)v1->z;
     j.fog = (int)v1->f;
+    j.q = d->fst ? 1.0f : v1->q;
     /* plain fills: no texture, test, blend, fog, mask or depth work */
     j.simple = !d->tme && !d->abe && !d->ate && !d->date && !d->fge && !d->fbmsk && !d->fba &&
                (!d->zte || (d->ztst == 1 && d->zmsk)) &&
@@ -699,17 +760,17 @@ static void tri_row(void *ctx, int y) {
             col = flatcol;
             fog = (int)v2->f;
         }
-        float uu = 0, vv = 0;
+        float uu = 0, vv = 0, qq = 1.0f;
         if (d->tme) {
             float s = j->s0 * w0 + j->s1 * w1 + j->s2 * w2, t = j->t0 * w0 + j->t1 * w1 + j->t2 * w2;
             if (d->fst) { uu = s; vv = t; }
             else {
                 float q = j->q0 * w0 + j->q1 * w1 + j->q2 * w2;
                 if (q == 0) q = 1e-6f;
-                uu = s / q * j->tws; vv = t / q * j->ths;
+                uu = s / q * j->tws; vv = t / q * j->ths; qq = q;
             }
         }
-        put_pixel(d, x, y, zi, col, fog, uu, vv);
+        put_pixel(d, x, y, zi, col, fog, uu, vv, qq);
     }
 }
 
@@ -753,7 +814,8 @@ static void draw_line(const DrawCtx *d, const Vtx *v0, const Vtx *v1) {
         double z = v0->z + (v1->z - v0->z) * t;
         float u0, w0, u1, w1;
         tex_coords(d, v0, &u0, &w0); tex_coords(d, v1, &u1, &w1);
-        put_pixel(d, x, y, (uint32_t)z, col, (int)(v0->f + (v1->f - v0->f) * t), u0 + (u1 - u0) * t, w0 + (w1 - w0) * t);
+        put_pixel(d, x, y, (uint32_t)z, col, (int)(v0->f + (v1->f - v0->f) * t), u0 + (u1 - u0) * t, w0 + (w1 - w0) * t,
+                  d->fst ? 1.0f : v0->q + (v1->q - v0->q) * t);
     }
 }
 
@@ -830,7 +892,7 @@ static void vertex_kick(Vtx v, int draw) {
     case 0:
         setup_ctx(&d);
         put_pixel(&d, (int)vq[0].x, (int)vq[0].y, (uint32_t)vq[0].z, pack_color(vq[0].r, vq[0].g, vq[0].b, vq[0].a),
-                  (int)vq[0].f, vq[0].u, vq[0].v);
+                  (int)vq[0].f, vq[0].u, vq[0].v, d.fst ? 1.0f : vq[0].q);
         vcount = 0;
         break;
     case 1:
@@ -1057,7 +1119,8 @@ void gs_write_reg(int reg, uint64_t v) {
     case 0x1b: gs.prmode = v; break;
     case 0x1c: gs.texclut = v; break;
     case 0x22: gs.scanmsk = v; break;
-    case 0x34: case 0x35: case 0x36: case 0x37: break;   /* mip base pointers */
+    case 0x34: case 0x35: gs.miptbp1[reg - 0x34] = v; break;
+    case 0x36: case 0x37: gs.miptbp2[reg - 0x36] = v; break;
     case 0x3b: gs.texa = v; break;
     case 0x3d: gs.fogcol = v; break;
     case 0x3f: break;   /* TEXFLUSH */
