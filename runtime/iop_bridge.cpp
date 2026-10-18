@@ -24,6 +24,7 @@
 
 extern "C" {
 uint64_t virt_ns(void);
+void fastboot_note(const char *event);
 void kern_raise_dmac(int ch);
 }
 
@@ -88,6 +89,10 @@ void iopb_init(const char *iso, const char *memcard) {
     std::lock_guard<std::recursive_mutex> lk(g_lock);
     ps2::g_t0_ns = virt_ns();
     ps2::g_options.memcard_path = memcard ? memcard : "";
+    ps2::g_options.on_memcard_saved = [] {   // the card file was rewritten (a save, a format)
+        std::fprintf(stderr, "[mc] card written: %s\n", ps2::g_options.memcard_path.c_str());
+        fastboot_note("card_written");
+    };
     ps2::g_options.trace_iop_modules = std::getenv("HP_IOPTRACE") != nullptr;
     ps2::g_options.trace_iop_hle = std::getenv("HP_IOPTRACE") && std::string(std::getenv("HP_IOPTRACE")) == "2";
     if (!ps2::disc::open(iso)) std::fprintf(stderr, "[iop] cannot open disc image %s\n", iso);
@@ -156,12 +161,21 @@ void iopb_vblank(int start) {
     std::lock_guard<std::recursive_mutex> lk(g_lock);
     advance_locked();
     ps2::iop::vblank(start != 0);
+    // memory card writes reach the file once the card has been idle for 50 vblanks (nothing
+    // called this before: saves were never written to disk)
+    if (start) ps2::iop::sio2::flush_cards();
 }
 
 void iopb_set_pad(int pad, uint16_t pressed, const uint8_t axes[4]) {
     std::lock_guard<std::recursive_mutex> lk(g_lock);
     ps2::iop::sio2::set_buttons(pad, pressed);
     for (int a = 0; a < 4; ++a) ps2::iop::sio2::set_axis(pad, a, axes[a]);
+}
+
+// write pending memory card changes now (before the process ends)
+void iopb_mc_flush(void) {
+    std::lock_guard<std::recursive_mutex> lk(g_lock);
+    for (int k = 0; k < 64; ++k) ps2::iop::sio2::flush_cards();   // past its 50-tick idle wait
 }
 
 void iopb_set_audio_sink(void (*sink)(const int16_t *samples, size_t frames)) { g_sink = sink; }
