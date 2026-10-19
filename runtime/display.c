@@ -35,8 +35,21 @@ void display_vsync(void) {
     if (h > MAXH) h = MAXH;
     if (w <= 0 || h <= 0) return;
     pthread_mutex_lock(&fm);
-    extern int g_gs_gpu;
+    extern int g_gs_gpu, g_gs_mirror;
     extern int gsb_display(uint64_t, uint64_t, const uint64_t *, const uint64_t *, uint32_t *, uint32_t, int *, int *);
+    /* HP_SHOT=dir: write frame_<vsync>.ppm every 60 vsyncs */
+    static const char *shot = (const char *)1;
+    if (shot == (const char *)1) shot = getenv("HP_SHOT");
+    /* the first frame shown at or after each multiple of HP_SHOTEVERY (with the GPU renderer a new
+       frame is not ready at every vsync) */
+    static unsigned long long next_shot;
+    static int every = -1;
+    if (every < 0) { every = getenv("HP_SHOTEVERY") ? atoi(getenv("HP_SHOTEVERY")) : 60; if (every <= 0) every = 60; next_shot = every; }
+    /* HP_GS=both: both renderers' frames of a screenshot are taken with the GS input held, so that
+       a buffer being drawn into (loading screens) shows the same packets in both */
+    extern pthread_mutex_t g_gs_lock;
+    const int mirror_shot = g_gs_mirror && shot && g_vsyncs >= next_shot;
+    if (mirror_shot) pthread_mutex_lock(&g_gs_lock);
     if (g_gs_gpu) {   /* the GPU renderer hands back the displayed frame */
         uint64_t fb2[2] = {hw_gs_priv(0x0070), hw_gs_priv(0x0090)}, disp2[2] = {hw_gs_priv(0x0080), hw_gs_priv(0x00a0)};
         if (!gsb_display(pmode, hw_gs_priv(0x0020), fb2, disp2, frame_buf, MAXW * MAXH, &w, &h)) { pthread_mutex_unlock(&fm); return; }
@@ -55,14 +68,6 @@ void display_vsync(void) {
             frame_buf[y * w + x] = c | 0xff000000u;
         }
     frame_w = w; frame_h = h; frame_new = 1;
-    /* HP_SHOT=dir: write frame_<vsync>.ppm every 60 vsyncs */
-    static const char *shot = (const char *)1;
-    if (shot == (const char *)1) shot = getenv("HP_SHOT");
-    /* the first frame shown at or after each multiple of HP_SHOTEVERY (with the GPU renderer a new
-       frame is not ready at every vsync) */
-    static unsigned long long next_shot;
-    static int every = -1;
-    if (every < 0) { every = getenv("HP_SHOTEVERY") ? atoi(getenv("HP_SHOTEVERY")) : 60; if (every <= 0) every = 60; next_shot = every; }
     if (shot && g_vsyncs >= next_shot) {
         next_shot = (g_vsyncs / every + 1) * every;
         char path[1100];
@@ -73,7 +78,6 @@ void display_vsync(void) {
             for (int i = 0; i < w * h; i++) { uint32_t c = frame_buf[i]; uint8_t px[3] = {(uint8_t)c, (uint8_t)(c >> 8), (uint8_t)(c >> 16)}; fwrite(px, 1, 3, f); }
             fclose(f);
         }
-        extern int g_gs_mirror;
         if (g_gs_mirror) {   /* HP_GS=both: the GPU renderer's frame from the same packets, gpu_<vsync>.ppm */
             static uint32_t gbuf[MAXW * MAXH];
             int gw = 0, gh = 0;
@@ -88,6 +92,7 @@ void display_vsync(void) {
             }
         }
     }
+    if (mirror_shot) pthread_mutex_unlock(&g_gs_lock);
     /* HP_SHOTFB=fbp,fbw,psm,w,h (hex fbp in 2048-word pages): also dump that buffer */
     static const char *fb = (const char *)1;
     if (fb == (const char *)1) fb = getenv("HP_SHOTFB");

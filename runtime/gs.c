@@ -883,6 +883,7 @@ int g_gs_census = -1;
 typedef struct { uint64_t k0, k1; unsigned long long prims; unsigned long long first; uint64_t dimx, fogcol; } CensusEnt;
 static CensusEnt census[2048];
 static int census_n;
+static unsigned long long census_xfer[4], census_xfer_px[4];
 static uint32_t census_rt[32];   /* frame base blocks drawn to so far */
 static int census_nrt;
 static pthread_mutex_t census_m = PTHREAD_MUTEX_INITIALIZER;
@@ -1011,7 +1012,8 @@ void gs_census_report(void) {
     for (int i = 0; i < 2048; i++) if (census[i].prims) sorted[n++] = census[i];
     qsort(sorted, n, sizeof sorted[0], census_cmp);
     extern unsigned long long g_vsyncs;
-    LOG("[gsstate report v%llu] %d distinct states\n", g_vsyncs, n);
+    LOG("[gsstate report v%llu] %d distinct states; transfers host->local %llu (%llu px), local->host %llu (%llu px), local->local %llu (%llu px)\n",
+        g_vsyncs, n, census_xfer[0], census_xfer_px[0], census_xfer[1], census_xfer_px[1], census_xfer[2], census_xfer_px[2]);
     for (int i = 0; i < n; i++) {
         char d[600];
         census_describe(&sorted[i], d, sizeof d);
@@ -1112,6 +1114,11 @@ static void xfer_put_pixel(uint32_t v) {
 }
 
 static void xfer_start(void) {
+    if (g_gs_census > 0) {   /* HP_GSSTATS: transfers by direction (host->local, local->host, local->local) */
+        int dir = bits(gs.trxdir, 0, 2);
+        census_xfer[dir]++;
+        census_xfer_px[dir] += bits(gs.trxreg, 0, 12) * bits(gs.trxreg, 32, 12);
+    }
     if (g_gs_gpu) { xfer.active = 0; dl.active = 0; return; }
     int dir = bits(gs.trxdir, 0, 2);
     uint64_t bb = gs.bitbltbuf;
