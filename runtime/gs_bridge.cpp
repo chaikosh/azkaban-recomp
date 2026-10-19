@@ -72,10 +72,48 @@ std::vector<std::uint32_t> g_frame;
 std::uint32_t g_frame_w = 0, g_frame_h = 0;
 std::uint64_t g_frame_serial = 0;
 
+// HP_GSREC=file records everything the vendored GS is given, in order, for tools/gsreplay
+// (renderer changes compared frame for frame on the same input, and GPU time measured without the
+// game): 'G' path qwc data | 'S' Show | 'R' qwords.  HP_GSRECMAX=MB stops it (default 4000).
+FILE *rec_file() {   // g_lock held
+    static FILE *f = nullptr;
+    static bool tried = false;
+    static std::uint64_t left = 0;
+    if (!tried) {
+        tried = true;
+        if (const char *p = std::getenv("HP_GSREC")) {
+            f = std::fopen(p, "wb");
+            if (f) {
+                static char buf[4 << 20];
+                std::setvbuf(f, buf, _IOFBF, sizeof buf);
+                std::fwrite("HPGSREC1", 1, 8, f);
+            }
+            left = static_cast<std::uint64_t>(std::getenv("HP_GSRECMAX") ? std::atoi(std::getenv("HP_GSRECMAX")) : 4000) << 20;
+        }
+    }
+    if (f && static_cast<std::uint64_t>(std::ftell(f)) > left) {
+        std::fclose(f);
+        f = nullptr;
+        std::fprintf(stderr, "[gsrec] size limit reached, recording stopped\n");
+    }
+    return f;
+}
+void rec_put(char tag, const void *a, std::size_t na, const void *b = nullptr, std::size_t nb = 0) {   // g_lock held
+    FILE *f = rec_file();
+    if (!f) return;
+    std::fputc(tag, f);
+    std::fwrite(a, 1, na, f);
+    if (nb) std::fwrite(b, 1, nb, f);
+}
+
 void render_batch(Batch &b) {   // g_lock held
     const double t0 = secs();
     std::size_t off = 0;
     for (const Run &r : b.runs) {
+        if (rec_file()) {
+            const std::uint32_t hdr[2] = {static_cast<std::uint32_t>(r.path), r.qwc};
+            rec_put('G', hdr, sizeof hdr, b.data.data() + off, static_cast<std::size_t>(r.qwc) * 16);
+        }
         ps2::gif::render(r.path + 1, b.data.data() + off, r.qwc);
         off += static_cast<std::size_t>(r.qwc) * 16;
     }
@@ -100,6 +138,7 @@ bool source_of(const Show &r, ps2::gs::gpu::DisplaySource &src) {
 // Reads back the displayed buffer (asynchronously: the newest finished copy) into g_frame.
 void show_frame(const Show &r) {   // g_lock held
     const double t0 = secs();
+    rec_put('S', &r, sizeof r);
     ps2::gs::gpu::DisplaySource src;
     if (source_of(r, src)) {
         static std::vector<std::uint32_t> rgba;
@@ -237,6 +276,7 @@ void gsb_read_image(uint8_t *dst, uint32_t qwords) {
     }
     wait_idle();
     std::lock_guard<std::mutex> lk(g_lock);
+    rec_put('R', &qwords, sizeof qwords);
     ps2::gs::read_image(dst, qwords);
     g_download_s += secs() - t0;
 }

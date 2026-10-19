@@ -146,6 +146,10 @@ struct Batch {
     Range fb_range, z_range;
     // hp: the 8 KB pages of local memory the batch's primitives write (frame and Z), by bbox
     std::uint64_t fb_pages[8] = {}, z_pages[8] = {};
+    // hp: the frame bits each primitive may write (FBMSK), so a texture that reads other bits of
+    // the frame (alpha as a palette index, PSMT8H) does not end the batch
+    std::vector<std::uint32_t> wbits;
+    std::uint32_t wbits_all = 0;
 } g_batch;
 
 // hp: page sets.  region() spans from the buffer's base, so a texture kept anywhere between the
@@ -626,6 +630,8 @@ void flush_batch() {
     b.prims.clear();
     b.setups.clear();
     b.boxes.clear();
+    b.wbits.clear();
+    b.wbits_all = 0;
     std::memset(b.fb_pages, 0, sizeof b.fb_pages);
     std::memset(b.z_pages, 0, sizeof b.z_pages);
     g_batch_reads.clear();
@@ -1112,29 +1118,10 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w, 
     return flags;
 }
 
-bool texel_rect(const std::uint32_t *setup, const Vertex *v, int count, std::uint32_t prim, bool fst, int rect[4]) {
+// hp: wraps a span of texel indices by the CLAMP mode the way texel_x/texel_y do
+bool wrap_rect(const std::uint32_t *setup, int ua, int ub, int va, int vb, int rect[4]) {
     const int tw = 1 << (setup[15] & 0xFFu), th = 1 << (setup[15] >> 8);
-    float u0 = 1e30f, v0 = 1e30f, u1 = -1e30f, v1 = -1e30f;
-    for (int i = 0; i < count; ++i) {
-        float u, t;
-        if (fst) {
-            u = static_cast<float>(v[i].u) / 16.0f;
-            t = static_cast<float>(v[i].v) / 16.0f;
-        } else {
-            const float q = prim == 6 ? v[count - 1].q : v[i].q;
-            if (!(q > 0.0f) || !(v[0].q > 0.0f) || !(v[count - 1].q > 0.0f)) return false;
-            u = v[i].s / q * static_cast<float>(tw);
-            t = v[i].t / q * static_cast<float>(th);
-        }
-        if (!std::isfinite(u) || !std::isfinite(t)) return false;
-        u0 = std::min(u0, u);
-        u1 = std::max(u1, u);
-        v0 = std::min(v0, t);
-        v1 = std::max(v1, t);
-    }
-    const auto axis = [](std::uint32_t mode, float lo, float hi, int size, std::uint32_t clamp, int &a, int &b) {
-        a = static_cast<int>(std::floor(lo)) - 1;
-        b = static_cast<int>(std::ceil(hi)) + 1;
+    const auto axis = [](std::uint32_t mode, int size, std::uint32_t clamp, int &a, int &b) {
         switch (mode) {
         case 0:
             if (a < 0 || b >= size) {
@@ -1155,8 +1142,7 @@ bool texel_rect(const std::uint32_t *setup, const Vertex *v, int count, std::uin
         default: return false;
         }
     };
-    int ua, ub, va, vb;
-    if (!axis((setup[7] >> 24) & 3u, u0, u1, tw, setup[18], ua, ub) || !axis((setup[7] >> 26) & 3u, v0, v1, th, setup[19], va, vb)) return false;
+    if (!axis((setup[7] >> 24) & 3u, tw, setup[18], ua, ub) || !axis((setup[7] >> 26) & 3u, th, setup[19], va, vb)) return false;
     rect[0] = std::max(ua, 0);
     rect[1] = std::max(va, 0);
     rect[2] = std::max(ub, 0);
@@ -1164,16 +1150,105 @@ bool texel_rect(const std::uint32_t *setup, const Vertex *v, int count, std::uin
     return true;
 }
 
+bool texel_rect(const std::uint32_t *setup, const Vertex *v, int count, std::uint32_t prim, bool fst, int rect[4]) {
+    const int tw = 1 << (setup[15] & 0xFFu), th = 1 << (setup[15] >> 8);
+    float u0 = 1e30f, v0 = 1e30f, u1 = -1e30f, v1 = -1e30f;
+    for (int i = 0; i < count; ++i) {
+        float u, t;
+        if (fst) {
+            u = static_cast<float>(v[i].u) / 16.0f;
+            t = static_cast<float>(v[i].v) / 16.0f;
+        } else {
+            const float q = prim == 6 ? v[count - 1].q : v[i].q;
+            if (!(q > 0.0f) || !(v[0].q > 0.0f) || !(v[count - 1].q > 0.0f)) return false;
+            u = v[i].s / q * static_cast<float>(tw);
+            t = v[i].t / q * static_cast<float>(th);
+        }
+        if (!std::isfinite(u) || !std::isfinite(t)) return false;
+        u0 = std::min(u0, u);
+        u1 = std::max(u1, u);
+        v0 = std::min(v0, t);
+        v1 = std::max(v1, t);
+    }
+    return wrap_rect(setup, static_cast<int>(std::floor(u0)) - 1, static_cast<int>(std::ceil(u1)) + 1,
+                     static_cast<int>(std::floor(v0)) - 1, static_cast<int>(std::ceil(v1)) + 1, rect);
+}
+
+// hp: the texels a sprite samples, interpolated at its first and last sample positions the way
+// the raster kernel does it (case 1 of shade_at), instead of the vertex span padded by a texel.
+// The padding made 8-pixel channel-shuffle strips and 2-row scrolls look like they read the
+// strip drawn just before them, and each one ended the batch.
+bool sprite_texels(const std::uint32_t *setup, const Vertex *v, bool fst, float x0, float y0, float dx, float dy,
+                   int minx, int miny, int maxx, int maxy, int rect[4]) {
+    const int tw = 1 << (setup[15] & 0xFFu), th = 1 << (setup[15] >> 8);
+    float q = 1.0f;
+    if (!fst) {
+        q = v[1].q == 0.0f ? 1.0f : v[1].q;
+        if (!(q > 0.0f) || !std::isfinite(q)) return false;
+    }
+    const bool bilinear = setup[0] & 16384u;
+    const float sub = static_cast<float>(g_scale - 1) / static_cast<float>(g_scale);
+    const auto span = [&](float a, float b, float o, float d, int lo, int hi, int size, int &ta, int &tb) {
+        float u[2], e[2];
+        for (int i = 0; i < 2; ++i) {
+            const float px = i ? static_cast<float>(hi) + sub : static_cast<float>(lo);
+            const float t = d != 0.0f ? (px - o) / d : 0.0f;
+            const float sv = a + (b - a) * t;
+            u[i] = fst ? sv / 16.0f : sv / q * static_cast<float>(size);
+            if (!std::isfinite(u[i])) return false;
+            // at the vertex itself (t == 0) the kernel gets the vertex value bit for bit; anywhere
+            // else allow for its division rounding differently
+            e[i] = (t == 0.0f && (fst || q == 1.0f)) ? 0.0f : 1.0f / 256.0f + std::fabs(u[i]) * 1e-5f;
+        }
+        const int k = u[0] <= u[1] ? 0 : 1;
+        const float ulo = u[k] - e[k], uhi = u[1 - k] + e[1 - k];
+        if (bilinear) {
+            ta = static_cast<int>(std::floor(ulo - 0.5f));
+            tb = static_cast<int>(std::floor(uhi - 0.5f)) + 1;
+        } else {
+            ta = static_cast<int>(std::floor(ulo));
+            tb = static_cast<int>(std::floor(uhi));
+        }
+        return true;
+    };
+    const float sa = fst ? static_cast<float>(v[0].u) : v[0].s, sb = fst ? static_cast<float>(v[1].u) : v[1].s;
+    const float ta_ = fst ? static_cast<float>(v[0].v) : v[0].t, tb_ = fst ? static_cast<float>(v[1].v) : v[1].t;
+    int ua, ub, va, vb;
+    if (!span(sa, sb, x0, dx, minx, maxx, tw, ua, ub) || !span(ta_, tb_, y0, dy, miny, maxy, th, va, vb)) return false;
+    return wrap_rect(setup, ua, ub, va, vb, rect);
+}
+
+// hp: the frame bits a primitive can change, and the frame bits a texture of the same 32-bit
+// layout reads
+std::uint32_t written_bits(const std::uint32_t *setup) {
+    switch (setup[3]) {
+    case 0x00u: return ~setup[4];
+    case 0x01u: return ~setup[4] & 0x00FFFFFFu;
+    default: return 0xFFFFFFFFu;
+    }
+}
+std::uint32_t read_bits(const std::uint32_t *setup) {
+    switch (setup[14]) {
+    case 0x01u: return 0x00FFFFFFu;
+    case 0x1Bu: return 0xFF000000u;
+    case 0x24u: return 0x0F000000u;
+    case 0x2Cu: return 0xF0000000u;
+    default: return 0xFFFFFFFFu;
+    }
+}
+
 bool shares_frame(const std::uint32_t *setup, const Batch &b) {
     const auto wide = [](std::uint32_t psm) { return psm == PSMCT32 || psm == PSMCT24 || psm == PSMT8H || psm == PSMT4HL || psm == PSMT4HH; };
     return setup[12] == b.fbp && setup[13] == b.fbw && (setup[14] == b.fpsm || (wide(setup[14]) && wide(b.fpsm)));
 }
 
-bool drawn_under(const Batch &b, const int rect[4]) {
+bool drawn_under(const Batch &b, const int rect[4], std::uint32_t bits) {
     const auto hits = [&](int x0, int y0, int x1, int y1) { return rect[0] <= x1 && x0 <= rect[2] && rect[1] <= y1 && y0 <= rect[3]; };
+    if (!(b.wbits_all & bits)) return false;
     const std::size_t prims = b.boxes.size() / 2;
     if (prims > 64) return hits(b.minx, b.miny, b.maxx, b.maxy);
     for (std::size_t i = 0; i < prims; ++i) {
+        if (!(b.wbits[i] & bits)) continue;
         const std::uint32_t lo = b.boxes[i * 2], hi = b.boxes[i * 2 + 1];
         if (hits(static_cast<int>(lo & 0xFFFFu), static_cast<int>(lo >> 16), static_cast<int>(hi & 0xFFFFu), static_cast<int>(hi >> 16))) return true;
     }
@@ -1488,7 +1563,10 @@ void draw(const State &st, const Vertex *v, int count) {
             const auto written = [&](const Range &t) { return t.overlaps(b.fb_range.lo, b.fb_range.hi) || (b.zwrite && t.overlaps(b.z_range.lo, b.z_range.hi)); };
             int rect[4];
             if (written(tex)) {
-                if (!texel_rect(setup, v, count, prim, fst, rect)) {
+                static const bool loose = std::getenv("HP_GPULOOSETEX") != nullptr;   // the padded vertex span
+                const bool got = (prim == 6 && !loose) ? sprite_texels(setup, v, fst, sx(v[0]), sy(v[0]), sx(v[1]) - sx(v[0]), sy(v[1]) - sy(v[0]), minx, miny, maxx, maxy, rect)
+                                                       : texel_rect(setup, v, count, prim, fst, rect);
+                if (!got) {
                     { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); emit_all(); }
                 } else {
                     const Range used = region(setup[12], setup[13], setup[14], rect[0], rect[1], rect[2], rect[3]);
@@ -1501,8 +1579,22 @@ void draw(const State &st, const Vertex *v, int count) {
                                                            : hits_pages(b.z_pages, setup[12], setup[13], setup[14], rect[0], rect[1], rect[2], rect[3]));
                     const bool same = shares_frame(setup, b);
                     static const bool nofeedback = std::getenv("HP_NOFEEDBACK") != nullptr;   // experiment only: wrong for effects
-                    const bool frame = !cached && (same ? (!nofeedback && drawn_under(b, rect)) : fb_hit);
+                    const bool frame = !cached && (same ? (!nofeedback && drawn_under(b, rect, loose ? 0xFFFFFFFFu : read_bits(setup))) : fb_hit);
                     if (frame) hp_flush_note(same ? (b.boxes.size() / 2 > 64 ? 4001 : 4002) : 4003);
+                    {   // hp: HP_FEEDBACKLOG=n logs the first n same-buffer feedback primitives
+                        static int left = std::getenv("HP_FEEDBACKLOG") ? std::atoi(std::getenv("HP_FEEDBACKLOG")) : 0;
+                        if (frame && same && left > 0) {
+                            --left;
+                            std::fprintf(stderr, "[fb] prim %u xy %d,%d-%d,%d texel %d,%d-%d,%d tex0 %08x%08x tex1 filt %u fst %d batch %zu prims bbox %d,%d-%d,%d\n",
+                                         prim, minx, miny, maxx, maxy, rect[0], rect[1], rect[2], rect[3],
+                                         static_cast<unsigned>(c.tex0 >> 32), static_cast<unsigned>(c.tex0), static_cast<unsigned>((c.tex1 >> 5) & 7u), fst ? 1 : 0,
+                                         b.boxes.size() / 2, b.minx, b.miny, b.maxx, b.maxy);
+                            std::fprintf(stderr, "[fbv] fbmsk %08x fpsm %u v0 %u,%u s %g t %g q %g uv %u,%u v1 %u,%u s %g t %g q %g uv %u,%u\n",
+                                         static_cast<unsigned>(c.frame >> 32), setup[3],
+                                         v[0].x, v[0].y, v[0].s, v[0].t, v[0].q, v[0].u, v[0].v,
+                                         v[count - 1].x, v[count - 1].y, v[count - 1].s, v[count - 1].t, v[count - 1].q, v[count - 1].u, v[count - 1].v);
+                        }
+                    }
                     if (!frame && z_hit) hp_flush_note(4004);
                     if (frame || z_hit) { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); emit_all(); }
                 }
@@ -1544,6 +1636,8 @@ void draw(const State &st, const Vertex *v, int count) {
     b.prims.insert(b.prims.end(), rec, rec + kPrimWords);
     b.boxes.push_back(rec[2]);
     b.boxes.push_back(rec[3]);
+    b.wbits.push_back(written_bits(setup));
+    b.wbits_all |= b.wbits.back();
     mark_pages(b.fb_pages, b.fbp, b.fbw, b.fpsm, minx, miny, maxx, maxy);
     if (b.zwrite) mark_pages(b.z_pages, b.zbp, b.fbw, b.zpsm, minx, miny, maxx, maxy);
     b.minx = std::min(b.minx, minx);

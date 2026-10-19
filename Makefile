@@ -45,7 +45,7 @@ GEN_SRC   = $(wildcard $(GEN)/*.c)
 RT_OBJ   := $(patsubst %.c,$(OBJDIR)/obj/%.o,$(RT_SRC))
 GEN_OBJ   = $(patsubst $(GEN)/%.c,$(OBJDIR)/obj/gen/%.o,$(GEN_SRC))
 
-.PHONY: all recomp run clean link
+.PHONY: all recomp run clean link gsreplay
 all: $(OUT)/hp
 
 recomp: $(GEN)/funcs.h
@@ -91,6 +91,13 @@ $(OBJDIR)/obj/%.o: %.c runtime/*.h
 $(OBJDIR)/obj/gen/%.o: $(GEN)/%.c runtime/ee.h runtime/ee_gen.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# tools/gsreplay: replays an HP_GSREC trace through the GPU renderer (frames, timing)
+GSR_OBJ  := $(patsubst %.cpp,$(OBJDIR)/obj/%.o,$(wildcard $(GS_DIR)/src/gs/*.cpp) $(GS_DIR)/src/gs/gpu/gpu.cpp tools/gsreplay.cpp) $(WGSL_OBJ)
+gsreplay: $(OBJDIR)/gsreplay
+$(OBJDIR)/gsreplay: $(GSR_OBJ) | $(WGPU_LIB)
+	$(CXX) $(CFLAGS) $(WGPU_LIB) -framework Metal -framework QuartzCore -framework Foundation -framework CoreFoundation \
+	    -framework IOKit -framework IOSurface -lobjc -o $@ $^
 
 run: all
 	$(OUT)/hp $(REC)/image.bin disc
