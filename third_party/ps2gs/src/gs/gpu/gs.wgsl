@@ -442,9 +442,6 @@ struct Setup {
     clut: u32,
     zmax: u32,
     dec: u32,
-    tf: Fmt,
-    ff: Fmt,
-    zf: Fmt,
 }
 
 const F_IIP: u32 = 1u;
@@ -497,10 +494,13 @@ fn load_setup(at: u32) -> Setup {
     s.clut = data[at + 22u];
     s.zmax = data[at + 23u];
     s.dec = data[at + 24u];
-    s.tf = fmt_of(s.tpsm, s.tbp, s.tbw);
-    s.ff = fmt_of(s.fpsm, s.fbp, s.fbw);
-    s.zf = fmt_of(s.zpsm, s.zbp, s.fbw);
+    // hp: the address formats (texture, frame, Z) are worked out where they are used, so a
+    // primitive without a texture or a depth test does not pay for them
     return s;
+}
+
+fn fmt_tex(s: Setup) -> Fmt {
+    return fmt_of(s.tpsm, s.tbp, s.tbw);
 }
 
 fn has(s: Setup, f: u32) -> bool {
@@ -575,7 +575,7 @@ fn fetch(s: Setup, xi: i32, yi: i32, k: u32) -> u32 {
     if (s.dec != 0xFFFFFFFFu) {
         return decoded[s.dec + (y << s.tw) + x];
     }
-    return convert(s, load_texel(addr(s.tf, x, y), k));
+    return convert(s, load_texel(addr(fmt_tex(s), x, y), k));
 }
 
 fn convert(s: Setup, raw: u32) -> u32 {
@@ -718,7 +718,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
     let ux = u32(x);
     let uy = u32(y);
     let z = min(at.z, s.zmax);
-    let fl = addr(s.ff, ux, uy);
+    let fl = addr(fmt_of(s.fpsm, s.fbp, s.fbw), ux, uy);
     var zl = Loc(0u, 0u, 0u);
 
     var dst = 0u;
@@ -737,7 +737,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
         if (ztst == 0u) {
             return;
         }
-        zl = addr(s.zf, ux, uy);
+        zl = addr(fmt_of(s.zpsm, s.zbp, s.fbw), ux, uy);
         if (ztst != 1u) {
             let old = load_at(zl, k) & s.zmax;
             if ((ztst == 2u && z < old) || (ztst == 3u && z <= old)) {
@@ -1097,7 +1097,7 @@ fn decode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let s = load_setup(prm(0u));
     let x = i & ((1u << s.tw) - 1u);
     let y = i >> s.tw;
-    decoded[prm(1u) + i] = convert(s, load_at(addr(s.tf, x, y), 0u));
+    decoded[prm(1u) + i] = convert(s, load_at(addr(fmt_tex(s), x, y), 0u));
 }
 
 @compute @workgroup_size(64)
@@ -1140,21 +1140,17 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
     let setups = prm(2u);
     snapshot_lo = prm(5u);
     snapshot_hi = prm(6u);
-    var last_setup = 0xFFFFFFFFu;
-    var s: Setup;
     for (var i = 0u; i < count; i = i + 1u) {
         let h = first + i;
         let p = prims + ((data[lists + (h >> 1u)] >> ((h & 1u) * 16u)) & 0xFFFFu) * PRIM_WORDS;
-        let si = data[p];
-        if (si != last_setup) {
-            s = load_setup(setups + si * SETUP_WORDS);
-            last_setup = si;
-        }
         let lo = data[p + 2u];
         let hi = data[p + 3u];
         if (x < i32(lo & 0xFFFFu) || y < i32(lo >> 16u) || x > i32(hi & 0xFFFFu) || y > i32(hi >> 16u)) {
             continue;
         }
+        // hp: the setup is loaded for each primitive that covers the pixel instead of kept from
+        // the last one: ~46 values live across the whole loop held the kernel's occupancy down
+        let s = load_setup(setups + data[p] * SETUP_WORDS);
         shade_at(p, s, x, y, k, px, py);
     }
 }
