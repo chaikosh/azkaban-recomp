@@ -88,7 +88,8 @@ WGPUShaderModule g_module = nullptr;
 // The key also carries the setup flags every primitive of the batch has (FLAGS_ON) or lacks
 // (FLAGS_OFF), whether all its textures are decoded (DECODED), the texture format if all share
 // one (TPSM) and the bits of the modes word all setups agree on (MODES_ON/OFF):
-// a = fpsm | zpsm << 8 | on << 16 | off << 32 | decoded << 48 | tpsm << 49, b = modes on | off << 32.
+// a = fpsm | zpsm << 8 | on << 16 | off << 32 | decoded << 48 | tpsm << 49 | dither on << 57 | dither off << 58
+// (setup flag 65536, DTHE into a 16-bit frame), b = modes on | off << 32.
 struct VariantKey {
     std::uint64_t a, b;
     bool operator==(const VariantKey &o) const { return a == o.a && b == o.b; }
@@ -159,8 +160,14 @@ WGPUComputePipeline raster_variant(const std::uint32_t *setups, std::size_t coun
     }
     VariantKey key{fpsm | (zpsm << 8), 0};
     if (flags_on) {
+        bool dither_all = count > 0, dither_any = false;
+        for (std::size_t i = 0; i < count; ++i) {
+            const bool d = (setups[i * kSetupWords] & 65536u) != 0;
+            dither_all = dither_all && d;
+            dither_any = dither_any || d;
+        }
         key.a |= (static_cast<std::uint64_t>(all & 0xFFFFu) << 16) | (static_cast<std::uint64_t>(~any & 0xFFFFu) << 32) | (static_cast<std::uint64_t>(decoded) << 48) |
-                 (static_cast<std::uint64_t>(tpsm & 0xFFu) << 49);
+                 (static_cast<std::uint64_t>(tpsm & 0xFFu) << 49) | (static_cast<std::uint64_t>(dither_all) << 57) | (static_cast<std::uint64_t>(!dither_any) << 58);
         key.b = mall | (static_cast<std::uint64_t>(~many) << 32);
     } else {
         key.a |= 0xFFull << 49;
@@ -1000,9 +1007,9 @@ WGPUComputePipeline make_pipeline(int entry, const VariantKey *variant) {
     constants[3].key = view("ZPSM");
     constants[3].value = generic ? 4294967295.0 : static_cast<double>((key >> 8) & 0xFFu);
     constants[4].key = view("FLAGS_ON");
-    constants[4].value = generic ? 0.0 : static_cast<double>((key >> 16) & 0xFFFFu);
+    constants[4].value = generic ? 0.0 : static_cast<double>(((key >> 16) & 0xFFFFu) | (((key >> 57) & 1u) << 16));
     constants[5].key = view("FLAGS_OFF");
-    constants[5].value = generic ? 0.0 : static_cast<double>((key >> 32) & 0xFFFFu);
+    constants[5].value = generic ? 0.0 : static_cast<double>(((key >> 32) & 0xFFFFu) | (((key >> 58) & 1u) << 16));
     constants[6].key = view("DECODED");
     constants[6].value = generic ? 0.0 : static_cast<double>((key >> 48) & 1u);
     constants[7].key = view("TPSM");

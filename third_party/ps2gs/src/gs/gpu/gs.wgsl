@@ -969,8 +969,8 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
         }
         // like the GS: dither after blending, then COLCLAMP (clamp or keep the low 8 bits);
         // the 16-bit format keeps the top 5 bits (pack16)
-        // (a kernel specialised on a 32-bit frame format has no dithering code)
-        if ((FPSM == 0xFFFFFFFFu || FPSM == PSMCT16 || FPSM == PSMCT16S || FPSM == PSMZ16 || FPSM == PSMZ16S) && has(s, F_DTHE)) {
+        // (F_DTHE is folded into the kernels of batches that all dither or none does: FLAGS_ON/OFF)
+        if (has(s, F_DTHE)) {
             let dm = dither_value(x, y);
             r = r + dm;
             g = g + dm;
