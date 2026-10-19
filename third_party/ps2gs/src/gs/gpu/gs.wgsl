@@ -676,20 +676,22 @@ fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
 }
 
 // Bilinear filter in fixed point like the software GS (runtime/gs.c tex_sample): 8-bit weights,
-// a horizontal then a vertical lerp, each truncated, (a * (256 - f) + b * f) >> 8.
-fn lerp8(a: u32, b: u32, f: u32) -> u32 {
+// a horizontal then a vertical lerp, each truncated, (a * (256 - f) + b * f) >> 8.  Computed in
+// float, which is exact here (integers below 2^24, divided by a power of two).
+fn blend4(c00: u32, c10: u32, c01: u32, c11: u32, fx: f32, fy: f32) -> u32 {
+    let fu = floor(clamp(fx * 256.0, 0.0, 255.0));
+    let fv = floor(clamp(fy * 256.0, 0.0, 255.0));
     var out = 0u;
     for (var ch = 0u; ch < 32u; ch = ch + 8u) {
-        let v = (((a >> ch) & 0xFFu) * (256u - f) + ((b >> ch) & 0xFFu) * f) >> 8u;
-        out = out | (v << ch);
+        let a = f32((c00 >> ch) & 0xFFu);
+        let b = f32((c10 >> ch) & 0xFFu);
+        let c = f32((c01 >> ch) & 0xFFu);
+        let d = f32((c11 >> ch) & 0xFFu);
+        let top = floor((a * (256.0 - fu) + b * fu) * (1.0 / 256.0));
+        let bottom = floor((c * (256.0 - fu) + d * fu) * (1.0 / 256.0));
+        out = out | (u32(floor((top * (256.0 - fv) + bottom * fv) * (1.0 / 256.0))) << ch);
     }
     return out;
-}
-
-fn blend4(c00: u32, c10: u32, c01: u32, c11: u32, fx: f32, fy: f32) -> u32 {
-    let fu = u32(clamp(fx * 256.0, 0.0, 255.0));
-    let fv = u32(clamp(fy * 256.0, 0.0, 255.0));
-    return lerp8(lerp8(c00, c10, fu), lerp8(c01, c11, fu), fv);
 }
 
 fn read_frame(s: Setup, l: Loc, k: u32) -> u32 {
@@ -967,7 +969,8 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
         }
         // like the GS: dither after blending, then COLCLAMP (clamp or keep the low 8 bits);
         // the 16-bit format keeps the top 5 bits (pack16)
-        if (has(s, F_DTHE)) {
+        // (a kernel specialised on a 32-bit frame format has no dithering code)
+        if ((FPSM == 0xFFFFFFFFu || FPSM == PSMCT16 || FPSM == PSMCT16S || FPSM == PSMZ16 || FPSM == PSMZ16S) && has(s, F_DTHE)) {
             let dm = dither_value(x, y);
             r = r + dm;
             g = g + dm;
