@@ -12,6 +12,10 @@ struct Params {
 @group(0) @binding(7) var<storage, read_write> decoded: array<u32>;
 
 override SCALE: u32 = 1u;
+// hp: HP_EXP=bits switches parts of the raster kernel off, to measure what they cost on a GS trace
+// (tools/gsreplay): 1 no shading, 4 no texture sampling, 32 point sampling only, 64 no texel
+// loads, 128 no texel loads outside the decode buffer.  0 in normal use.
+override EXP: u32 = 0u;
 
 const PSMCT32: u32 = 0x00u;
 const PSMCT24: u32 = 0x01u;
@@ -562,6 +566,12 @@ fn load_texel(l: Loc, k: u32) -> u32 {
 fn fetch(s: Setup, xi: i32, yi: i32, k: u32) -> u32 {
     let x = texel_x(s, xi);
     let y = texel_y(s, yi);
+    if ((EXP & 64u) != 0u) {
+        return (x * 2654435761u) ^ (y * 40503u);
+    }
+    if ((EXP & 128u) != 0u && s.dec == 0xFFFFFFFFu) {
+        return (x * 2654435761u) ^ (y * 40503u);
+    }
     if (s.dec != 0xFFFFFFFFu) {
         return decoded[s.dec + (y << s.tw) + x];
     }
@@ -604,7 +614,7 @@ fn convert(s: Setup, raw: u32) -> u32 {
 }
 
 fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
-    if (!has(s, F_BILINEAR)) {
+    if (!has(s, F_BILINEAR) || (EXP & 32u) != 0u) {
         return fetch(s, i32(floor(uin)), i32(floor(vin)), k);
     }
     let u = uin - 0.5;
@@ -754,7 +764,10 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
             u = at.s / q * f32(1u << s.tw);
             v = at.t / q * f32(1u << s.th);
         }
-        let t = sample(s, u, v, k);
+        var t = 0x80808080u;
+        if ((EXP & 4u) == 0u) {
+            t = sample(s, u, v, k);
+        }
         let tr = i32(t & 0xFFu);
         let tg = i32((t >> 8u) & 0xFFu);
         let tb = i32((t >> 16u) & 0xFFu);
@@ -952,6 +965,9 @@ fn edge_in(w: f32, inclusive: u32) -> bool {
 }
 
 fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
+    if ((EXP & 1u) != 0u) {
+        return;
+    }
     let kind = data[p + 1u];
     var at: Attr;
     switch kind {

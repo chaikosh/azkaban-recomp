@@ -136,8 +136,11 @@ bool source_of(const Show &r, ps2::gs::gpu::DisplaySource &src) {
 }
 
 // Reads back the displayed buffer (asynchronously: the newest finished copy) into g_frame.
+unsigned long long g_shows_done = 0;   // frame requests run by the GS thread (for the [fps] line)
+
 void show_frame(const Show &r) {   // g_lock held
     const double t0 = secs();
+    ++g_shows_done;
     rec_put('S', &r, sizeof r);
     ps2::gs::gpu::DisplaySource src;
     if (source_of(r, src)) {
@@ -335,6 +338,13 @@ void gsb_times(double *gif, double *display, double *download) {
     *display = g_display_s;
     *download = g_download_s;
 }
+
+/* GPU time of the GS's compute passes so far (ms, from timestamps on a sample of the passes);
+   read without the GS lock (an estimate for the [fps] line). */
+double gsb_gpu_busy_ms(void) {
+    return g_ready ? ps2::gs::gpu::busy_ms() : 0.0;
+}
+unsigned long long gsb_shows(void) { return g_shows_done; }
 
 void gsb_stats(void) {
     std::lock_guard<std::mutex> lk(g_lock);

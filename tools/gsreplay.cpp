@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace ps2 {
@@ -79,12 +80,25 @@ int main(int argc, char **argv) {
             if (std::fread(&r, sizeof r, 1, f) != 1) break;
             const long n = frames++;
             ++ps2::g_frames;
+            // HP_REPLAYPACE=fps: frame requests no faster than the game makes them
+            static const double pace = std::getenv("HP_REPLAYPACE") ? std::atof(std::getenv("HP_REPLAYPACE")) : 0.0;
+            if (pace > 0) {
+                static const double start = secs();
+                const double due = start + static_cast<double>(n) / pace;
+                while (secs() < due) std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
             static const bool every100 = std::getenv("HP_REPLAYSTEPS") != nullptr;
             static double t_last = secs();
             if (every100 && n % 100 == 0 && n) {
-                std::fprintf(stderr, "gsreplay: frames %ld-%ld %.2f ms/frame\n", n - 100, n, (secs() - t_last) * 10);
+                static double b_last = 0;
+                const double b = ps2::gs::gpu::busy_ms();
+                std::fprintf(stderr, "gsreplay: frames %ld-%ld %.2f ms/frame, GPU passes %.2f ms/frame\n", n - 100, n, (secs() - t_last) * 10, (b - b_last) / 100);
                 t_last = secs();
+                b_last = b;
             }
+            // HP_REPLAYSHOWEVERY=n: run only every n-th frame request (what fewer requests would cost)
+            static const long show_every = std::getenv("HP_REPLAYSHOWEVERY") ? std::atol(std::getenv("HP_REPLAYSHOWEVERY")) : 1;
+            if (show_every > 1 && n % show_every) continue;
             ps2::gs::gpu::DisplaySource src;
             if (!source_of(r, src)) continue;
             const double ts = secs();
@@ -124,6 +138,7 @@ int main(int argc, char **argv) {
         }
     }
     const double t = secs() - t0;
+    std::fprintf(stderr, "gsreplay: GS passes on the GPU %.0f ms\n", ps2::gs::gpu::busy_ms());
     std::fprintf(stderr, "gsreplay: %ld frames (%ld written), %.1f MB GIF, %.2f s (%.2f ms/frame, readback %.2f s)\n", frames, written,
                  static_cast<double>(bytes) / (1 << 20), t, frames ? t * 1000 / static_cast<double>(frames) : 0.0, t_show);
     return 0;

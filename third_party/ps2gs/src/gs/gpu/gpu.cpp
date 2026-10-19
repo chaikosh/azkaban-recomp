@@ -467,10 +467,15 @@ Range pages(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, int x0, int y
 
 // hp: HP_GPUFLUSHLOG counts why primitive batches end (by source line), printed every 600 frames
 unsigned g_hp_flush_why[4096];
+std::uint64_t g_hp_dec[8];   // hp: HP_GPUFLUSHLOG decode census: small batch, region, budget, scaled, decoded, shared
 static inline void hp_flush_note(int line) { g_hp_flush_why[line & 4095]++; }
 void hp_flush_report() {
     static const bool on = std::getenv("HP_GPUFLUSHLOG") != nullptr;
     if (!on) return;
+    std::fprintf(stderr, "[gpu] texture setups: small batch %llu, region clamp or large %llu, over budget %llu, scaled %llu, decoded %llu, shared %llu, reused %llu; CLUT loads skipped %llu\n",
+                 (unsigned long long)g_hp_dec[0], (unsigned long long)g_hp_dec[1], (unsigned long long)g_hp_dec[2], (unsigned long long)g_hp_dec[3],
+                 (unsigned long long)g_hp_dec[4], (unsigned long long)g_hp_dec[5], (unsigned long long)g_hp_dec[6], (unsigned long long)g_hp_dec[7]);
+    std::memset(g_hp_dec, 0, sizeof g_hp_dec);
     std::fprintf(stderr, "[gpu] batch ends by line:");
     for (int k = 0; k < 4096; k++) if (g_hp_flush_why[k]) { std::fprintf(stderr, " %d:%u", k, g_hp_flush_why[k]); g_hp_flush_why[k] = 0; }
     std::fprintf(stderr, "\n");
@@ -479,9 +484,17 @@ void hp_flush_report() {
 Range g_watch;
 bool g_watch_dirty = true;
 
+// hp: when each 8 KB page of local memory was last written (queued), for the decode cache below
+std::uint64_t g_vram_time = 0, g_page_time[512] = {};
+void mark_written(const Range &r) {
+    ++g_vram_time;
+    for (std::uint64_t at = r.lo & ~std::uint64_t(8191); at < r.hi; at += 8192) g_page_time[(at >> 13) & 511u] = g_vram_time;
+}
+
 void mark_rendered(const Range &r) {
     for (std::uint64_t at = r.lo; at < r.hi; at += 8192) g_rendered[(at >> 13) & 511u] = true;
     if (g_watch.overlaps(r.lo, r.hi)) g_watch_dirty = true;
+    mark_written(r);
 }
 
 bool rendered(const Range &r) {
@@ -495,10 +508,51 @@ struct Decode {
 };
 std::vector<Decode> g_decodes;
 
+// hp: textures decoded earlier in this submit, reused by later batches while none of their pages
+// has been written since (a frame drew the same textures in many batches and decoded each again,
+// so the 16 MB decode buffer ran out and most texels were read through the slow path).  CLUT
+// slots are not reused within a submit, so the slot is part of the key.  Cleared with the decode
+// buffer at every submit.
+struct DecodeEntry {
+    std::uint32_t key[9];
+    std::uint32_t offset, words;
+    std::uint64_t time;
+};
+std::vector<DecodeEntry> g_decode_cache;
+
+// hp: what each CLUT slot holds, as an id shared by loads that write the same entries (same
+// parameters, source pages not written in between).  A T8 texture's colours are the 256 loaded
+// entries; a T4 texture's are the 16 its CSA picks, which are the loaded ones when the CSAs agree.
+struct ClutLoad { std::uint32_t params[8]; std::uint64_t time; std::uint32_t id; };
+std::vector<ClutLoad> g_clut_recent;
+struct SlotInfo { std::uint32_t id = 0, csa = 0, csm = 0; bool eight = false; };
+std::vector<SlotInfo> g_slot_info;
+std::uint32_t g_next_palette = 1;
+// the palette part of a decode key: 0 when the colours do not follow from one load
+std::uint32_t palette_key(const std::uint32_t *w) {
+    const std::uint32_t tpsm = w[14];
+    const bool t8 = tpsm == 0x13u || tpsm == 0x1Bu, t4 = tpsm == 0x14u || tpsm == 0x24u || tpsm == 0x2Cu;
+    if (!t8 && !t4) return 0xFFFFFFFFu;
+    if (w[22] >= g_slot_info.size()) return 0;
+    const SlotInfo &si = g_slot_info[w[22]];
+    if (!si.id) return 0;
+    if (t8) return si.eight && (si.csm == 0 || si.csa == 0) ? si.id : 0;
+    return !si.eight && si.csa == w[17] ? si.id : 0;
+}
+bool decode_current(const DecodeEntry &e, const std::uint32_t *w) {
+    const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+    const Range r = region(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1);
+    for (std::uint64_t at = r.lo & ~std::uint64_t(8191); at < r.hi; at += 8192)
+        if (g_page_time[(at >> 13) & 511u] > e.time) return false;
+    return true;
+}
+
 void plan_decodes(std::uint32_t prims) {
     Batch &b = g_batch;
     g_decodes.clear();
-    if (!g_decode || prims <= kDecodePrims) return;
+    if (!g_decode) return;
+    // a small batch does not pay for decoding a whole texture, but takes one decoded earlier
+    const bool small = prims <= kDecodePrims;
     const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
     static const int kKey[] = {12, 13, 14, 15, 16, 17, 20, 22};
     for (std::uint32_t i = 0; i < setups; ++i) {
@@ -515,16 +569,42 @@ void plan_decodes(std::uint32_t prims) {
                 break;
             }
         }
-        if (shared) continue;
+        if (shared) { ++g_hp_dec[5]; continue; }
         const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
         const std::uint32_t mu = (w[7] >> 24) & 3u, mv = (w[7] >> 26) & 3u;
         const auto inside = [](std::uint32_t mode, std::uint32_t region, std::uint32_t size) { return mode < 2 || ((region & 0x3FFu) < (1u << size) && (region >> 16) < (1u << size)); };
-        if (!inside(mu, w[18], tw) || !inside(mv, w[19], th)) continue;
+        if (!inside(mu, w[18], tw) || !inside(mv, w[19], th)) { ++g_hp_dec[1]; continue; }
         const std::uint32_t words = 1u << (tw + th);
-        if (g_decoded_used + words > kDecodedWords) continue;
-        if (g_scale > 1 && rendered(pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1))) continue;
+        // hp: a texture the size of the frame buffer (2^19..2^20 texels, read by screen effects
+        // over a small part) took a quarter of the decode buffer each time and left the textures
+        // the scene reads every frame undecoded; those large ones are sampled in place
+        static const std::uint32_t max_log2 = std::getenv("HP_DECODEMAX") ? std::atoi(std::getenv("HP_DECODEMAX")) : 16;
+        if (tw + th > max_log2) { ++g_hp_dec[1]; continue; }
+        std::uint32_t key[9];
+        for (int k = 0; k < 8; ++k) key[k] = w[kKey[k]];
+        key[7] = palette_key(w);   // kKey[7] is the CLUT slot
+        key[8] = w[0] & 32768u;
+        DecodeEntry *hit = nullptr;
+        static const bool nocache = std::getenv("HP_NODECODECACHE") != nullptr;
+        if (key[7])
+            for (DecodeEntry &e : g_decode_cache)
+                if (!nocache && std::memcmp(e.key, key, sizeof key) == 0) { hit = &e; break; }
+        if (hit && decode_current(*hit, w)) {
+            ++g_hp_dec[6];
+            w[24] = hit->offset;
+            continue;
+        }
+        if (small) { ++g_hp_dec[0]; continue; }
+        if (g_decoded_used + words > kDecodedWords) { ++g_hp_dec[2]; continue; }
+        if (g_scale > 1 && rendered(pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1))) { ++g_hp_dec[3]; continue; }
+        ++g_hp_dec[4];
         w[24] = g_decoded_used;
         g_decodes.push_back({i, g_decoded_used, words});
+        if (key[7]) {
+            if (hit) *hit = DecodeEntry{{}, g_decoded_used, words, g_vram_time};
+            else g_decode_cache.push_back(DecodeEntry{{}, g_decoded_used, words, g_vram_time});
+            std::memcpy((hit ? hit : &g_decode_cache.back())->key, key, sizeof key);
+        }
         g_decoded_used += words;
     }
 }
@@ -708,6 +788,7 @@ void emit_all() {
 void queue_pre(const PreOp &op) {
     if (!op.clut && g_watch.overlaps(op.range.lo, op.range.hi)) g_watch_dirty = true;
     if (batch_conflict(op.range, op.clut)) { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); emit_all(); }
+    if (!op.clut) mark_written(op.range);   // after the batch it ends: that batch decodes before this lands
     g_pre.push_back(op);
 }
 
@@ -898,6 +979,7 @@ void profile_submit() {
     g_param_records.clear();
     g_arena.clear();
     g_decoded_used = 0;
+    g_decode_cache.clear();
     g_clut_loads = 0;
 }
 
@@ -996,6 +1078,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     g_param_records.clear();
     g_arena.clear();
     g_decoded_used = 0;
+    g_decode_cache.clear();
     g_clut_loads = 0;
 }
 
@@ -1420,11 +1503,13 @@ bool init(Mode m) {
         cd.layout = g_pipeline_layout;
         cd.compute.module = module;
         cd.compute.entryPoint = view(kEntryPoints[i]);
-        WGPUConstantEntry constant = WGPU_CONSTANT_ENTRY_INIT;
-        constant.key = view("SCALE");
-        constant.value = static_cast<double>(g_scale);
-        cd.compute.constantCount = 1;
-        cd.compute.constants = &constant;
+        WGPUConstantEntry constants[2] = {WGPU_CONSTANT_ENTRY_INIT, WGPU_CONSTANT_ENTRY_INIT};
+        constants[0].key = view("SCALE");
+        constants[0].value = static_cast<double>(g_scale);
+        constants[1].key = view("EXP");   // hp: HP_EXP=bits, raster-kernel experiments (gs.wgsl)
+        constants[1].value = std::getenv("HP_EXP") ? std::atof(std::getenv("HP_EXP")) : 0.0;
+        cd.compute.constantCount = 2;
+        cd.compute.constants = constants;
         g_pipelines[i] = wgpuDeviceCreateComputePipeline(g_device, &cd);
         if (!g_pipelines[i]) return false;
     }
@@ -1715,7 +1800,50 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     std::memcpy(op.rec, rec, sizeof rec);
     op.range = csm ? region(cbp, cbw, cpsm, static_cast<int>(cou * 16), static_cast<int>(cov), static_cast<int>(cou * 16 + 255), static_cast<int>(cov))
                    : region(cbp, 1, cpsm, 0, 0, 15, 15);
+    // hp: the game loads the CLUT with every TEX0 (CLD=1), mostly the same one again.  A load with
+    // the parameters of the load that made the current slot, from pages not written since, would
+    // write the same entries with the same values: the slot stays, so textures decoded with it are
+    // reused (decode cache) and the load does not end the batch.  HP_NOCLUTSKIP=1 loads every time.
+    static std::uint32_t last[8];
+    static std::uint64_t last_time = 0;
+    static bool have_last = false;
+    static const bool noskip = std::getenv("HP_NOCLUTSKIP") != nullptr;
+    if (!noskip && have_last && std::memcmp(last, rec + 2, sizeof last) == 0) {
+        bool clean = true;
+        for (std::uint64_t at = op.range.lo & ~std::uint64_t(8191); at < op.range.hi && clean; at += 8192) clean = g_page_time[(at >> 13) & 511u] <= last_time;
+        if (clean) {
+            ++g_hp_dec[7];
+            return;
+        }
+    }
     queue_pre(op);
+    std::memcpy(last, rec + 2, sizeof last);
+    last_time = g_vram_time;
+    have_last = true;
+    {   // the palette id of what this load leaves in the slot
+        std::uint32_t id = 0;
+        for (ClutLoad &l : g_clut_recent) {
+            if (std::memcmp(l.params, rec + 2, sizeof l.params)) continue;
+            bool clean = true;
+            for (std::uint64_t at = op.range.lo & ~std::uint64_t(8191); at < op.range.hi && clean; at += 8192) clean = g_page_time[(at >> 13) & 511u] <= l.time;
+            if (clean) id = l.id;
+            l.time = g_vram_time;
+            if (!clean) l.id = id = g_next_palette++;
+            break;
+        }
+        if (!id) {
+            id = g_next_palette++;
+            if (g_clut_recent.size() >= 64) g_clut_recent.erase(g_clut_recent.begin());
+            ClutLoad l{};
+            std::memcpy(l.params, rec + 2, sizeof l.params);
+            l.time = g_vram_time;
+            l.id = id;
+            g_clut_recent.push_back(l);
+        }
+        if (g_slot_info.size() < kClutSlots) g_slot_info.resize(kClutSlots);
+        // T4 loads keep the other entries of the slot they copy; only the loaded 16 are known
+        g_slot_info[next] = SlotInfo{id, rec[5], rec[4], rec[6] != 0};
+    }
     g_clut_slot = next;
     ++g_clut_loads;
 }

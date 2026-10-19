@@ -403,8 +403,13 @@ void hw_vblank(int start) {
                 {   /* where the time goes: per-thread CPU, and how long the EE slept in its frame wait */
                     extern unsigned long long g_idle_ns; static unsigned long long li;
                     extern void hp_thread_report(double wall);
-                    LOG("[fps] EE idle in frame wait %.0f%%; ", 100.0 * (g_idle_ns - li) / 1e9 / wall);
-                    li = g_idle_ns;
+                    extern int g_gs_gpu; extern double gsb_gpu_busy_ms(void); extern unsigned long long gsb_shows(void);
+                    static double lg; static unsigned long long ls;
+                    const double gb = g_gs_gpu ? gsb_gpu_busy_ms() : 0;
+                    const unsigned long long sh = g_gs_gpu ? gsb_shows() : 0;
+                    LOG("[fps] EE idle in frame wait %.0f%%, GS passes on the GPU %.0f%% (%.0f frame requests/s); ", 100.0 * (g_idle_ns - li) / 1e9 / wall,
+                        (gb - lg) / 10.0 / wall, (sh - ls) / wall);
+                    li = g_idle_ns; lg = gb; ls = sh;
                     hp_thread_report(wall);
                 }
                 memset(g_pace, 0, sizeof g_pace);
