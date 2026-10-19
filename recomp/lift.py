@@ -554,7 +554,7 @@ class FuncEmitter:
             k += 1
         if prev_ft is not None:
             body.append(self.goto_or_fall(prev_ft))
-        out.append(f"void {fname(f.start)}(EE *c) {{")
+        out.append(f"void {fname(f.start)}(EE *restrict c) {{")
         out.append("  RA_ENTER();")
         if pcs and pcs[0] != f.start:
             # code below the entry (a jump target shared with a neighbour) is emitted first
@@ -685,9 +685,9 @@ def emit_all(elf, an, out, per_file=150):
     with open(os.path.join(gen, "funcs.h"), "w") as fh:
         fh.write("#pragma once\n#include \"ee.h\"\n")
         for a in starts:
-            fh.write(f"void {fname(a)}(EE *c);\n")
+            fh.write(f"void {fname(a)}(EE *restrict c);\n")
         for a, name in sorted(hooks.items()):
-            fh.write(f"void {fname(a)}_orig(EE *c);\nvoid {name}(EE *c);\n")
+            fh.write(f"void {fname(a)}_orig(EE *restrict c);\nvoid {name}(EE *restrict c);\n")
     unimpl = {}
     nfiles = 0
     for n in range(0, len(starts), per_file):
@@ -701,8 +701,8 @@ def emit_all(elf, an, out, per_file=150):
             body = fe.emit()
             if a in hooks:
                 # the original body stays callable as f_X_orig; f_X goes to the host
-                body[0] = body[0].replace(f"void {fname(a)}(EE *c)", f"void {fname(a)}_orig(EE *c)")
-                lines.append(f"void {fname(a)}(EE *c) {{ {hooks[a]}(c); }}")
+                body[0] = body[0].replace(f"void {fname(a)}(EE *restrict c)", f"void {fname(a)}_orig(EE *restrict c)")
+                lines.append(f"void {fname(a)}(EE *restrict c) {{ {hooks[a]}(c); }}")
             lines.extend(body)
             lines.append("")
             for ln in body:

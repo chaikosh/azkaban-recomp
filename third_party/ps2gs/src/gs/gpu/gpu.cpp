@@ -81,6 +81,13 @@ WGPUDevice g_device = nullptr;
 WGPUQueue g_queue = nullptr;
 WGPUBuffer g_vram = nullptr, g_tables = nullptr, g_params = nullptr, g_data = nullptr, g_clut = nullptr, g_scratch = nullptr, g_readback = nullptr, g_decoded = nullptr;
 WGPUBuffer g_hsr = nullptr;   // hp: per-pixel skip counts of the hidden-surface prepass, and census counters at its end
+// hp: the raster kernels take their setups from a uniform buffer (binding 9, a 64 KB window at
+// a dynamic offset per batch) instead of the data buffer: the lanes of a workgroup all read the
+// same setup, and uniform reads are far cheaper on the GPU than per-lane storage loads.
+WGPUBuffer g_usetup = nullptr;
+std::uint64_t g_usetup_size = 0;
+std::vector<std::uint32_t> g_usetup_data;
+constexpr std::uint32_t kUSetupBytes = 65536, kUSetupMax = kUSetupBytes / 4 / 34;   // setups per batch
 constexpr std::uint32_t kHsrWords = (4u << 20) + 64;
 std::uint32_t g_decoded_used = 0;
 bool g_rendered[512] = {};
@@ -195,6 +202,7 @@ struct Command {
     std::uint32_t x, y;
     std::uint32_t param;
     WGPUComputePipeline variant = nullptr;   // hp: a raster kernel built for the batch's frame and Z formats
+    std::uint32_t usetup = 0;   // hp: byte offset of the batch's setups in the uniform setup buffer
 };
 
 struct CommandInfo {
@@ -1124,10 +1132,18 @@ void flush_batch() {
     for (std::uint32_t t : g_touched) g_tile_count[t] = 0;
     std::uint32_t snapshot_lo, snapshot_hi;
     const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi);
-    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, snapshot_lo, snapshot_hi});
+    // hp: 7: unused (LOCALFB is a pipeline constant); 8: the batch tests or writes Z
+    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, snapshot_lo, snapshot_hi, 0u, b.zte || b.zwrite ? 1u : 0u});
     note_raster(prims, tiles, total, snapshot);
+    std::uint32_t usetup = 0;
+    {   // hp: the batch's setups at a 256-byte aligned offset of the uniform setup buffer
+        const std::size_t at = (g_usetup_data.size() * 4 + 255) / 256 * 64;
+        g_usetup_data.resize(at, 0);
+        g_usetup_data.insert(g_usetup_data.end(), b.setups.begin(), b.setups.end());
+        usetup = static_cast<std::uint32_t>(at * 4);
+    }
     g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param,
-                          raster_variant(b.setups.data(), b.setups.size() / kSetupWords, b.fpsm, b.zpsm)});
+                          raster_variant(b.setups.data(), b.setups.size() / kSetupWords, b.fpsm, b.zpsm), usetup});
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
     b.prims.clear();
@@ -1348,7 +1364,7 @@ WGPUComputePipeline make_pipeline(int entry, const VariantKey *variant) {
     cd.layout = g_pipeline_layout;
     cd.compute.module = g_module;
     cd.compute.entryPoint = view(entry == kRaster && g_simd ? "raster_simd" : kEntryPoints[entry]);
-    WGPUConstantEntry constants[11];
+    WGPUConstantEntry constants[13];
     for (WGPUConstantEntry &c : constants) c = WGPU_CONSTANT_ENTRY_INIT;
     constants[0].key = view("SCALE");
     constants[0].value = static_cast<double>(g_scale);
@@ -1372,24 +1388,30 @@ WGPUComputePipeline make_pipeline(int entry, const VariantKey *variant) {
     constants[9].value = static_cast<double>(modes >> 32);
     constants[10].key = view("MIPMAP");   // 0: no primitive of the batch mipmaps per pixel
     constants[10].value = generic || !((key >> 59) & 1u) ? 1.0 : 0.0;
-    cd.compute.constantCount = 11;
+    constants[11].key = view("LOCALFB");   // hp: frame and Z words kept in the lanes (the tile kernel, one sample per pixel)
+    static const bool local_fb = !std::getenv("HP_NOLOCALFB");
+    constants[11].value = local_fb && g_scale == 1 && !g_simd ? 1.0 : 0.0;
+    constants[12].key = view("SETUP_UNIFORM");   // hp: the raster kernels read setups from the uniform window
+    static const bool usetup = !std::getenv("HP_NOUSETUP");
+    constants[12].value = entry == kRaster && usetup ? 1.0 : 0.0;
+    cd.compute.constantCount = 13;
     cd.compute.constants = constants;
     return wgpuDeviceCreateComputePipeline(g_device, &cd);
 }
 
 void rebuild_group() {
     if (g_group) wgpuBindGroupRelease(g_group);
-    WGPUBindGroupEntry e[9] = {};
-    WGPUBuffer buffers[9] = {g_vram, g_tables, g_params, g_data, g_clut, g_scratch, g_cache, g_decoded, g_hsr};
-    for (int i = 0; i < 9; ++i) {
+    WGPUBindGroupEntry e[10] = {};
+    WGPUBuffer buffers[10] = {g_vram, g_tables, g_params, g_data, g_clut, g_scratch, g_cache, g_decoded, g_hsr, g_usetup};
+    for (int i = 0; i < 10; ++i) {
         e[i] = WGPU_BIND_GROUP_ENTRY_INIT;
         e[i].binding = static_cast<std::uint32_t>(i);
         e[i].buffer = buffers[i];
-        e[i].size = i == 2 ? kParamStride : WGPU_WHOLE_SIZE;
+        e[i].size = i == 2 ? kParamStride : i == 9 ? kUSetupBytes : WGPU_WHOLE_SIZE;
     }
     WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     d.layout = g_layout;
-    d.entryCount = 9;
+    d.entryCount = 10;
     d.entries = e;
     g_group = wgpuDeviceCreateBindGroup(g_device, &d);
 }
@@ -1401,6 +1423,13 @@ void ensure_capacity() {
         if (g_data) wgpuBufferRelease(g_data);
         g_data_size = std::max<std::uint64_t>(g_data_size * 2, (data_bytes + (4u << 20) - 1) & ~((4ull << 20) - 1));
         g_data = make_buffer(g_data_size, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+        changed = true;
+    }
+    const std::uint64_t usetup_bytes = g_usetup_data.size() * 4 + kUSetupBytes;
+    if (usetup_bytes > g_usetup_size) {
+        if (g_usetup) wgpuBufferRelease(g_usetup);
+        g_usetup_size = std::max<std::uint64_t>(g_usetup_size * 2, (usetup_bytes + (1u << 20) - 1) & ~((1ull << 20) - 1));
+        g_usetup = make_buffer(g_usetup_size, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
         changed = true;
     }
     const std::uint64_t param_bytes = std::max<std::uint64_t>(g_param_records.size(), 1) * kParamStride;
@@ -1426,6 +1455,7 @@ void profile_submit() {
     ensure_capacity();
     wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
     wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
+    if (!g_usetup_data.empty()) wgpuQueueWriteBuffer(g_queue, g_usetup, 0, g_usetup_data.data(), g_usetup_data.size() * 4);
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::size_t>(g_commands.size(), kMax));
     for (std::uint32_t i = 0; i < g_commands.size(); ++i) {
@@ -1438,8 +1468,8 @@ void profile_submit() {
         if (i < n) cd.timestampWrites = &writes;
         WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
         wgpuComputePassEncoderSetPipeline(pass, c.variant ? c.variant : g_pipelines[c.pipeline]);
-        const std::uint32_t offset = c.param * kParamStride;
-        wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
+        const std::uint32_t offsets[2] = {c.param * kParamStride, c.usetup};
+        wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 2, offsets);
         wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
@@ -1476,6 +1506,7 @@ void profile_submit() {
     g_command_info.clear();
     ++g_serial;
     g_param_records.clear();
+    g_usetup_data.clear();
     g_arena.clear();
     g_clut_loads = 0;
 }
@@ -1490,6 +1521,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     ensure_capacity();
     wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
     wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
+    if (!g_usetup_data.empty()) wgpuQueueWriteBuffer(g_queue, g_usetup, 0, g_usetup_data.data(), g_usetup_data.size() * 4);
     if (g_query_ready) {
         const void *mapped = wgpuBufferGetConstMappedRange(g_query_read, 0, 16);
         if (mapped) {
@@ -1522,8 +1554,8 @@ void submit(WGPUTextureView present_view = nullptr) {
             wgpuComputePassEncoderSetPipeline(pass, want);
             current = want;
         }
-        const std::uint32_t offset = c.param * kParamStride;
-        wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
+        const std::uint32_t offsets[2] = {c.param * kParamStride, c.usetup};
+        wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 2, offsets);
         wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
     }
     wgpuComputePassEncoderEnd(pass);
@@ -1574,6 +1606,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     g_command_info.clear();
     ++g_serial;
     g_param_records.clear();
+    g_usetup_data.clear();
     g_arena.clear();
     g_clut_loads = 0;
 }
@@ -1691,7 +1724,10 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w, 
     if (st.colclamp & 1u) flags |= 2048u;
     if (c.fba & 1u) flags |= 4096u;
     if ((c.tex0 >> 34) & 1u) flags |= 8192u;
-    if ((c.tex1 >> 5) & 1u) flags |= 16384u;
+    // hp: HP_GPUPOINT=1 samples every texture with the nearest texel (the bilinear filter was ~15% of
+    // the raster pass): a speed option for phones, not what the console shows
+    static const bool point = std::getenv("HP_GPUPOINT") != nullptr;
+    if (((c.tex1 >> 5) & 1u) && !point) flags |= 16384u;
     if ((st.texa >> 15) & 1u) flags |= 32768u;
     const std::uint32_t fpsm = static_cast<std::uint32_t>(c.frame >> 24) & 0x3Fu;
     const bool dither = (st.dthe & 1u) && (fpsm == PSMCT16 || fpsm == PSMCT16S || fpsm == PSMZ16 || fpsm == PSMZ16S);
@@ -1999,12 +2035,12 @@ bool init(Mode m) {
     std::uint32_t nfeat = 0;
     g_timestamps = wgpuAdapterHasFeature(adapter, WGPUFeatureName_TimestampQuery);
     if (g_timestamps) features[nfeat++] = WGPUFeatureName_TimestampQuery;
-    // hp: the SIMD raster kernel (gs.wgsl raster_simd) needs subgroup operations; HP_RASTER=tile
-    // keeps the kernel with a lane per pixel
+    // hp: HP_RASTER=simd draws with the SIMD raster kernel (gs.wgsl raster_simd, needs subgroup
+    // operations; it was slower than the lane-per-pixel tile kernel on an M1)
     {
         const char *rk = std::getenv("HP_RASTER");
         g_subgroups = wgpuAdapterHasFeature(adapter, static_cast<WGPUFeatureName>(WGPUNativeFeature_Subgroup));
-        g_simd = (!rk || std::string(rk) != "tile") && g_subgroups;
+        g_simd = rk && std::string(rk) == "simd" && g_subgroups;   // slower on M1: opt-in
         if (g_subgroups) features[nfeat++] = static_cast<WGPUFeatureName>(WGPUNativeFeature_Subgroup);
         std::fprintf(stderr, "[gpu] raster kernel: %s\n", g_simd ? "simd (a subgroup per tile)" : "tile (a lane per pixel)");
         const char *up = std::getenv("HP_UPLOAD");
@@ -2068,20 +2104,21 @@ bool init(Mode m) {
         g_query_read = make_buffer(16, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     }
 
-    WGPUBindGroupLayoutEntry le[9] = {};
-    const WGPUBufferBindingType types[9] = {WGPUBufferBindingType_Storage, WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Uniform,
-                                            WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Storage, WGPUBufferBindingType_Storage,
-                                            WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Storage, WGPUBufferBindingType_Storage};
-    for (int i = 0; i < 9; ++i) {
+    WGPUBindGroupLayoutEntry le[10] = {};
+    const WGPUBufferBindingType types[10] = {WGPUBufferBindingType_Storage, WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Uniform,
+                                             WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Storage, WGPUBufferBindingType_Storage,
+                                             WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Storage, WGPUBufferBindingType_Storage,
+                                             WGPUBufferBindingType_Uniform};
+    for (int i = 0; i < 10; ++i) {
         le[i] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
         le[i].binding = static_cast<std::uint32_t>(i);
         le[i].visibility = WGPUShaderStage_Compute;
         le[i].buffer.type = types[i];
-        le[i].buffer.hasDynamicOffset = i == 2;
-        le[i].buffer.minBindingSize = i == 2 ? kParamStride : 0;
+        le[i].buffer.hasDynamicOffset = i == 2 || i == 9;
+        le[i].buffer.minBindingSize = i == 2 ? kParamStride : i == 9 ? kUSetupBytes : 0;
     }
     WGPUBindGroupLayoutDescriptor ld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
-    ld.entryCount = 9;
+    ld.entryCount = 10;
     ld.entries = le;
     g_layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
     WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
@@ -2115,11 +2152,13 @@ bool init(Mode m) {
 
 void upload_report() {   // hp: the uploads so far and how many were content-cache hits (gsreplay)
     if (std::getenv("HP_EXP") && (std::atoi(std::getenv("HP_EXP")) & 8192)) {   // the census of gs.wgsl EXP 8192 (two words at the top of local memory)
-        std::uint32_t c[2] = {0, 0};
+        std::uint32_t c[12] = {};
         { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); flush_all(); }
         submit();
-        read_back(g_hsr, 8, c, static_cast<std::uint64_t>(kHsrWords - 64) * 4);
+        read_back(g_hsr, sizeof c, c, static_cast<std::uint64_t>(kHsrWords - 64) * 4);
         std::fprintf(stderr, "[gpu] census: pixel writes %u, of them before the last full replace of the pixel (hidden) %u (%.1f%%)\n", c[0], c[1], c[0] ? 100.0 * c[1] / c[0] : 0.0);
+        std::fprintf(stderr, "[gpu] census: not a full replace because: no fb write %u, no z write %u, zte off %u, abe %u, ate %u, date %u, fbmsk %u, scanmsk %u; ate without abe %u, of them GREATER 0 %u\n",
+                     c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11]);
     }
     std::fprintf(stderr, "[gpu] uploads: %llu calls %.1f MB, cache hits %llu calls %.1f MB, skipped (already there) %llu images %.1f MB, decode resets %llu; by format:",
                  (unsigned long long)g_hp_up_calls, g_hp_up_bytes / 1048576.0, (unsigned long long)g_hp_up_hit_calls, g_hp_up_hit_bytes / 1048576.0,
@@ -2308,6 +2347,10 @@ void draw(const State &st, const Vertex *v, int count) {
                 }
             }
         }
+    }
+    if (b.setups.size() / kSetupWords >= kUSetupMax && std::memcmp(b.setups.data() + b.setups.size() - kSetupWords, setup, kSetupWords * 4) != 0) {
+        hp_flush_note(__LINE__);   // hp: the uniform setup window holds kUSetupMax setups
+        emit_all();
     }
     if (b.prims.empty()) {
         b.texflushes = g_texflushes;

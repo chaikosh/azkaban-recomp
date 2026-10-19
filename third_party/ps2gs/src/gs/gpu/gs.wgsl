@@ -12,6 +12,11 @@ struct Params {
 @group(0) @binding(7) var<storage, read_write> decoded: array<u32>;
 // hp: the hidden-surface prepass's per-pixel skip counts; the last 64 words are census counters
 @group(0) @binding(8) var<storage, read_write> hsr: array<atomic<u32>>;
+// hp: the setups of the batch being rasterised, a 64 KB window at a dynamic offset (gpu.cpp)
+struct USetups {
+    v: array<vec4<u32>, 4096>,
+}
+@group(0) @binding(9) var<uniform> usetups: USetups;
 const HSR_WORDS: u32 = 4194368u;
 
 override SCALE: u32 = 1u;
@@ -34,6 +39,10 @@ override MIPMAP: u32 = 1u;
 override TPSM: u32 = 0xFFFFFFFFu;
 override MODES_ON: u32 = 0u;
 override MODES_OFF: u32 = 0u;
+// 1: the tile kernel keeps each lane's frame and Z words in registers for the whole list (below)
+override LOCALFB: u32 = 0u;
+// 1: setups are read from the uniform window (raster kernels), 0: from the data buffer (decode)
+override SETUP_UNIFORM: u32 = 0u;
 
 const PSMCT32: u32 = 0x00u;
 const PSMCT24: u32 = 0x01u;
@@ -625,40 +634,50 @@ const F_DTHE: u32 = 65536u;
 // L 7-8, K 9-20; words 28-33 the base (bits 0-13) and width (14-19) of levels 1-6
 const MIP_ON: u32 = 0x80000000u;
 
+// hp: a word of a setup: the raster kernels read the batch's setups from the uniform window
+// (every lane of a workgroup reads the same words: a uniform load, not a per-lane storage load;
+// the raster pass took a third less), the decode kernel from the data buffer
+fn setup_word(at: u32, k: u32) -> u32 {
+    if (SETUP_UNIFORM != 0u) {
+        let i = at + k;
+        return usetups.v[i >> 2u][i & 3u];
+    }
+    return data[at + k];
+}
 fn load_setup(at: u32) -> Setup {
     var s: Setup;
-    s.flags = (data[at] | FLAGS_ON) & ~FLAGS_OFF;
-    s.fbp = data[at + 1u];
-    s.fbw = data[at + 2u];
-    s.fpsm = select(data[at + 3u], FPSM, FPSM != 0xFFFFFFFFu);
-    s.fbmsk = data[at + 4u];
-    s.zbp = data[at + 5u];
-    s.zpsm = select(data[at + 6u], ZPSM, ZPSM != 0xFFFFFFFFu);
-    s.modes = (data[at + 7u] | MODES_ON) & ~MODES_OFF;
-    s.aref = data[at + 8u];
-    s.fix = data[at + 9u];
-    s.scax0 = i32(data[at + 10u] & 0xFFFFu);
-    s.scax1 = i32(data[at + 10u] >> 16u);
-    s.scay0 = i32(data[at + 11u] & 0xFFFFu);
-    s.scay1 = i32(data[at + 11u] >> 16u);
-    s.tbp = data[at + 12u];
-    s.tbw = data[at + 13u];
-    s.tpsm = select(data[at + 14u], TPSM, TPSM != 0xFFFFFFFFu);
-    s.tw = data[at + 15u] & 0xFFu;
-    s.th = data[at + 15u] >> 8u;
-    s.cpsm = data[at + 16u];
-    s.csa = data[at + 17u];
-    s.minu = data[at + 18u] & 0xFFFFu;
-    s.maxu = data[at + 18u] >> 16u;
-    s.minv = data[at + 19u] & 0xFFFFu;
-    s.maxv = data[at + 19u] >> 16u;
-    s.ta0 = data[at + 20u] & 0xFFu;
-    s.ta1 = (data[at + 20u] >> 8u) & 0xFFu;
-    s.fogcol = data[at + 21u];
-    s.clut = data[at + 22u];
-    s.zmax = data[at + 23u];
-    s.dec = data[at + 24u];
-    s.mip = data[at + 27u];
+    s.flags = (setup_word(at, 0u) | FLAGS_ON) & ~FLAGS_OFF;
+    s.fbp = setup_word(at, 1u);
+    s.fbw = setup_word(at, 2u);
+    s.fpsm = select(setup_word(at, 3u), FPSM, FPSM != 0xFFFFFFFFu);
+    s.fbmsk = setup_word(at, 4u);
+    s.zbp = setup_word(at, 5u);
+    s.zpsm = select(setup_word(at, 6u), ZPSM, ZPSM != 0xFFFFFFFFu);
+    s.modes = (setup_word(at, 7u) | MODES_ON) & ~MODES_OFF;
+    s.aref = setup_word(at, 8u);
+    s.fix = setup_word(at, 9u);
+    s.scax0 = i32(setup_word(at, 10u) & 0xFFFFu);
+    s.scax1 = i32(setup_word(at, 10u) >> 16u);
+    s.scay0 = i32(setup_word(at, 11u) & 0xFFFFu);
+    s.scay1 = i32(setup_word(at, 11u) >> 16u);
+    s.tbp = setup_word(at, 12u);
+    s.tbw = setup_word(at, 13u);
+    s.tpsm = select(setup_word(at, 14u), TPSM, TPSM != 0xFFFFFFFFu);
+    s.tw = setup_word(at, 15u) & 0xFFu;
+    s.th = setup_word(at, 15u) >> 8u;
+    s.cpsm = setup_word(at, 16u);
+    s.csa = setup_word(at, 17u);
+    s.minu = setup_word(at, 18u) & 0xFFFFu;
+    s.maxu = setup_word(at, 18u) >> 16u;
+    s.minv = setup_word(at, 19u) & 0xFFFFu;
+    s.maxv = setup_word(at, 19u) >> 16u;
+    s.ta0 = setup_word(at, 20u) & 0xFFu;
+    s.ta1 = (setup_word(at, 20u) >> 8u) & 0xFFu;
+    s.fogcol = setup_word(at, 21u);
+    s.clut = setup_word(at, 22u);
+    s.zmax = setup_word(at, 23u);
+    s.dec = setup_word(at, 24u);
+    s.mip = setup_word(at, 27u);
     s.at = at;
     // hp: the address formats (texture, frame, Z) are worked out where they are used, so a
     // primitive without a texture or a depth test does not pay for them
@@ -687,7 +706,7 @@ var<private> setup_at: u32 = 0u;
 
 fn dither_value(x: i32, y: i32) -> i32 {
     let sh = (u32(y) & 3u) * 16u + (u32(x) & 3u) * 4u;
-    let w = data[setup_at + 25u + sh / 32u];
+    let w = setup_word(setup_at, 25u + sh / 32u);
     return bitcast<i32>(w << (29u - (sh & 31u))) >> 29u;
 }
 
@@ -854,7 +873,7 @@ fn lv_of(s: Setup, lv: u32) -> Lv {
     if (lv == 0u) {
         return Lv(s.dec, s.tw, s.th, s.tbp, s.tbw, 0u);
     }
-    let w = data[s.at + 27u + lv];
+    let w = setup_word(s.at, 27u + lv);
     var off = s.dec;
     if (s.dec != 0xFFFFFFFFu) {
         for (var i = 0u; i < lv; i = i + 1u) {
@@ -923,8 +942,46 @@ var<private> mip_fix: u32 = 0u;
 // hp: EXP 8192 census: what plot did for the pixel (0 nothing, 1 wrote, 2 wrote every bit and Z)
 var<private> plot_did: u32 = 0u;
 
+// hp: the tile kernel keeps the lane's pixel of the frame and of the Z buffer in two private
+// words for the whole primitive list (loaded once, written back once at the end), instead of a
+// read-modify-write of local memory for every primitive that covers the pixel (the game writes
+// each pixel ~25 times a frame, most of it blended).  plot reads and writes them through these.
+var<private> tile_fb: u32 = 0u;
+var<private> tile_z: u32 = 0u;
+var<private> tile_fb_dirty: bool = false;
+var<private> tile_z_dirty: bool = false;
+
+fn fb_load(l: Loc, k: u32) -> u32 {
+    if (LOCALFB != 0u) {
+        return (tile_fb >> l.shift) & l.mask;
+    }
+    return load_at(l, k);
+}
+fn fb_store(l: Loc, k: u32, value: u32) {
+    if (LOCALFB != 0u) {
+        tile_fb = (tile_fb & ~(l.mask << l.shift)) | ((value & l.mask) << l.shift);
+        tile_fb_dirty = true;
+        return;
+    }
+    store(l, k, value);
+}
+fn z_load(l: Loc, k: u32) -> u32 {
+    if (LOCALFB != 0u) {
+        return (tile_z >> l.shift) & l.mask;
+    }
+    return load_at(l, k);
+}
+fn z_store(l: Loc, k: u32, value: u32) {
+    if (LOCALFB != 0u) {
+        tile_z = (tile_z & ~(l.mask << l.shift)) | ((value & l.mask) << l.shift);
+        tile_z_dirty = true;
+        return;
+    }
+    store(l, k, value);
+}
+
 fn read_frame(s: Setup, l: Loc, k: u32) -> u32 {
-    let raw = load_at(l, k);
+    let raw = fb_load(l, k);
     switch s.fpsm {
         case 0x01u {
             return raw | 0x80000000u;
@@ -953,26 +1010,26 @@ fn pack16(v: u32) -> u32 {
 fn write_frame(s: Setup, l: Loc, k: u32, c: u32, mask: u32) {
     switch s.fpsm {
         case 0x02u, 0x0Au {
-            let old = load_at(l, k);
+            let old = fb_load(l, k);
             var m16 = pack16(mask);
             if ((mask & 0x80000000u) != 0u) {
                 m16 = m16 | 0x8000u;
             }
-            store(l, k, (pack16(c) & ~m16) | (old & m16));
+            fb_store(l, k, (pack16(c) & ~m16) | (old & m16));
         }
         case 0x01u {
             let l32 = Loc(l.word, 0u, 0xFFFFFFFFu);
-            let old = load_at(l32, k);
+            let old = fb_load(l32, k);
             let m = mask | 0xFF000000u;
-            store(l32, k, (c & ~m) | (old & m));
+            fb_store(l32, k, (c & ~m) | (old & m));
         }
         default {
             var v = c;
             if (mask != 0u) {
-                let old = load_at(l, k);
+                let old = fb_load(l, k);
                 v = (c & ~mask) | (old & mask);
             }
-            store(l, k, v);
+            fb_store(l, k, v);
         }
     }
 }
@@ -1024,7 +1081,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
         }
         zl = addr(fmt_of(s.zpsm, s.zbp, s.fbw), ux, uy);
         if (ztst != 1u && (EXP & 1024u) == 0u) {
-            let old = load_at(zl, k) & s.zmax;
+            let old = z_load(zl, k) & s.zmax;
             if ((ztst == 2u && z < old) || (ztst == 3u && z <= old)) {
                 return;
             }
@@ -1171,6 +1228,17 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
         plot_did = 1u;
         if (write_fb && write_z && zte && !has(s, F_ABE) && !has(s, F_ATE) && !has(s, F_DATE) && s.fbmsk == 0u && scanmsk == 0u) {
             plot_did = 2u;
+        } else {   // which condition fails (census counters 2..9)
+            if (!write_fb) { atomicAdd(&hsr[HSR_WORDS - 62u], 1u); }
+            if (!write_z) { atomicAdd(&hsr[HSR_WORDS - 61u], 1u); }
+            if (!zte) { atomicAdd(&hsr[HSR_WORDS - 60u], 1u); }
+            if (has(s, F_ABE)) { atomicAdd(&hsr[HSR_WORDS - 59u], 1u); }
+            if (has(s, F_ATE)) { atomicAdd(&hsr[HSR_WORDS - 58u], 1u); }
+            if (has(s, F_DATE)) { atomicAdd(&hsr[HSR_WORDS - 57u], 1u); }
+            if (s.fbmsk != 0u) { atomicAdd(&hsr[HSR_WORDS - 56u], 1u); }
+            if (scanmsk != 0u) { atomicAdd(&hsr[HSR_WORDS - 55u], 1u); }
+            if (has(s, F_ATE) && !has(s, F_ABE)) { atomicAdd(&hsr[HSR_WORDS - 54u], 1u); }
+            if (has(s, F_ATE) && !has(s, F_ABE) && mode(s, 0u, 3u) == 6u && s.aref == 0u) { atomicAdd(&hsr[HSR_WORDS - 53u], 1u); }
         }
     }
     if (write_fb) {
@@ -1244,7 +1312,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
         write_frame(s, fl, k, u32(r) | (u32(g) << 8u) | (u32(b) << 16u) | (out_a << 24u), mask);
     }
     if (write_z && zte && (EXP & 256u) == 0u) {
-        store(zl, k, z);
+        z_store(zl, k, z);
     }
 }
 
@@ -1455,6 +1523,20 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
     let setups = prm(2u);
     snapshot_lo = prm(5u);
     snapshot_hi = prm(6u);
+    // hp: the lane's frame pixel and Z value come in once (prm 7: on, prm 8: the batch tests or
+    // writes Z); the batch's buffers are those of its first setup (all of them share them)
+    var fl0 = Loc(0u, 0u, 0u);
+    var zl0 = Loc(0u, 0u, 0u);
+    let with_z = prm(8u) != 0u;
+    if (LOCALFB != 0u) {
+        let s0 = load_setup(select(setups, 0u, SETUP_UNIFORM != 0u));
+        fl0 = addr(fmt_of(s0.fpsm, s0.fbp, s0.fbw), u32(x), u32(y));
+        tile_fb = atomicLoad(&vram[fl0.word]);
+        if (with_z) {
+            zl0 = addr(fmt_of(s0.zpsm, s0.zbp, s0.fbw), u32(x), u32(y));
+            tile_z = atomicLoad(&vram[zl0.word]);
+        }
+    }
     var shaded = 0u;
     var last_full = 0u;
     for (var i = 0u; i < count; i = i + 1u) {
@@ -1467,7 +1549,7 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
         }
         // hp: the setup is loaded for each primitive that covers the pixel instead of kept from
         // the last one: ~46 values live across the whole loop held the kernel's occupancy down
-        setup_at = setups + data[p] * SETUP_WORDS;
+        setup_at = select(setups, 0u, SETUP_UNIFORM != 0u) + data[p] * SETUP_WORDS;
         let s = load_setup(setup_at);
         plot_did = 0u;
         shade_at(p, s, x, y, k, px, py);
@@ -1481,6 +1563,24 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
     if ((EXP & 8192u) != 0u) {   // hp: census: pixel writes, and those before the last full replace (hidden)
         atomicAdd(&hsr[HSR_WORDS - 64u], shaded);
         atomicAdd(&hsr[HSR_WORDS - 63u], select(0u, last_full - 1u, last_full > 0u));
+    }
+    if (LOCALFB != 0u) {   // written back only when written: an untouched lane may alias another tile's word
+        if (tile_fb_dirty) {
+            if (fl0.mask == 0xFFFFFFFFu) {
+                atomicStore(&vram[fl0.word], tile_fb);
+            } else {
+                atomicAnd(&vram[fl0.word], ~(fl0.mask << fl0.shift));
+                atomicOr(&vram[fl0.word], tile_fb & (fl0.mask << fl0.shift));
+            }
+        }
+        if (tile_z_dirty) {
+            if (zl0.mask == 0xFFFFFFFFu) {
+                atomicStore(&vram[zl0.word], tile_z);
+            } else {
+                atomicAnd(&vram[zl0.word], ~(zl0.mask << zl0.shift));
+                atomicOr(&vram[zl0.word], tile_z & (zl0.mask << zl0.shift));
+            }
+        }
     }
 }
 
@@ -1562,7 +1662,7 @@ fn raster_simd(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
         }
         workgroupBarrier();
         if (total != 0u) {
-            setup_at = setups + data[p] * SETUP_WORDS;
+            setup_at = select(setups, 0u, SETUP_UNIFORM != 0u) + data[p] * SETUP_WORDS;
             let s = load_setup(setup_at);
             for (var c = lane; c < total; c = c + 32u) {
                 let e = cov_list[half * 256u + c];
