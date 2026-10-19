@@ -20,6 +20,10 @@ override EXP: u32 = 0u;
 // 0xFFFFFFFF = read them from the setup
 override FPSM: u32 = 0xFFFFFFFFu;
 override ZPSM: u32 = 0xFFFFFFFFu;
+// setup flags all primitives of the batch have / lack, and whether all its textures are decoded
+override FLAGS_ON: u32 = 0u;
+override FLAGS_OFF: u32 = 0u;
+override DECODED: u32 = 0u;
 
 const PSMCT32: u32 = 0x00u;
 const PSMCT24: u32 = 0x01u;
@@ -475,7 +479,7 @@ const F_AEM: u32 = 32768u;
 
 fn load_setup(at: u32) -> Setup {
     var s: Setup;
-    s.flags = data[at];
+    s.flags = (data[at] | FLAGS_ON) & ~FLAGS_OFF;
     s.fbp = data[at + 1u];
     s.fbw = data[at + 2u];
     s.fpsm = select(data[at + 3u], FPSM, FPSM != 0xFFFFFFFFu);
@@ -584,7 +588,7 @@ fn fetch(s: Setup, xi: i32, yi: i32, k: u32) -> u32 {
     if ((EXP & 128u) != 0u && s.dec == 0xFFFFFFFFu) {
         return (x * 2654435761u) ^ (y * 40503u);
     }
-    if (s.dec != 0xFFFFFFFFu) {
+    if (DECODED != 0u || s.dec != 0xFFFFFFFFu) {
         return decoded[s.dec + (y << s.tw) + x];
     }
     return convert(s, load_texel(addr(fmt_tex(s), x, y), k));

@@ -85,9 +85,12 @@ WGPUComputePipeline g_pipelines[kPipelines] = {};
 // kernel draws until it is ready; the usual ones are started at init.  HP_GPUVARIANTS=0 keeps
 // the generic kernel.
 WGPUShaderModule g_module = nullptr;
-WGPUComputePipeline make_pipeline(int entry, std::uint32_t fpsm, std::uint32_t zpsm);
-struct RasterVariant { std::uint32_t key; std::atomic<WGPUComputePipeline> pipeline{nullptr}; };
-RasterVariant g_variants[64];
+// The key also carries the setup flags every primitive of the batch has (FLAGS_ON) or lacks
+// (FLAGS_OFF) and whether all its textures are decoded (DECODED): fpsm | zpsm << 8 | on << 16 |
+// off << 32 | decoded << 48.
+WGPUComputePipeline make_pipeline(int entry, std::uint64_t key);
+struct RasterVariant { std::uint64_t key; std::atomic<WGPUComputePipeline> pipeline{nullptr}; };
+RasterVariant g_variants[256];
 std::atomic<int> g_variant_count{0};
 std::mutex g_variant_lock;
 std::condition_variable g_variant_cv;
@@ -101,11 +104,11 @@ void variant_builder() {
             i = g_variant_jobs.front();
             g_variant_jobs.pop_front();
         }
-        const std::uint32_t key = g_variants[i].key;
+        const std::uint64_t key = g_variants[i].key;
         const auto t0 = std::chrono::steady_clock::now();
-        WGPUComputePipeline p = make_pipeline(kRaster, key & 0xFFu, key >> 8);
+        WGPUComputePipeline p = make_pipeline(kRaster, key);
         if (std::getenv("HP_GPUFLUSHLOG"))
-            std::fprintf(stderr, "[gpu] raster kernel for frame %02x z %02x built in %.0f ms\n", key & 0xFFu, key >> 8,
+            std::fprintf(stderr, "[gpu] raster kernel %012llx built in %.0f ms\n", static_cast<unsigned long long>(key),
                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
         g_variants[i].pipeline.store(p);
     }
@@ -114,11 +117,11 @@ bool variants_on() {
     static const bool on = !std::getenv("HP_GPUVARIANTS") || std::atoi(std::getenv("HP_GPUVARIANTS")) != 0;
     return on && g_module;
 }
-int request_variant(std::uint32_t key) {   // the GS thread only (it alone adds entries)
+int request_variant(std::uint64_t key) {   // the GS thread only (it alone adds entries)
     const int n = g_variant_count.load();
     for (int i = 0; i < n; ++i)
         if (g_variants[i].key == key) return i;
-    if (n >= 64) return -1;
+    if (n >= 256) return -1;
     g_variants[n].key = key;
     g_variant_count.store(n + 1);
     static bool started = false;
@@ -133,9 +136,20 @@ int request_variant(std::uint32_t key) {   // the GS thread only (it alone adds 
     g_variant_cv.notify_one();
     return n;
 }
-WGPUComputePipeline raster_variant(std::uint32_t fpsm, std::uint32_t zpsm) {
+WGPUComputePipeline raster_variant(const std::uint32_t *setups, std::size_t count, std::uint32_t fpsm, std::uint32_t zpsm) {
     if (!variants_on()) return nullptr;
-    const int i = request_variant(fpsm | (zpsm << 8));
+    static const bool flags_on = !std::getenv("HP_GPUVARIANTS") || std::atoi(std::getenv("HP_GPUVARIANTS")) != 2;   // 2: formats only
+    std::uint32_t all = 0xFFFFu, any = 0;
+    bool decoded = true;
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::uint32_t *w = setups + i * kSetupWords;
+        all &= w[0];
+        any |= w[0];
+        if (w[0] & 2u) decoded = decoded && w[24] != 0xFFFFFFFFu;
+    }
+    std::uint64_t key = fpsm | (zpsm << 8);
+    if (flags_on) key |= (static_cast<std::uint64_t>(all & 0xFFFFu) << 16) | (static_cast<std::uint64_t>(~any & 0xFFFFu) << 32) | (static_cast<std::uint64_t>(decoded) << 48);
+    const int i = request_variant(key);
     return i < 0 ? nullptr : g_variants[i].pipeline.load();
 }
 
@@ -770,7 +784,8 @@ void flush_batch() {
     const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi);
     const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, snapshot_lo, snapshot_hi});
     note_raster(prims, tiles, total, snapshot);
-    g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param, raster_variant(b.fpsm, b.zpsm)});
+    g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param,
+                          raster_variant(b.setups.data(), b.setups.size() / kSetupWords, b.fpsm, b.zpsm)});
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
     b.prims.clear();
@@ -944,21 +959,29 @@ WGPUBuffer make_buffer(std::uint64_t size, WGPUBufferUsage usage) {
     return wgpuDeviceCreateBuffer(g_device, &d);
 }
 
-WGPUComputePipeline make_pipeline(int entry, std::uint32_t fpsm, std::uint32_t zpsm) {
+WGPUComputePipeline make_pipeline(int entry, std::uint64_t key) {
+    const bool generic = key == ~0ull;
     WGPUComputePipelineDescriptor cd = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
     cd.layout = g_pipeline_layout;
     cd.compute.module = g_module;
     cd.compute.entryPoint = view(kEntryPoints[entry]);
-    WGPUConstantEntry constants[4] = {WGPU_CONSTANT_ENTRY_INIT, WGPU_CONSTANT_ENTRY_INIT, WGPU_CONSTANT_ENTRY_INIT, WGPU_CONSTANT_ENTRY_INIT};
+    WGPUConstantEntry constants[7];
+    for (WGPUConstantEntry &c : constants) c = WGPU_CONSTANT_ENTRY_INIT;
     constants[0].key = view("SCALE");
     constants[0].value = static_cast<double>(g_scale);
     constants[1].key = view("EXP");   // hp: HP_EXP=bits, raster-kernel experiments (gs.wgsl)
     constants[1].value = std::getenv("HP_EXP") ? std::atof(std::getenv("HP_EXP")) : 0.0;
     constants[2].key = view("FPSM");
-    constants[2].value = static_cast<double>(fpsm);
+    constants[2].value = generic ? 4294967295.0 : static_cast<double>(key & 0xFFu);
     constants[3].key = view("ZPSM");
-    constants[3].value = static_cast<double>(zpsm);
-    cd.compute.constantCount = 4;
+    constants[3].value = generic ? 4294967295.0 : static_cast<double>((key >> 8) & 0xFFu);
+    constants[4].key = view("FLAGS_ON");
+    constants[4].value = generic ? 0.0 : static_cast<double>((key >> 16) & 0xFFFFu);
+    constants[5].key = view("FLAGS_OFF");
+    constants[5].value = generic ? 0.0 : static_cast<double>((key >> 32) & 0xFFFFu);
+    constants[6].key = view("DECODED");
+    constants[6].value = generic ? 0.0 : static_cast<double>((key >> 48) & 1u);
+    cd.compute.constantCount = 7;
     cd.compute.constants = constants;
     return wgpuDeviceCreateComputePipeline(g_device, &cd);
 }
@@ -1586,11 +1609,11 @@ bool init(Mode m) {
     WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_device, &md);
     g_module = module;   // kept for the raster variants
     for (int i = 0; i < kPipelines; ++i) {
-        g_pipelines[i] = make_pipeline(i, 0xFFFFFFFFu, 0xFFFFFFFFu);
+        g_pipelines[i] = make_pipeline(i, ~0ull);
         if (!g_pipelines[i]) return false;
     }
     if (variants_on())   // the formats this game draws with most
-        for (const std::uint32_t key : {0x3A00u, 0x3000u, 0x3A02u, 0x3202u, 0x3A0Au, 0x3002u})
+        for (const std::uint64_t key : {0x3A00ull, 0x3000ull, 0x3A02ull, 0x3202ull, 0x3A0Aull, 0x3002ull})
             request_variant(key);
     ensure_capacity();
     g_mode = m;
