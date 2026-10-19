@@ -656,18 +656,21 @@ fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
     return blend4(fetch(s, x0, y0, k), fetch(s, x0 + 1, y0, k), fetch(s, x0, y0 + 1, k), fetch(s, x0 + 1, y0 + 1, k), u - f32(x0), v - f32(y0));
 }
 
-fn blend4(c00: u32, c10: u32, c01: u32, c11: u32, fx: f32, fy: f32) -> u32 {
+// Bilinear filter in fixed point like the software GS (runtime/gs.c tex_sample): 8-bit weights,
+// a horizontal then a vertical lerp, each truncated, (a * (256 - f) + b * f) >> 8.
+fn lerp8(a: u32, b: u32, f: u32) -> u32 {
     var out = 0u;
     for (var ch = 0u; ch < 32u; ch = ch + 8u) {
-        let a = f32((c00 >> ch) & 0xFFu);
-        let b = f32((c10 >> ch) & 0xFFu);
-        let c = f32((c01 >> ch) & 0xFFu);
-        let d = f32((c11 >> ch) & 0xFFu);
-        let top = a + (b - a) * fx;
-        let bottom = c + (d - c) * fx;
-        out = out | (u32(clamp(top + (bottom - top) * fy + 0.5, 0.0, 255.0)) << ch);
+        let v = (((a >> ch) & 0xFFu) * (256u - f) + ((b >> ch) & 0xFFu) * f) >> 8u;
+        out = out | (v << ch);
     }
     return out;
+}
+
+fn blend4(c00: u32, c10: u32, c01: u32, c11: u32, fx: f32, fy: f32) -> u32 {
+    let fu = u32(clamp(fx * 256.0, 0.0, 255.0));
+    let fv = u32(clamp(fy * 256.0, 0.0, 255.0));
+    return lerp8(lerp8(c00, c10, fu), lerp8(c01, c11, fu), fv);
 }
 
 fn read_frame(s: Setup, l: Loc, k: u32) -> u32 {
