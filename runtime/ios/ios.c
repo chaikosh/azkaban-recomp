@@ -76,6 +76,7 @@ const char *hp_ios_setup(void) {
         snprintf(log, sizeof log, "%s/hp.log", docs);
         if (freopen(log, "w", stderr)) setvbuf(stderr, NULL, _IONBF, 0);
     }
+    if (chdir(docs) != 0) fprintf(stderr, "[ios] cannot enter %s\n", docs);   /* relative paths (HP_WAV=rec.wav, HP_SHOT=shots) land in Documents */
     setenv("HP_GS", "gpu", 0);
     setenv("HP_FPSLOG", "1", 0);   /* a [fps] line in hp.log every 5 s */
     snprintf(memcard, sizeof memcard, "%s/memcard0.ps2", docs);
