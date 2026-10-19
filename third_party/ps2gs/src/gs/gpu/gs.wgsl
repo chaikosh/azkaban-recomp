@@ -24,6 +24,11 @@ override ZPSM: u32 = 0xFFFFFFFFu;
 override FLAGS_ON: u32 = 0u;
 override FLAGS_OFF: u32 = 0u;
 override DECODED: u32 = 0u;
+// the texture format all textured primitives share (0xFFFFFFFF: read it), and the bits of the
+// modes word all setups agree on
+override TPSM: u32 = 0xFFFFFFFFu;
+override MODES_ON: u32 = 0u;
+override MODES_OFF: u32 = 0u;
 
 const PSMCT32: u32 = 0x00u;
 const PSMCT24: u32 = 0x01u;
@@ -486,7 +491,7 @@ fn load_setup(at: u32) -> Setup {
     s.fbmsk = data[at + 4u];
     s.zbp = data[at + 5u];
     s.zpsm = select(data[at + 6u], ZPSM, ZPSM != 0xFFFFFFFFu);
-    s.modes = data[at + 7u];
+    s.modes = (data[at + 7u] | MODES_ON) & ~MODES_OFF;
     s.aref = data[at + 8u];
     s.fix = data[at + 9u];
     s.scax0 = i32(data[at + 10u] & 0xFFFFu);
@@ -495,7 +500,7 @@ fn load_setup(at: u32) -> Setup {
     s.scay1 = i32(data[at + 11u] >> 16u);
     s.tbp = data[at + 12u];
     s.tbw = data[at + 13u];
-    s.tpsm = data[at + 14u];
+    s.tpsm = select(data[at + 14u], TPSM, TPSM != 0xFFFFFFFFu);
     s.tw = data[at + 15u] & 0xFFu;
     s.th = data[at + 15u] >> 8u;
     s.cpsm = data[at + 16u];
