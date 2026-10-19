@@ -16,6 +16,10 @@ override SCALE: u32 = 1u;
 // (tools/gsreplay): 1 no shading, 4 no texture sampling, 32 point sampling only, 64 no texel
 // loads, 128 no texel loads outside the decode buffer.  0 in normal use.
 override EXP: u32 = 0u;
+// hp: the frame and Z formats of a raster kernel built for one batch (gpu.cpp raster_variant);
+// 0xFFFFFFFF = read them from the setup
+override FPSM: u32 = 0xFFFFFFFFu;
+override ZPSM: u32 = 0xFFFFFFFFu;
 
 const PSMCT32: u32 = 0x00u;
 const PSMCT24: u32 = 0x01u;
@@ -474,10 +478,10 @@ fn load_setup(at: u32) -> Setup {
     s.flags = data[at];
     s.fbp = data[at + 1u];
     s.fbw = data[at + 2u];
-    s.fpsm = data[at + 3u];
+    s.fpsm = select(data[at + 3u], FPSM, FPSM != 0xFFFFFFFFu);
     s.fbmsk = data[at + 4u];
     s.zbp = data[at + 5u];
-    s.zpsm = data[at + 6u];
+    s.zpsm = select(data[at + 6u], ZPSM, ZPSM != 0xFFFFFFFFu);
     s.modes = data[at + 7u];
     s.aref = data[at + 8u];
     s.fix = data[at + 9u];
