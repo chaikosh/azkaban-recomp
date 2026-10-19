@@ -435,8 +435,13 @@ Range pages(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, int x0, int y
     return r;
 }
 
+// hp: the area last shown and whether anything wrote into it since (see display_async)
+Range g_watch;
+bool g_watch_dirty = true;
+
 void mark_rendered(const Range &r) {
     for (std::uint64_t at = r.lo; at < r.hi; at += 8192) g_rendered[(at >> 13) & 511u] = true;
+    if (g_watch.overlaps(r.lo, r.hi)) g_watch_dirty = true;
 }
 
 bool rendered(const Range &r) {
@@ -657,6 +662,7 @@ void emit_all() {
 }
 
 void queue_pre(const PreOp &op) {
+    if (!op.clut && g_watch.overlaps(op.range.lo, op.range.hi)) g_watch_dirty = true;
     if (batch_conflict(op.range, op.clut)) emit_all();
     g_pre.push_back(op);
 }
@@ -1859,10 +1865,41 @@ struct Copy {
     WGPUSubmissionIndex submission = 0;   // hp: the submit that fills it
 #endif
 };
-Copy g_copies[3];
+bool g_skip_copy = false;
+Copy g_copies[2];   // hp: at most 2 frames in flight: more only added input latency (the GPU sets the pace)
 std::uint64_t g_copy_order = 0;
 
 bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
+    // hp: nothing new to show unless something wrote into the displayed area since the last copy
+    // (this game draws into a back buffer and copies the finished frame into the displayed one):
+    // skipping keeps the frame's batches whole and saves a readback per vblank.  Pending draws
+    // into it count too.
+    {
+        const Range shown = pages(src.fbp, src.fbw, src.psm, static_cast<int>(src.dbx), static_cast<int>(src.dby),
+                                  static_cast<int>(src.dbx + src.width - 1), static_cast<int>(src.dby + (src.halved ? src.height / 2 : src.height) - 1));
+        bool dirty = g_watch_dirty || shown.lo != g_watch.lo || shown.hi != g_watch.hi;
+        if (!dirty && !g_batch.prims.empty()) {
+            batch_ranges();
+            dirty = g_batch.fb_range.overlaps(shown.lo, shown.hi);
+        }
+        if (!dirty) {
+            static const bool always = std::getenv("HP_SHOWALWAYS") != nullptr;
+            if (!always) {
+#ifndef __EMSCRIPTEN__
+                wgpuDevicePoll(g_device, false, nullptr);   // let finished copies report in
+#endif
+                bool any_ready = false;
+                for (Copy &c : g_copies) any_ready |= c.ready;
+                if (!any_ready) return false;   // still collect copies that came back below
+            }
+        } else {
+            g_watch = shown;
+            g_watch_dirty = false;
+        }
+        static bool skip_new_copy;
+        skip_new_copy = !dirty && std::getenv("HP_SHOWALWAYS") == nullptr;
+        g_skip_copy = skip_new_copy;
+    }
 #ifdef __EMSCRIPTEN__
     wgpuInstanceProcessEvents(g_instance);
 #else
@@ -1924,6 +1961,7 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
     Copy *slot = nullptr;
     for (Copy &c : g_copies)
         if (!c.busy) slot = &c;
+    if (g_skip_copy) slot = nullptr;   // hp: nothing new was drawn into the displayed area
     if (slot) {
         const std::uint64_t bytes = static_cast<std::uint64_t>(src.width) * src.height * g_scale * g_scale * 4;
         if (slot->size < bytes) {

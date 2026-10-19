@@ -259,7 +259,10 @@ int gsb_display(uint64_t pmode, uint64_t smode2, const uint64_t dispfb[2], const
         const bool flip = !have_last || std::memcmp(&last, &regs, sizeof regs);
         const bool drawn = !g_pend.data.empty() || g_new_since_show;
         ++since;
-        if (flip || drawn) {
+        // this game does not flip DISPFB per frame, so any vblank with new data asks for a frame
+        // (HP_SHOWEVERY=n: at most every n-th vblank without a flip)
+        static const unsigned every = std::getenv("HP_SHOWEVERY") ? std::atoi(std::getenv("HP_SHOWEVERY")) : 1;
+        if (flip || (drawn && since >= every)) {
             post_locked(true, &regs);
             last = regs;
             have_last = true;
