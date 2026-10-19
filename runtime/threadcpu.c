@@ -33,8 +33,11 @@ void hp_thread_register(const char *name) {
            IOP: sound, pads, timers) in the same class, so those preempt them when they wake */
         int heavy = !strncmp(name, "ee", 2) || !strcmp(name, "render");
 #if TARGET_OS_IOS
-        /* two performance cores on iPhones: the GS thread must not sink to an efficiency core */
-        pthread_set_qos_class_self_np(is_low ? QOS_CLASS_USER_INITIATED : QOS_CLASS_USER_INTERACTIVE, heavy ? -4 : 0);
+        /* two performance cores on iPhones: the heavy threads (EE, render, GS) are user-initiated,
+           the light timing ones (vblank, alarm, IOP: sound, pads, timers) user-interactive, so
+           those always get a core when they wake */
+        int heavy_ios = heavy || is_low;
+        pthread_set_qos_class_self_np(heavy_ios ? QOS_CLASS_USER_INITIATED : QOS_CLASS_USER_INTERACTIVE, 0);
 #else
         pthread_set_qos_class_self_np(is_low ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INTERACTIVE, heavy ? -4 : 0);
 #endif

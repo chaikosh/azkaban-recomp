@@ -49,8 +49,7 @@ std::uint64_t g_synced = 0;   // EE cycles the IOP has caught up to
 bool g_running = false;
 void (*g_sink)(const std::int16_t *, std::size_t) = nullptr;
 
-void advance_locked() {
-    const std::uint64_t t = ps2::now();
+void advance_to_locked(std::uint64_t t) {
     if (t > g_synced) {
         // keep slices short so SIF replies are not held back by a long catch-up
         std::uint64_t left = t - g_synced;
@@ -63,12 +62,36 @@ void advance_locked() {
     }
     ps2::sif::pump();
 }
+void advance_locked() { advance_to_locked(ps2::now()); }
+
+// Vblank edges come from the vblank thread as timestamped events; the IOP thread delivers them
+// after catching up to their time.  The vblank thread used to run the IOP catch-up itself under
+// g_lock: it was late whenever that took a while (the iPhone's vblanks fell to 51-57/s, padman
+// reported VBLANK OVERLAP and the sound broke up).
+struct VblankEvent { std::uint64_t at; bool start; };
+std::mutex g_vb_lock;
+VblankEvent g_vb[64];
+unsigned g_vb_head = 0, g_vb_tail = 0;
+
+void deliver_vblanks_locked() {
+    for (;;) {
+        VblankEvent e;
+        {
+            std::lock_guard<std::mutex> vl(g_vb_lock);
+            if (g_vb_head == g_vb_tail) return;
+            e = g_vb[g_vb_head++ % 64];
+        }
+        advance_to_locked(e.at);
+        ps2::iop::vblank(e.start);
+    }
+}
 
 extern "C" void hp_thread_register(const char *name);
 void iop_thread() {
     hp_thread_register("iop");
     std::unique_lock<std::recursive_mutex> lk(g_lock);
     while (g_running) {
+        deliver_vblanks_locked();
         advance_locked();
         g_wake.wait_for(lk, std::chrono::microseconds(250));
     }
@@ -158,12 +181,18 @@ void iopb_sif_set_reg(uint32_t reg, uint32_t v) {
 }
 
 void iopb_vblank(int start) {
-    std::lock_guard<std::recursive_mutex> lk(g_lock);
-    advance_locked();
-    ps2::iop::vblank(start != 0);
-    // memory card writes reach the file once the card has been idle for 50 vblanks (nothing
-    // called this before: saves were never written to disk)
-    if (start) ps2::iop::sio2::flush_cards();
+    static const bool direct = std::getenv("HP_IOPVBLANKSYNC") != nullptr;   // the old way, on this thread
+    if (direct) {
+        std::lock_guard<std::recursive_mutex> lk(g_lock);
+        advance_locked();
+        ps2::iop::vblank(start != 0);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> vl(g_vb_lock);
+        if (g_vb_tail - g_vb_head < 64) g_vb[g_vb_tail++ % 64] = VblankEvent{ps2::now(), start != 0};
+    }
+    g_wake.notify_one();
 }
 
 void iopb_set_pad(int pad, uint16_t pressed, const uint8_t axes[4]) {

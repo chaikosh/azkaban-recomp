@@ -195,7 +195,12 @@ static void audio_sink(const int16_t *samples, size_t frames) {
         g_audio_underruns++;
     }
     SDL_PutAudioStreamData(g_audio, samples, (int)(frames * 4));
-    if (g_audio_paused && queued + (int)(frames * 4) >= 48000 * 4 / 10) {
+#if TARGET_OS_IOS
+    const int margin = 48000 * 4 * 15 / 100;   /* 150 ms on phones */
+#else
+    const int margin = 48000 * 4 / 10;         /* 100 ms */
+#endif
+    if (g_audio_paused && queued + (int)(frames * 4) >= margin) {
         SDL_ResumeAudioStreamDevice(g_audio);
         g_audio_paused = 0;
     }
