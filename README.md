@@ -10,15 +10,21 @@ assets and no game code. You must supply your own legally obtained disc.
 
 ## Status (October 2026)
 
-Early work in progress.
+Work in progress.
 
-- Boots, runs the Emotion Engine kernel and the IOP services.
-- Shows the loading and memory-card screens correctly.
-- Decodes the intro movies (they are not displayed yet).
-- Loads the front-end packages.
-- No menu and no gameplay yet.
-- Sound is stubbed: there is no audio output.
-- macOS (SDL3 window) and iOS (see [iOS](#ios); simulator-tested).
+- Boots through the memory-card screen, the EA and WB logos and the intro
+  movies (MPEG decoding matches ffmpeg frame for frame) to the main menu.
+- New Game reaches the Hogwarts Express and its 3D scenes with correct
+  textures and geometry.
+- Music and sound come from the game's own IOP modules, run on a low-level IOP
+  (vendored from ps2-web-recomp, see `THIRD_PARTY.md`).
+- EE code and the VU1 microprograms are statically recompiled to C; the VU1
+  code is checked bit-exact against the interpreter.
+- Two GS renderers: the software reference and a GPU renderer (WebGPU on Metal).
+- macOS (M1): the first 3D scene runs at the game's own 30 fps cap.
+- iOS: runs on an iPhone 14 Pro Max (see [iOS](#ios)); 3D runs at 15–20 fps
+  and the sound stutters there, which is being worked on.
+- Only the start of the game has been tested so far.
 
 ## How it works
 
