@@ -77,6 +77,29 @@ const char *hp_ios_setup(void) {
         if (freopen(log, "w", stderr)) setvbuf(stderr, NULL, _IONBF, 0);
     }
     if (chdir(docs) != 0) fprintf(stderr, "[ios] cannot enter %s\n", docs);   /* relative paths (HP_WAV=rec.wav, HP_SHOT=shots) land in Documents */
+    {   /* Documents/options.txt: one NAME=VALUE per line, set as environment variables before the
+           defaults below (e.g. HP_GPUPOINT=1 for nearest-texel sampling, HP_NOUPLOADSKIP=1);
+           a line starting with # is a comment.  Edit it from a Mac through Finder file sharing. */
+        char path[1200];
+        snprintf(path, sizeof path, "%s/options.txt", docs);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char line[512];
+            while (fgets(line, sizeof line, f)) {
+                char *p = line;
+                while (*p == ' ' || *p == '\t') p++;
+                if (*p == '#' || *p == '\n' || !*p) continue;
+                char *eq = strchr(p, '=');
+                if (!eq) continue;
+                *eq = 0;
+                char *v = eq + 1, *nl = strpbrk(v, "\r\n");
+                if (nl) *nl = 0;
+                setenv(p, v, 1);
+                fprintf(stderr, "[ios] option %s=%s\n", p, v);
+            }
+            fclose(f);
+        }
+    }
     setenv("HP_GS", "gpu", 0);
     setenv("HP_FPSLOG", "1", 0);   /* a [fps] line in hp.log every 5 s */
     /* VU1 microprograms the recompiled set does not have yet run in the interpreter (slow); keep
