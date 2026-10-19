@@ -1102,8 +1102,15 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     scratch[i] = atomicLoad(&vram[i * SCALE * SCALE]);
 }
 
+// hp: the tile's list is read 256 entries at a time into workgroup memory (one load per
+// invocation instead of four per invocation per entry), and a primitive's setup is only loaded by
+// the invocations inside its bounding box.  Same order and results as before.
+var<workgroup> sh_prim: array<u32, 256>;
+var<workgroup> sh_lo: array<u32, 256>;
+var<workgroup> sh_hi: array<u32, 256>;
+
 @compute @workgroup_size(16, 16)
-fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let index = wid.x + wid.y * 1024u;
     if (index >= prm(3u)) {
         return;
@@ -1126,19 +1133,30 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
     snapshot_hi = prm(6u);
     var last_setup = 0xFFFFFFFFu;
     var s: Setup;
-    for (var i = 0u; i < count; i = i + 1u) {
-        let h = first + i;
-        let p = prims + ((data[lists + (h >> 1u)] >> ((h & 1u) * 16u)) & 0xFFFFu) * PRIM_WORDS;
-        let si = data[p];
-        if (si != last_setup) {
-            s = load_setup(setups + si * SETUP_WORDS);
-            last_setup = si;
+    for (var base = 0u; base < count; base = base + 256u) {
+        let n = min(256u, count - base);
+        if (li < n) {
+            let h = first + base + li;
+            let p = prims + ((data[lists + (h >> 1u)] >> ((h & 1u) * 16u)) & 0xFFFFu) * PRIM_WORDS;
+            sh_prim[li] = p;
+            sh_lo[li] = data[p + 2u];
+            sh_hi[li] = data[p + 3u];
         }
-        let lo = data[p + 2u];
-        let hi = data[p + 3u];
-        if (x < i32(lo & 0xFFFFu) || y < i32(lo >> 16u) || x > i32(hi & 0xFFFFu) || y > i32(hi >> 16u)) {
-            continue;
+        workgroupBarrier();
+        for (var j = 0u; j < n; j = j + 1u) {
+            let lo = sh_lo[j];
+            let hi = sh_hi[j];
+            if (x < i32(lo & 0xFFFFu) || y < i32(lo >> 16u) || x > i32(hi & 0xFFFFu) || y > i32(hi >> 16u)) {
+                continue;
+            }
+            let p = sh_prim[j];
+            let si = data[p];
+            if (si != last_setup) {
+                s = load_setup(setups + si * SETUP_WORDS);
+                last_setup = si;
+            }
+            shade_at(p, s, x, y, k, px, py);
         }
-        shade_at(p, s, x, y, k, px, py);
+        workgroupBarrier();
     }
 }

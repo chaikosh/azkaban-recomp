@@ -166,6 +166,7 @@ static void poll_input(SDL_Gamepad *pad) {
 #if TARGET_OS_IOS
     on |= touchpad_buttons();
     { uint8_t tx, ty; if (touchpad_stick(&tx, &ty)) { lx = tx; ly = ty; } }
+    { uint8_t tx, ty; if (touchpad_rstick(&tx, &ty)) { rx = tx; ry = ty; } }
 #endif
     uint8_t axes[4] = {(uint8_t)rx, (uint8_t)ry, (uint8_t)lx, (uint8_t)ly};
     { extern int iopb_enabled(void); extern void iopb_set_pad(int, uint16_t, const uint8_t *);

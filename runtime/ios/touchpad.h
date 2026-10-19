@@ -8,4 +8,5 @@ void touchpad_event(const SDL_Event *e);                /* finger events; others
 void touchpad_set_gamepad(int connected);               /* a physical controller hides the overlay until touched */
 uint16_t touchpad_buttons(void);                        /* pressed buttons, display.c bit order, 1 = pressed */
 int touchpad_stick(uint8_t *x, uint8_t *y);             /* left stick, 0..255; returns 0 when untouched */
+int touchpad_rstick(uint8_t *x, uint8_t *y);            /* right stick (camera), same */
 void touchpad_draw(SDL_Renderer *ren);

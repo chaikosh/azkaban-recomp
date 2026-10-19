@@ -27,15 +27,16 @@ enum { NBTN = 10, MAXF = 10 };
 static Button btn[NBTN];
 static float u = 1;                   /* 1% of the screen height, in pixels */
 static float dpx, dpy, dpr;           /* D-pad centre and radius */
-static float stx, sty, str;           /* stick base centre and radius */
+static float stx, sty, str;           /* left stick base centre and radius */
+static float rtx, rty;                /* right stick base centre (same radius): the camera */
 static int scr_w = 1, scr_h = 1;
 
-static struct { SDL_FingerID id; float x, y; int stick; } fin[MAXF];
+static struct { SDL_FingerID id; float x, y; int stick; } fin[MAXF];   /* stick: 0 none, 1 left, 2 right */
 static int nfin;
 static int hidden, pad_seen;
 static uint16_t pressed;
-static int stick_on;
-static float knob_x, knob_y;          /* -1..1 */
+static int stick_on, rstick_on;
+static float knob_x, knob_y, rknob_x, rknob_y;   /* -1..1 */
 
 void touchpad_layout(SDL_Window *win, int w, int h) {
     if (w <= 0 || h <= 0) return;
@@ -65,6 +66,7 @@ void touchpad_layout(SDL_Window *win, int w, int h) {
     btn[n++] = (Button){B_START, 0, w * 0.5f + 5 * u, 91 * u, 16 * u, 6 * u, "START"};
     dpx = left + 16 * u; dpy = 45 * u; dpr = 15 * u;
     stx = left + 22 * u; sty = 79 * u; str = 13 * u;
+    rtx = right - 22 * u; rty = 79 * u;
 }
 
 static int hit(const Button *b, float x, float y) {
@@ -75,14 +77,16 @@ static int hit(const Button *b, float x, float y) {
 
 static void update(void) {
     uint16_t on = 0;
-    stick_on = 0;
-    knob_x = knob_y = 0;
+    stick_on = rstick_on = 0;
+    knob_x = knob_y = rknob_x = rknob_y = 0;
     for (int k = 0; k < nfin; k++) {
         const float x = fin[k].x, y = fin[k].y;
         if (fin[k].stick) {
-            float dx = (x - stx) / str, dy = (y - sty) / str, m = hypotf(dx, dy);
+            const float cx = fin[k].stick == 2 ? rtx : stx, cy = fin[k].stick == 2 ? rty : sty;
+            float dx = (x - cx) / str, dy = (y - cy) / str, m = hypotf(dx, dy);
             if (m > 1) { dx /= m; dy /= m; }
-            knob_x = dx; knob_y = dy; stick_on = 1;
+            if (fin[k].stick == 2) { rknob_x = dx; rknob_y = dy; rstick_on = 1; }
+            else { knob_x = dx; knob_y = dy; stick_on = 1; }
             continue;
         }
         for (int i = 0; i < NBTN; i++)
@@ -113,8 +117,13 @@ void touchpad_event(const SDL_Event *e) {
         }
         fin[k].id = e->tfinger.fingerID;
         fin[k].x = x; fin[k].y = y;
-        const float ds = hypotf(x - stx, y - sty), dd = hypotf(x - dpx, y - dpy);
-        fin[k].stick = ds <= str * 1.5f && ds / str <= dd / dpr;
+        const float ds = hypotf(x - stx, y - sty), dd = hypotf(x - dpx, y - dpy), dr = hypotf(x - rtx, y - rty);
+        fin[k].stick = ds <= str * 1.5f && ds / str <= dd / dpr ? 1 : 0;
+        if (!fin[k].stick && dr <= str * 1.3f) {   /* the right stick, unless the finger is on a face button */
+            int on_button = 0;
+            for (int i = 0; i < NBTN; i++) on_button |= hit(&btn[i], x, y);
+            if (!on_button) fin[k].stick = 2;
+        }
     } else if (k < nfin) {
         if (t == SDL_EVENT_FINGER_MOTION) { fin[k].x = x; fin[k].y = y; }
         else fin[k] = fin[--nfin];
@@ -129,6 +138,14 @@ void touchpad_set_gamepad(int connected) {
 }
 
 uint16_t touchpad_buttons(void) { return pressed; }
+
+int touchpad_rstick(uint8_t *x, uint8_t *y) {
+    if (!rstick_on) return 0;
+    float vx = 128 + rknob_x * 127.5f, vy = 128 + rknob_y * 127.5f;
+    *x = (uint8_t)fminf(fmaxf(vx, 0), 255);
+    *y = (uint8_t)fminf(fmaxf(vy, 0), 255);
+    return 1;
+}
 
 int touchpad_stick(uint8_t *x, uint8_t *y) {
     if (!stick_on) return 0;
@@ -298,6 +315,11 @@ void touchpad_draw(SDL_Renderer *ren) {
     const float kr = 0.48f * str, travel = str - kr * 0.6f;
     disc(stx + knob_x * travel, sty + knob_y * travel, kr, stick_on ? DOWN : (SDL_FColor){1, 1, 1, 0.25f});
     ring(stx + knob_x * travel, sty + knob_y * travel, kr, t, EDGE);
+    /* right stick (camera) */
+    disc(rtx, rty, str, IDLE);
+    ring(rtx, rty, str, t, EDGE);
+    disc(rtx + rknob_x * travel, rty + rknob_y * travel, kr, rstick_on ? DOWN : (SDL_FColor){1, 1, 1, 0.25f});
+    ring(rtx + rknob_x * travel, rty + rknob_y * travel, kr, t, EDGE);
     /* buttons */
     for (int i = 0; i < NBTN; i++) {
         const Button *b = &btn[i];
