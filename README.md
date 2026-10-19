@@ -22,11 +22,13 @@ Work in progress.
   code is checked bit-exact against the interpreter.
 - Two GS renderers: the software reference and a GPU renderer (WebGPU on Metal).
 - macOS (M1): the train corridor runs at the game's own 30 fps cap with the
-  GPU ~42% busy, and the music no longer stutters.
+  GPU ~42% busy, and the music no longer stutters; 46 of the 48 rooms that can
+  be started directly (`HP_ARGS="-startChapter=... -startRoom=..."`) run at
+  30 fps too, with the VU1 microprograms of 62 rooms recompiled.
 - iOS: runs on an iPhone 14 Pro Max (see [iOS](#ios)); the current GPU
   renderer has not been measured there yet (it was 15–20 fps before the
   renderer work of 19 October).
-- Only the start of the game has been tested so far.
+- Gameplay past the train has only been checked by starting in rooms directly.
 
 ## How it works
 
