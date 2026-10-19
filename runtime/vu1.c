@@ -448,6 +448,7 @@ static int rec_on = -1, rec_check;
 static unsigned long long rec_runs, rec_bails, rec_misses, rec_bad;
 static int rec_nroutines;
 static int rt_head[2048], *rt_next;          /* routines by start pair */
+static void rec_index_h0(void);
 static unsigned *rt_gen; static uint8_t *rt_ok; /* validity per code generation */
 static int rec_enabled(void) {
     if (rec_on < 0) {
@@ -464,26 +465,67 @@ static int rec_enabled(void) {
             rt_next[k] = rt_head[st];
             rt_head[st] = k;
         }
+        rec_index_h0();
         LOG("[vu1rec] %d recompiled routines%s%s\n", rec_nroutines, rec_on ? "" : " (disabled by HP_VUREC=0)", rec_check ? ", checking every run" : "");
     }
     return rec_on;
 }
-/* A routine is used while micro memory holds exactly the pairs it was compiled from. */
-static const VuRoutine *rec_lookup(uint32_t pc) {
+/* A routine is used while micro memory holds exactly the pairs it was compiled from, at its own
+   start or shifted: the game loads the same microcode at different places, and the routines
+   shift every pc they produce by *d (vu1rec.py).  Shifted ones are found by their first two pairs
+   (h0) and remembered per pc until the code changes. */
+static uint64_t rec_key_at(const VuRoutine *r, uint32_t d) {
+    uint64_t h = 1469598103934665603ull;
+    for (const uint16_t *g = r->ranges; *g != 0xffff; g += 2)
+        for (uint32_t n = g[0]; n < g[1]; n++)
+            for (int b = 0; b < 8; b++) { h ^= g_vu1_code[((n + d) & 0x7ff) * 8 + b]; h *= 1099511628211ull; }
+    return h;
+}
+static int *h0_head, *h0_next, h0_mask;
+static struct { unsigned gen; int k; uint16_t d; } reloc_cache[2048];
+static void rec_index_h0(void) {
+    h0_mask = 1; while (h0_mask < rec_nroutines * 2) h0_mask <<= 1; h0_mask--;
+    h0_head = malloc((h0_mask + 1) * sizeof *h0_head); h0_next = calloc(rec_nroutines + 1, sizeof *h0_next);
+    for (int k = 0; k <= h0_mask; k++) h0_head[k] = -1;
+    for (int k = rec_nroutines - 1; k >= 0; k--) {
+        int b = (int)(g_vu1_routines[k].h0 & h0_mask);
+        h0_next[k] = h0_head[b];
+        h0_head[b] = k;
+    }
+}
+static const VuRoutine *rec_lookup(uint32_t pc, uint32_t *d) {
     extern unsigned g_vu1_code_gen;
-    for (int k = rt_head[pc & 0x7ff]; k >= 0; k = rt_next[k]) {
+    pc &= 0x7ff;
+    for (int k = rt_head[pc]; k >= 0; k = rt_next[k]) {
         const VuRoutine *r = &g_vu1_routines[k];
         if (rt_gen[k] != g_vu1_code_gen) {
-            uint64_t h = 1469598103934665603ull;
-            for (const uint16_t *g = r->ranges; *g != 0xffff; g += 2)
-                for (uint32_t n = g[0]; n < g[1]; n++)
-                    for (int b = 0; b < 8; b++) { h ^= g_vu1_code[(n & 0x7ff) * 8 + b]; h *= 1099511628211ull; }
-            rt_ok[k] = h == r->key;
+            rt_ok[k] = rec_key_at(r, 0) == r->key;
             rt_gen[k] = g_vu1_code_gen;
         }
-        if (rt_ok[k]) return r;
+        if (rt_ok[k]) { *d = 0; return r; }
     }
-    return NULL;
+    static int reloc_on = -1;
+    if (reloc_on < 0) reloc_on = !getenv("HP_VURELOC") || strcmp(getenv("HP_VURELOC"), "0") != 0;
+    if (!reloc_on) return NULL;
+    if (reloc_cache[pc].gen == g_vu1_code_gen + 1) {   /* +1: 0 means empty */
+        if (reloc_cache[pc].k < 0) return NULL;
+        *d = reloc_cache[pc].d;
+        return &g_vu1_routines[reloc_cache[pc].k];
+    }
+    uint64_t h0 = 1469598103934665603ull;
+    for (uint32_t m = pc; m <= pc + 1; m++)
+        for (int b = 0; b < 8; b++) { h0 ^= g_vu1_code[(m & 0x7ff) * 8 + b]; h0 *= 1099511628211ull; }
+    int found = -1;
+    for (int k = h0_head[h0 & h0_mask]; k >= 0 && found < 0; k = h0_next[k]) {
+        const VuRoutine *r = &g_vu1_routines[k];
+        if (r->h0 != h0) continue;
+        uint32_t dd = (pc - r->start) & 0x7ff;
+        if (rec_key_at(r, dd) == r->key) { found = k; *d = dd; }
+    }
+    reloc_cache[pc].gen = g_vu1_code_gen + 1;
+    reloc_cache[pc].k = found;
+    reloc_cache[pc].d = (uint16_t)*d;
+    return found >= 0 ? &g_vu1_routines[found] : NULL;
 }
 static void rec_note_miss(uint32_t pc, uint32_t start) {
     static uint32_t missed[64]; static int nmissed;
@@ -498,15 +540,17 @@ static void rec_note_miss(uint32_t pc, uint32_t start) {
 /* Runs the program at start through recompiled routines (the interpreter takes over where none
    fits).  Returns 0 if no routine fits the start at all (nothing was run). */
 static int rec_run(uint32_t start) {
-    const VuRoutine *rt = rec_lookup(start);
+    uint32_t d = 0;
+    const VuRoutine *rt = rec_lookup(start, &d);
     if (!rt) { rec_note_miss(start, start); if (collect_jr) note_jr(start); return 0; }
     rec_runs++;
     VuResume r;
     r.due = -1;
     for (long hops = 0; hops < 1000000; hops++) {
+        r.d = d;
         if (!rt->fn(&vu, &r)) return 1;
         if (r.jr_miss != 2) break;               /* a case the routines do not compile */
-        const VuRoutine *next = rec_lookup(r.pc);
+        const VuRoutine *next = rec_lookup(r.pc, &d);
         if (!next) { rec_misses++; rec_note_miss(r.pc, start); if (collect_jr) note_jr(r.pc); break; }
         rt = next;
     }

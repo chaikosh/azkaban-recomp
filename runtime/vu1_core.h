@@ -40,6 +40,7 @@ typedef struct {
     uint32_t pc;
     int ending, branch_pending, due, jr_miss;
     uint32_t branch_target;
+    uint32_t d;                /* where the routine runs: its start + d (mod 2048) */
 } VuResume;
 
 /* Recompiled routines (build/recomp/vu1_gen.c): code reachable from one start pair up to the next
@@ -52,6 +53,7 @@ typedef struct {
     VuRtFn fn;
     const uint16_t *ranges;    /* pairs it was compiled from: [a, b) ..., 0xffff */
     uint64_t key;              /* FNV-1a of those pairs: usable while micro memory holds them */
+    uint64_t h0;               /* FNV-1a of the start pair and the next (finding it elsewhere) */
 } VuRoutine;
 extern const VuRoutine g_vu1_routines[];
 

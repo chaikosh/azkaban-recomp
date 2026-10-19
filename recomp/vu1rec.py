@@ -529,8 +529,8 @@ class Gen:
         if opc == 0x1c:
             return L, None, (it, '(uint16_t)(s.clip & 0xfff)'), None
         # branches: link registers here, the jump itself in branch_cond()
-        if opc in (0x21, 0x25):
-            return L, None, (it, f'(uint16_t){(n + 2) & 0xffff}'), None
+        if opc in (0x21, 0x25):   # the link is the actual pc + 2 (D: where the routine runs, see function())
+            return L, None, (it, f'(uint16_t)((({n} + D) & 0x7ff) + 2)'), None
         return L, None, None, None
 
     def branch_cond(self, lo, n):
@@ -544,7 +544,7 @@ class Gen:
                  0x2f: f'(int16_t){VIS} >= 0'}
         if opc in (0x24, 0x25):
             return '1', f'({VIS} & 0x7ff)'
-        return conds[opc], str(tgt)
+        return conds[opc], f'(({tgt} + D) & 0x7ff)'
 
     def body(self, n, kick_check, tk_var=None):
         """C for one pair: execute, commit, XGKICK.  If tk_var is set and the pair branches, the
@@ -612,6 +612,9 @@ class Gen:
         # the data memory, so they can stay in host registers across stores and kicks
         out = [f'static int {name}(VU1 *restrict g, VuResume *restrict res) {{']
         out.append('#define s (*g)')
+        # D: how far from `start` the routine runs this time (the game loads the same microcode at
+        # different places); every pc the code produces is shifted by it, mod 2048
+        out.append('    const uint32_t D = res->d; (void)D;')
         out.append('    int due = res->due, tk = 0, tk2 = 0; uint32_t tkt = 0, tk2t = 0, tpc = 0;')
         out.append('    V4 ur, lr; uint16_t viv; int kv;')
         out.append('    (void)tk2; (void)tk2t; (void)ur; (void)lr; (void)viv; (void)kv;')
@@ -625,7 +628,7 @@ class Gen:
                 out += ['    ' + l for l in self.body(n, True, 'tk' if br else None)]
                 out.append('    /* E bit: the next pair runs, then the program ends */')
                 out += ['    ' + l for l in self.body(d, prev_kick(d), None)]
-                out.append(f'    tpc = tk ? (tkt & 0x7ff) : {(n + 2) & 0x7ff};' if br else f'    tpc = {(n + 2) & 0x7ff};')
+                out.append(f'    tpc = tk ? (tkt & 0x7ff) : (({(n + 2) & 0x7ff} + D) & 0x7ff);' if br else f'    tpc = ({(n + 2) & 0x7ff} + D) & 0x7ff;')
                 out.append('    goto done;')
             elif br:
                 out += ['    ' + l for l in self.body(n, True, 'tk')]
@@ -633,7 +636,7 @@ class Gen:
                 out.append('    /* delay slot */')
                 out += ['    ' + l for l in self.body(d, prev_kick(d), 'tk2' if dbr else None)]
                 if dbr or img.ebit(d):
-                    out.append(f'    res->pc = tk ? (tkt & 0x7ff) : {(n + 2) & 0x7ff};')
+                    out.append(f'    res->pc = tk ? (tkt & 0x7ff) : (({(n + 2) & 0x7ff} + D) & 0x7ff);')
                     out.append(f'    res->branch_pending = {"tk2" if dbr else "0"}; res->branch_target = {"tk2t" if dbr else "0"};')
                     out.append(f'    res->ending = {1 if img.ebit(d) else 0}; res->jr_miss = 0;')
                     out.append('    goto bail;')
@@ -664,6 +667,11 @@ class Gen:
         out.append('}')
         flat = ', '.join(f'{a}, {b}' for a, b in ranges)
         out.append(f'static const uint16_t rg_{self.start:04x}_{key:016x}[] = {{{flat}, 0xffff}};')
+        h0 = 1469598103934665603   # the start pair and the next: the runtime finds relocated routines by it
+        for m in (self.start, (self.start + 1) & 0x7ff):
+            for b in img.lo[m].to_bytes(4, 'little') + img.up[m].to_bytes(4, 'little'):
+                h0 = ((h0 ^ b) * 1099511628211) & 0xffffffffffffffff
+        self.h0 = h0
         return out, len(pcs)
 
 
@@ -722,7 +730,8 @@ def main():
             work.extend(r for r in returns if r not in starts)
             g = Gen(img, flags, status, st, pcs)
             lines, n = g.function()
-            ident = (st, g.key, tuple(map(tuple, g.ranges)))
+            # the same code loaded elsewhere is the same routine (it runs anywhere, shifted by D)
+            ident = (g.key, tuple((a - st) & 0x7ff for r in g.ranges for a in r))
             if ident in seen:
                 continue
             seen.add(ident)
@@ -737,11 +746,11 @@ def main():
             total += n
             out += lines
             out.append('')
-            table.append((st, name, ranges, g.key))
+            table.append((st, name, ranges, g.key, g.h0))
     out.append('const VuRoutine g_vu1_routines[] = {')
-    for st, name, ranges, key in table:
-        out.append(f'    {{{st}, {name}, {ranges}, 0x{key:016x}ull}},')
-    out.append('    {0, 0, 0, 0},')
+    for st, name, ranges, key, h0 in table:
+        out.append(f'    {{{st}, {name}, {ranges}, 0x{key:016x}ull, 0x{h0:016x}ull}},')
+    out.append('    {0, 0, 0, 0, 0},')
     out.append('};')
     with open(dst, 'w') as f:
         f.write('\n'.join(out) + '\n')
