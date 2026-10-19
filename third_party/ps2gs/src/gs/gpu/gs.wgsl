@@ -302,8 +302,16 @@ fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
     let k = i - data[r + 11u];
     let rrw = data[r + 5u];
     let p = data[r + 6u] + k;
-    let x = (data[r + 3u] + p % rrw) & 0x7FFu;
-    let y = (data[r + 4u] + p / rrw) & 0x7FFu;
+    // hp: p / rrw through a float reciprocal, corrected to the exact quotient (integer division is
+    // slow on the GPU and ran for every pixel uploaded)
+    var row = u32(f32(p) / f32(rrw));
+    if (row * rrw > p) {
+        row = row - 1u;
+    } else if ((row + 1u) * rrw <= p) {
+        row = row + 1u;
+    }
+    let x = (data[r + 3u] + (p - row * rrw)) & 0x7FFu;
+    let y = (data[r + 4u] + row) & 0x7FFu;
     let bpp = data[r + 10u] & 0xFFu;
     var v = 0u;
     if ((data[r + 10u] & 0x80000000u) != 0u) {
