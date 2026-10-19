@@ -40,6 +40,8 @@ void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vec
 void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, const std::vector<std::uint32_t> &clut);
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
+// hp: the newest readback copy that finished since the last frame returned, without starting one
+bool poll_display(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 bool attach_surface(const SurfaceTarget &target);
 void resize_surface(std::uint32_t width, std::uint32_t height);
 bool has_surface();

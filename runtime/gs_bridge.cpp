@@ -135,6 +135,15 @@ bool source_of(const Show &r, ps2::gs::gpu::DisplaySource &src) {
     return true;
 }
 
+void publish(const std::vector<std::uint32_t> &rgba, std::uint32_t w, std::uint32_t h) {
+    if (!w || !h || rgba.size() < static_cast<std::size_t>(w) * h) return;
+    std::lock_guard<std::mutex> fl(g_frame_lock);
+    g_frame.assign(rgba.begin(), rgba.begin() + static_cast<std::ptrdiff_t>(w) * h);
+    g_frame_w = w;
+    g_frame_h = h;
+    ++g_frame_serial;
+}
+
 // Reads back the displayed buffer (asynchronously: the newest finished copy) into g_frame.
 unsigned long long g_shows_done = 0;   // frame requests run by the GS thread (for the [fps] line)
 
@@ -151,22 +160,34 @@ void show_frame(const Show &r) {   // g_lock held
         // (the GS thread then waits for the GPU each time: slower).
         static const bool sync = std::getenv("HP_GSSYNC") != nullptr;
         const bool ok = sync ? ps2::gs::gpu::display(src, rgba, w, h) : ps2::gs::gpu::display_async(src, rgba, w, h);
-        if (ok && w && h && rgba.size() >= static_cast<std::size_t>(w) * h) {
-            std::lock_guard<std::mutex> fl(g_frame_lock);
-            g_frame.assign(rgba.begin(), rgba.begin() + static_cast<std::ptrdiff_t>(w) * h);
-            g_frame_w = w;
-            g_frame_h = h;
-            ++g_frame_serial;
-        }
+        if (ok) publish(rgba, w, h);
     }
     g_display_s += secs() - t0;
+}
+
+// A readback that finished since the last frame request is handed on now (the GS thread checks
+// after each batch and every 2 ms while idle): the vblank that showed a frame used to depend on
+// when the next request reached the GS thread.  HP_FRAMEPOLL=0 waits for the request again.
+void poll_frame() {   // g_lock held
+    static const bool on = !std::getenv("HP_FRAMEPOLL") || std::atoi(std::getenv("HP_FRAMEPOLL")) != 0;
+    if (!on) return;
+    static std::vector<std::uint32_t> rgba;
+    std::uint32_t w = 0, h = 0;
+    if (ps2::gs::gpu::poll_display(rgba, w, h)) publish(rgba, w, h);
 }
 
 void gs_thread() {
     hp_thread_register("gs");
     std::unique_lock<std::mutex> ql(g_q_lock);
     for (;;) {
-        g_q_cv.wait(ql, [] { return !g_queue.empty(); });
+        while (!g_q_cv.wait_for(ql, std::chrono::milliseconds(2), [] { return !g_queue.empty(); })) {
+            ql.unlock();
+            {
+                std::lock_guard<std::mutex> lk(g_lock);
+                poll_frame();
+            }
+            ql.lock();
+        }
         Item it = std::move(g_queue.front());
         g_queue.pop_front();
         g_queued_bytes -= it.batch.data.size();
@@ -177,6 +198,7 @@ void gs_thread() {
             std::lock_guard<std::mutex> lk(g_lock);
             render_batch(it.batch);
             if (it.show) show_frame(it.regs);
+            else poll_frame();
         }
         ql.lock();
         if (it.batch.data.capacity() && g_free.size() < 8) g_free.push_back(std::move(it.batch));

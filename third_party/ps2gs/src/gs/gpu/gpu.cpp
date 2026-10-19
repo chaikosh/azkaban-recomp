@@ -2265,6 +2265,52 @@ bool g_skip_copy = false;
 Copy g_copies[2];   // hp: at most 2 frames in flight: more only added input latency (the GPU sets the pace)
 std::uint64_t g_copy_order = 0;
 
+// hp: takes the newest finished readback copy (newer than the last one returned) into rgba;
+// false when none is.  Copies older than it are dropped (they may finish out of order).
+std::uint32_t g_returned_order = 0;
+bool collect_copy(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
+    // hp: a copy older than the last frame returned is stale (copies may finish out of order)
+    for (Copy &c : g_copies)
+        if (c.ready && c.order <= g_returned_order) {
+            wgpuBufferUnmap(c.buffer);
+            c.ready = c.busy = false;
+        }
+    Copy *newest = nullptr;
+    for (Copy &c : g_copies)
+        if (c.ready && (!newest || c.order > newest->order)) newest = &c;
+    if (newest) g_returned_order = newest->order;
+    if (newest) {
+        const std::uint64_t bytes = static_cast<std::uint64_t>(newest->width) * newest->height * 4;
+        const void *mapped = wgpuBufferGetConstMappedRange(newest->buffer, 0, bytes);
+        if (mapped) {
+            rgba.resize(static_cast<std::size_t>(newest->width) * newest->height);
+            std::memcpy(rgba.data(), mapped, bytes);
+            width = newest->width;
+            height = newest->height;
+        }
+        for (Copy &c : g_copies)
+            if (c.ready && c.order <= newest->order) {
+                wgpuBufferUnmap(c.buffer);
+                c.ready = c.busy = false;
+            }
+        if (!mapped) newest = nullptr;
+    }
+    return newest != nullptr;
+}
+
+// hp: called by the GS thread between its work and while idle, so a finished frame is handed on
+// as soon as the GPU is through with it, not at the next frame request (which made the vblank
+// that shows it vary by one, frames shown after 1 and 3 vblanks at 30 fps)
+bool poll_display(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
+    if (g_mode != Mode::primary || !g_device) return false;
+#ifndef __EMSCRIPTEN__
+    wgpuDevicePoll(g_device, false, nullptr);
+#endif
+    bool any_ready = false;
+    for (Copy &c : g_copies) any_ready |= c.ready && c.order > g_returned_order;
+    return any_ready && collect_copy(rgba, width, height);
+}
+
 bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
     { static unsigned n; if (++n % 600 == 0) hp_flush_report(); }
     // hp: nothing new to show unless something wrote into the displayed area since the last copy
@@ -2316,44 +2362,18 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
         wgpuDevicePoll(g_device, true, &oldest->submission);
     }
 #endif
-    // hp: a copy older than the last frame returned is stale (copies may finish out of order)
-    static std::uint32_t returned_order = 0;
-    for (Copy &c : g_copies)
-        if (c.ready && c.order <= returned_order) {
-            wgpuBufferUnmap(c.buffer);
-            c.ready = c.busy = false;
-        }
-    Copy *newest = nullptr;
-    for (Copy &c : g_copies)
-        if (c.ready && (!newest || c.order > newest->order)) newest = &c;
-    if (newest) returned_order = newest->order;
+    const bool got_frame = collect_copy(rgba, width, height);
     {   // hp: HP_GSASYNCLOG counts how the asynchronous readback copies come back
         static const bool on = std::getenv("HP_GSASYNCLOG") != nullptr;
         static unsigned calls, got, busy_all;
         if (on) {
             ++calls;
-            if (newest) ++got;
+            if (got_frame) ++got;
             bool any_free = false;
             for (Copy &c : g_copies) any_free |= !c.busy;
             if (!any_free) ++busy_all;
             if (calls % 300 == 0) { std::fprintf(stderr, "[gpu] async display: %u calls, %u frames back, %u calls with every copy busy\n", calls, got, busy_all); calls = got = busy_all = 0; }
         }
-    }
-    if (newest) {
-        const std::uint64_t bytes = static_cast<std::uint64_t>(newest->width) * newest->height * 4;
-        const void *mapped = wgpuBufferGetConstMappedRange(newest->buffer, 0, bytes);
-        if (mapped) {
-            rgba.resize(static_cast<std::size_t>(newest->width) * newest->height);
-            std::memcpy(rgba.data(), mapped, bytes);
-            width = newest->width;
-            height = newest->height;
-        }
-        for (Copy &c : g_copies)
-            if (c.ready && c.order <= newest->order) {
-                wgpuBufferUnmap(c.buffer);
-                c.ready = c.busy = false;
-            }
-        if (!mapped) newest = nullptr;
     }
     Copy *slot = nullptr;
     for (Copy &c : g_copies)
@@ -2394,7 +2414,7 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
         cb.userdata1 = slot;
         wgpuBufferMapAsync(slot->buffer, WGPUMapMode_Read, 0, bytes, cb);
     }
-    return newest != nullptr;
+    return got_frame;
 }
 
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
