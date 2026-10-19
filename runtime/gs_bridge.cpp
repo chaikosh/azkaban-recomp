@@ -39,6 +39,7 @@ extern std::uint64_t g_hp_image_calls, g_hp_image_bytes, g_hp_emits, g_hp_pre_to
 }
 
 extern "C" int gsb_mirror(void);
+extern "C" int display_pcrtc_merge(std::uint64_t pmode);
 
 namespace {
 std::mutex g_lock;   // the vendored GS
@@ -125,16 +126,7 @@ void render_batch(Batch &b) {   // g_lock held
 }
 
 bool source_of(const Show &r, ps2::gs::gpu::DisplaySource &src) {
-    const int circuit = (r.pmode & 2u) ? 1 : (r.pmode & 1u) ? 0 : -1;
-    if (circuit < 0) return false;
-    const std::uint64_t fb = r.dispfb[circuit], disp = r.display[circuit];
-    const std::uint32_t magh = (static_cast<std::uint32_t>(disp >> 23) & 0xFu) + 1, magv = (static_cast<std::uint32_t>(disp >> 27) & 3u) + 1;
-    const std::uint32_t sw = ((static_cast<std::uint32_t>(disp >> 32) & 0xFFFu) + 1) / magh, sh = ((static_cast<std::uint32_t>(disp >> 44) & 0x7FFu) + 1) / magv;
-    if (!sw || !sh || sw > 2048 || sh > 2048) return false;
-    src = ps2::gs::gpu::DisplaySource{(static_cast<std::uint32_t>(fb) & 0x1FFu) * 32, static_cast<std::uint32_t>(fb >> 9) & 0x3Fu,
-                                      static_cast<std::uint32_t>(fb >> 15) & 0x1Fu, static_cast<std::uint32_t>(fb >> 32) & 0x7FFu,
-                                      static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, sw, sh, (r.smode2 & 3u) == 3u};
-    return true;
+    return ps2::gs::gpu::display_source(r.pmode, r.smode2, r.dispfb, r.display, static_cast<std::uint32_t>(display_pcrtc_merge(r.pmode)), src);
 }
 
 void publish(const std::vector<std::uint32_t> &rgba, std::uint32_t w, std::uint32_t h) {

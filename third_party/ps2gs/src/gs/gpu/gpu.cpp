@@ -359,6 +359,12 @@ std::uint32_t push_params(const std::initializer_list<std::uint32_t> values) {
     return static_cast<std::uint32_t>(g_param_records.size() - 1);
 }
 
+// parameters of the display pass (gs.wgsl display): the source, the scratch offset, the PCRTC merge
+std::uint32_t display_param(const DisplaySource &src, std::uint32_t base) {
+    return push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u, base, src.merge, src.fbp2,
+                        src.fbw2, src.psm2, src.dbx2, src.dby2, src.width2, src.height2, static_cast<std::uint32_t>(src.ox), static_cast<std::uint32_t>(src.oy)});
+}
+
 void dispatch_linear(Pipeline p, std::uint32_t items, std::uint32_t param) {
     const std::uint32_t groups = (items + 63) / 64;
     if (!groups) return;
@@ -2224,7 +2230,7 @@ bool present(const DisplaySource &src) {
     const std::uint32_t current = field_base(g_field), previous = field_base(g_field + 1);
     static const bool weave_off = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
     const bool blend = src.halved && g_have_previous && g_last_width == src.width && g_last_height == src.height && !weave_off;
-    const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u, current});
+    const std::uint32_t param = display_param(src, current);
     g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
     const float sw = static_cast<float>(g_surface_width), sh = static_cast<float>(g_surface_height);
     const float vw = std::min(sw, sh * 4.0f / 3.0f), vh = vw * 3.0f / 4.0f;
@@ -2392,7 +2398,7 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
             slot->buffer = make_buffer(bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
         }
         { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); flush_all(); }
-        const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u});
+        const std::uint32_t param = display_param(src, 0);
         g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
         submit();
         WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
@@ -2424,7 +2430,7 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
 
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
     { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); flush_all(); }
-    const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u});
+    const std::uint32_t param = display_param(src, 0);
     g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
     submit();
     width = src.width * g_scale;

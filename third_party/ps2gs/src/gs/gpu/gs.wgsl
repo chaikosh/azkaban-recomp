@@ -419,16 +419,35 @@ fn display(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= w || gid.y >= h) {
         return;
     }
-    let psm = prm(2u);
     var sy = gid.y;
     if (prm(7u) != 0u) {
         sy = gid.y / 2u;
     }
-    var c = read_sample(psm, prm(0u), prm(1u), prm(3u) + gid.x / SCALE, prm(4u) + sy / SCALE, (sy % SCALE) * SCALE + gid.x % SCALE);
+    let k = (sy % SCALE) * SCALE + gid.x % SCALE;
+    var c = display_texel(prm(2u), prm(0u), prm(1u), prm(3u) + gid.x / SCALE, prm(4u) + sy / SCALE, k);
+    if (prm(9u) != 0u) {   // PCRTC merge with the second circuit (params 9-18, gpu.cpp display_param)
+        let alp = prm(9u) - 1u;
+        let u = i32(gid.x / SCALE) - bitcast<i32>(prm(17u));
+        let v = i32(sy / SCALE) - bitcast<i32>(prm(18u));
+        if (u >= 0 && v >= 0 && u32(u) < prm(15u) && u32(v) < prm(16u)) {
+            let c2 = display_texel(prm(12u), prm(10u), prm(11u), prm(13u) + u32(u), prm(14u) + u32(v), k);
+            var m = 0u;
+            for (var ch = 0u; ch < 24u; ch = ch + 8u) {
+                let v8 = (((c >> ch) & 0xFFu) * alp + ((c2 >> ch) & 0xFFu) * (255u - alp)) / 255u;
+                m = m | (v8 << ch);
+            }
+            c = m;
+        }
+    }
+    scratch[prm(8u) + gid.y * w + gid.x] = c | 0xFF000000u;
+}
+
+fn display_texel(psm: u32, fbp: u32, fbw: u32, x: u32, y: u32, k: u32) -> u32 {
+    var c = read_sample(psm, fbp, fbw, x, y, k);
     if (psm == PSMCT16 || psm == PSMCT16S) {
         c = ((c & 0x1Fu) << 3u) | ((c & 0x3E0u) << 6u) | ((c & 0x7C00u) << 9u);
     }
-    scratch[prm(8u) + gid.y * w + gid.x] = c | 0xFF000000u;
+    return c & 0xFFFFFFu;
 }
 
 struct Setup {
