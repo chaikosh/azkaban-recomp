@@ -21,9 +21,11 @@ Work in progress.
 - EE code and the VU1 microprograms are statically recompiled to C; the VU1
   code is checked bit-exact against the interpreter.
 - Two GS renderers: the software reference and a GPU renderer (WebGPU on Metal).
-- macOS (M1): the first 3D scene runs at the game's own 30 fps cap.
-- iOS: runs on an iPhone 14 Pro Max (see [iOS](#ios)); 3D runs at 15–20 fps
-  and the sound stutters there, which is being worked on.
+- macOS (M1): the train corridor runs at the game's own 30 fps cap with the
+  GPU ~42% busy, and the music no longer stutters.
+- iOS: runs on an iPhone 14 Pro Max (see [iOS](#ios)); the current GPU
+  renderer has not been measured there yet (it was 15–20 fps before the
+  renderer work of 19 October).
 - Only the start of the game has been tested so far.
 
 ## How it works
@@ -123,6 +125,20 @@ opens the pause menu as soon as Harry can move. Steps: `wait:TEXT`,
 `sleep:SECONDS`, `exit`; the events are the FSCommands `HP_FSLOG=1` prints, and
 `card_written`. See `runtime/fastboot.c`.
 
+### GS traces
+
+`HP_GSREC=trace.gsr` records what the GPU renderer is given (GIF data, frame
+requests, downloads; a 30 s corridor run is ~4 GB). `make RELEASE=1 gsreplay`
+builds `build/rel/gsreplay`, which plays a trace back:
+
+    build/rel/gsreplay trace.gsr [outdir first last]
+
+It writes frames `first..last` as PPM and prints the time the GS passes took
+on the GPU. Renderer changes are checked by comparing the frames of two
+replays and timed on the same input (`HP_REPLAYASYNC=1` reads frames back the
+way the game does; `PS2_GPU_PROFILE=from,to,file` times every dispatch).
+Timings are only comparable with no game running at the same time.
+
 ## iOS
 
 `Makefile.ios` builds a native arm64 app for the iOS Simulator or an iPhone/iPad
@@ -217,6 +233,10 @@ a diagnostic dump.
 | `HP_HEADLESS` | core.c | Run without a window |
 | `HP_GS_THREADS` | gs.c | Number of rasterizer worker threads |
 | `HP_GS=gpu`, `HP_GSSYNC` | gs_bridge.cpp | GPU renderer; `HP_GSSYNC` waits for each displayed frame instead of showing the newest finished one |
+| `HP_GSREC`, `HP_GSRECMAX` | gs_bridge.cpp | Record everything the GPU GS is given to a file (stops at `HP_GSRECMAX` MB, default 4000) for `tools/gsreplay` |
+| `HP_GPUVARIANTS`, `HP_FRAMEPOLL` | gpu.cpp, gs_bridge.cpp | `HP_GPUVARIANTS=0` draws with the generic raster kernel only (`2`: specialise on frame/Z formats only); `HP_FRAMEPOLL=0` hands frames on at the next request only |
+| `HP_GPUFLUSHLOG`, `HP_GPULOOSETEX`, `HP_DECODEMAX`, `HP_NOCLUTSKIP`, `HP_NODECODECACHE` | gpu.cpp | Batch-end causes and texture decode census; the old padded texel test; largest decoded texture (log2 texels, 16); load every CLUT; no decode reuse |
+| `HP_EXP` | gs.wgsl | Switch parts of the raster kernel off (bits, see the shader) to measure what they cost on a trace |
 | `HP_CDLAT`, `HP_CDSEEK` | iop_servers.c | Emulated disc read latency / seek time |
 | `HP_ISO` | iop_servers.c | Path to the ISO image |
 
