@@ -144,7 +144,33 @@ struct Batch {
     std::uint32_t texflushes = 0;
     int rx0 = 0, ry0 = 0, rx1 = -2, ry1 = -2;
     Range fb_range, z_range;
+    // hp: the 8 KB pages of local memory the batch's primitives write (frame and Z), by bbox
+    std::uint64_t fb_pages[8] = {}, z_pages[8] = {};
 } g_batch;
+
+// hp: page sets.  region() spans from the buffer's base, so a texture kept anywhere between the
+// frame buffer's base and its last page (this game keeps them beside the frame) looked written
+// by the batch and ended it: ~170 batches per frame.  These follow the pages a rectangle touches.
+void page_size(std::uint32_t psm, std::uint32_t &pw, std::uint32_t &ph);
+template <typename F>
+void for_pages(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, int x0, int y0, int x1, int y1, F &&f) {
+    std::uint32_t pw, ph;
+    page_size(psm, pw, ph);
+    const std::uint32_t per_row = std::max<std::uint32_t>(1, bw * 64 / pw);
+    const std::uint32_t base = bp / 32, partial = bp % 32 ? 1u : 0u;   // a block-aligned buffer reaches into the next page
+    x0 = std::max(x0, 0); y0 = std::max(y0, 0);
+    for (std::uint32_t py = static_cast<std::uint32_t>(y0) / ph; py <= static_cast<std::uint32_t>(std::max(y1, 0)) / ph; ++py)
+        for (std::uint32_t px = static_cast<std::uint32_t>(x0) / pw; px <= static_cast<std::uint32_t>(std::max(x1, 0)) / pw; ++px)
+            for (std::uint32_t e = 0; e <= partial; ++e) f((base + px + py * per_row + e) & 511u);
+}
+void mark_pages(std::uint64_t *bits, std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, int x0, int y0, int x1, int y1) {
+    for_pages(bp, bw, psm, x0, y0, x1, y1, [&](std::uint32_t pg) { bits[pg >> 6] |= 1ull << (pg & 63); });
+}
+bool hits_pages(const std::uint64_t *bits, std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, int x0, int y0, int x1, int y1) {
+    bool hit = false;
+    for_pages(bp, bw, psm, x0, y0, x1, y1, [&](std::uint32_t pg) { hit = hit || ((bits[pg >> 6] >> (pg & 63)) & 1u); });
+    return hit;
+}
 
 struct SetupCache {
     std::uint32_t generation = ~0u, clut = ~0u;
@@ -435,6 +461,16 @@ Range pages(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, int x0, int y
     return r;
 }
 
+// hp: HP_GPUFLUSHLOG counts why primitive batches end (by source line), printed every 600 frames
+unsigned g_hp_flush_why[4096];
+static inline void hp_flush_note(int line) { g_hp_flush_why[line & 4095]++; }
+void hp_flush_report() {
+    static const bool on = std::getenv("HP_GPUFLUSHLOG") != nullptr;
+    if (!on) return;
+    std::fprintf(stderr, "[gpu] batch ends by line:");
+    for (int k = 0; k < 4096; k++) if (g_hp_flush_why[k]) { std::fprintf(stderr, " %d:%u", k, g_hp_flush_why[k]); g_hp_flush_why[k] = 0; }
+    std::fprintf(stderr, "\n");
+}
 // hp: the area last shown and whether anything wrote into it since (see display_async)
 Range g_watch;
 bool g_watch_dirty = true;
@@ -590,6 +626,8 @@ void flush_batch() {
     b.prims.clear();
     b.setups.clear();
     b.boxes.clear();
+    std::memset(b.fb_pages, 0, sizeof b.fb_pages);
+    std::memset(b.z_pages, 0, sizeof b.z_pages);
     g_batch_reads.clear();
     b.key = ~0ull;
     b.minx = b.miny = 1 << 30;
@@ -663,7 +701,7 @@ void emit_all() {
 
 void queue_pre(const PreOp &op) {
     if (!op.clut && g_watch.overlaps(op.range.lo, op.range.hi)) g_watch_dirty = true;
-    if (batch_conflict(op.range, op.clut)) emit_all();
+    if (batch_conflict(op.range, op.clut)) { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); emit_all(); }
     g_pre.push_back(op);
 }
 
@@ -725,7 +763,7 @@ void flush_image() {
 
 void flush_all() {
     flush_image();
-    emit_all();
+    { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); emit_all(); }
 }
 
 void on_error(WGPUDevice const *, WGPUErrorType type, WGPUStringView message, void *, void *) {
@@ -1442,7 +1480,7 @@ void draw(const State &st, const Vertex *v, int count) {
     Batch &b = g_batch;
     const bool zte = flags & 512u;
     const std::uint64_t key = cache.key;
-    if (b.key != ~0ull && b.key != key) emit_all();
+    if (b.key != ~0ull && b.key != key) { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); emit_all(); }
     const Range &tex = cache.tex;
     if (flags & 2u) {
         if (!b.prims.empty()) {
@@ -1451,13 +1489,22 @@ void draw(const State &st, const Vertex *v, int count) {
             int rect[4];
             if (written(tex)) {
                 if (!texel_rect(setup, v, count, prim, fst, rect)) {
-                    emit_all();
+                    { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); emit_all(); }
                 } else {
                     const Range used = region(setup[12], setup[13], setup[14], rect[0], rect[1], rect[2], rect[3]);
                     const bool small = rect[2] - rect[0] < 64 && rect[3] - rect[1] < 64;
                     const bool cached = b.texflushes == g_texflushes && small && shares_frame(setup, b);
-                    const bool frame = !cached && (shares_frame(setup, b) ? drawn_under(b, rect) : used.overlaps(b.fb_range.lo, b.fb_range.hi));
-                    if (frame || (b.zwrite && used.overlaps(b.z_range.lo, b.z_range.hi))) emit_all();
+                    static const bool coarse = std::getenv("HP_GPUCOARSE") != nullptr;   // the old interval test
+                    const bool fb_hit = coarse ? used.overlaps(b.fb_range.lo, b.fb_range.hi)
+                                               : hits_pages(b.fb_pages, setup[12], setup[13], setup[14], rect[0], rect[1], rect[2], rect[3]);
+                    const bool z_hit = b.zwrite && (coarse ? used.overlaps(b.z_range.lo, b.z_range.hi)
+                                                           : hits_pages(b.z_pages, setup[12], setup[13], setup[14], rect[0], rect[1], rect[2], rect[3]));
+                    const bool same = shares_frame(setup, b);
+                    static const bool nofeedback = std::getenv("HP_NOFEEDBACK") != nullptr;   // experiment only: wrong for effects
+                    const bool frame = !cached && (same ? (!nofeedback && drawn_under(b, rect)) : fb_hit);
+                    if (frame) hp_flush_note(same ? (b.boxes.size() / 2 > 64 ? 4001 : 4002) : 4003);
+                    if (!frame && z_hit) hp_flush_note(4004);
+                    if (frame || z_hit) { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); emit_all(); }
                 }
             }
         }
@@ -1497,11 +1544,13 @@ void draw(const State &st, const Vertex *v, int count) {
     b.prims.insert(b.prims.end(), rec, rec + kPrimWords);
     b.boxes.push_back(rec[2]);
     b.boxes.push_back(rec[3]);
+    mark_pages(b.fb_pages, b.fbp, b.fbw, b.fpsm, minx, miny, maxx, maxy);
+    if (b.zwrite) mark_pages(b.z_pages, b.zbp, b.fbw, b.zpsm, minx, miny, maxx, maxy);
     b.minx = std::min(b.minx, minx);
     b.miny = std::min(b.miny, miny);
     b.maxx = std::max(b.maxx, maxx);
     b.maxy = std::max(b.maxy, maxy);
-    if (b.prims.size() >= kPrimWords * 65536) emit_all();
+    if (b.prims.size() >= kPrimWords * 65536) { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); emit_all(); }
 }
 
 void image_begin(const State &s) {
@@ -1538,7 +1587,7 @@ void image_data(const std::uint8_t *data, std::size_t bytes) {
 }
 
 void local_copy(const State &s) {
-    flush_all();
+    { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); flush_all(); }
     const std::uint64_t buf = s.bitbltbuf, pos = s.trxpos, reg = s.trxreg;
     const std::uint32_t w = static_cast<std::uint32_t>(reg) & 0xFFFu, h = static_cast<std::uint32_t>(reg >> 32) & 0xFFFu;
     if (!w || !h) return;
@@ -1557,7 +1606,7 @@ void local_copy(const State &s) {
 void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     flush_image();
     if (g_clut_loads + 2 >= kClutSlots) {
-        emit_all();
+        { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); emit_all(); }
         submit();
     }
     const std::uint32_t psm = static_cast<std::uint32_t>(tex0 >> 20) & 0x3Fu;
@@ -1581,12 +1630,12 @@ void texflush() { ++g_texflushes; }
 
 void flush() {
     if (g_mode == Mode::off) return;
-    flush_all();
+    { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); flush_all(); }
     submit();
 }
 
 void wait_idle() {
-    flush_all();
+    { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); flush_all(); }
     submit();
     bool done = false;
     WGPUQueueWorkDoneCallbackInfo cb = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
@@ -1621,7 +1670,7 @@ bool download_async(std::uint8_t *memory, std::uint32_t offset, std::uint32_t by
         g_pending.capacity = bytes;
         g_pending.buffer = make_buffer(bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     }
-    flush_all();
+    { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); flush_all(); }
     if (g_scale != 1) dispatch_linear(kResolve, bytes / 4, push_params({offset / 4}));
     submit();
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
@@ -1654,7 +1703,7 @@ bool finish_download(std::uint32_t serial) {
 }
 
 void download(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes) {
-    flush_all();
+    { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); flush_all(); }
     if (g_scale == 1) {
         submit();
         read_back(g_vram, bytes, memory + offset, offset);
@@ -1666,7 +1715,7 @@ void download(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes) {
 }
 
 void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vector<std::uint32_t> &clut) {
-    flush_all();
+    { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); flush_all(); }
     submit();
     scale = g_scale;
     vram.resize(static_cast<std::size_t>(kMemorySize / 4) * g_scale * g_scale);
@@ -1819,7 +1868,7 @@ bool has_surface() { return g_surface != nullptr; }
 
 bool present(const DisplaySource &src) {
     if (!g_surface) return false;
-    flush_all();
+    { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); flush_all(); }
     const std::uint32_t current = field_base(g_field), previous = field_base(g_field + 1);
     static const bool weave_off = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
     const bool blend = src.halved && g_have_previous && g_last_width == src.width && g_last_height == src.height && !weave_off;
@@ -1870,6 +1919,7 @@ Copy g_copies[2];   // hp: at most 2 frames in flight: more only added input lat
 std::uint64_t g_copy_order = 0;
 
 bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
+    { static unsigned n; if (++n % 600 == 0) hp_flush_report(); }
     // hp: nothing new to show unless something wrote into the displayed area since the last copy
     // (this game draws into a back buffer and copies the finished frame into the displayed one):
     // skipping keeps the frame's batches whole and saves a readback per vblank.  Pending draws
@@ -1969,7 +2019,7 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
             slot->size = bytes;
             slot->buffer = make_buffer(bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
         }
-        flush_all();
+        { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); flush_all(); }
         const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u});
         g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
         submit();
@@ -2001,7 +2051,7 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
 }
 
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
-    flush_all();
+    { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); flush_all(); }
     const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u});
     g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
     submit();
