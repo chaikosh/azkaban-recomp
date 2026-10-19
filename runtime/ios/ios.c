@@ -79,6 +79,10 @@ const char *hp_ios_setup(void) {
     if (chdir(docs) != 0) fprintf(stderr, "[ios] cannot enter %s\n", docs);   /* relative paths (HP_WAV=rec.wav, HP_SHOT=shots) land in Documents */
     setenv("HP_GS", "gpu", 0);
     setenv("HP_FPSLOG", "1", 0);   /* a [fps] line in hp.log every 5 s */
+    /* VU1 microprograms the recompiled set does not have yet run in the interpreter (slow); keep
+       their code images in Documents/vu1 so they can be fetched from the device and recompiled */
+    mkdir("vu1", 0755);
+    setenv("HP_VUCOLLECT", "vu1", 0);
     snprintf(memcard, sizeof memcard, "%s/memcard0.ps2", docs);
     setenv("HP_MEMCARD", memcard, 0);
     snprintf(disc, sizeof disc, "%s/disc", docs);
