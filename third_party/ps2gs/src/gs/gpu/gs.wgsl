@@ -24,6 +24,8 @@ override ZPSM: u32 = 0xFFFFFFFFu;
 override FLAGS_ON: u32 = 0u;
 override FLAGS_OFF: u32 = 0u;
 override DECODED: u32 = 0u;
+// 0: no primitive of the batch samples mip levels per pixel (the code is compiled out)
+override MIPMAP: u32 = 1u;
 // the texture format all textured primitives share (0xFFFFFFFF: read it), and the bits of the
 // modes word all setups agree on
 override TPSM: u32 = 0xFFFFFFFFu;
@@ -482,6 +484,8 @@ struct Setup {
     clut: u32,
     zmax: u32,
     dec: u32,
+    mip: u32,
+    at: u32,
 }
 
 const F_IIP: u32 = 1u;
@@ -501,6 +505,9 @@ const F_TCC: u32 = 8192u;
 const F_BILINEAR: u32 = 16384u;
 const F_AEM: u32 = 32768u;
 const F_DTHE: u32 = 65536u;
+// setup word 27 (gpu.cpp make_setup): bit 31 per-pixel mipmapping, MXL bits 0-2, MMIN 3-5, LCM 6,
+// L 7-8, K 9-20; words 28-33 the base (bits 0-13) and width (14-19) of levels 1-6
+const MIP_ON: u32 = 0x80000000u;
 
 fn load_setup(at: u32) -> Setup {
     var s: Setup;
@@ -535,6 +542,8 @@ fn load_setup(at: u32) -> Setup {
     s.clut = data[at + 22u];
     s.zmax = data[at + 23u];
     s.dec = data[at + 24u];
+    s.mip = data[at + 27u];
+    s.at = at;
     // hp: the address formats (texture, frame, Z) are worked out where they are used, so a
     // primitive without a texture or a depth test does not pay for them
     return s;
@@ -665,7 +674,11 @@ fn convert(s: Setup, raw: u32) -> u32 {
 }
 
 fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
-    if (!has(s, F_BILINEAR) || (EXP & 32u) != 0u) {
+    return sample_filter(s, uin, vin, k, has(s, F_BILINEAR));
+}
+
+fn sample_filter(s: Setup, uin: f32, vin: f32, k: u32, linear: bool) -> u32 {
+    if (!linear || (EXP & 32u) != 0u) {
         return fetch(s, i32(floor(uin)), i32(floor(vin)), k);
     }
     let u = uin - 0.5;
@@ -693,6 +706,101 @@ fn blend4(c00: u32, c10: u32, c01: u32, c11: u32, fx: f32, fy: f32) -> u32 {
     }
     return out;
 }
+
+// hp: per-pixel mipmapping as the GS and the software GS (gs.c tex_sample_mip) do it.
+// (a * (256 - f) + b * f) >> 8 per channel, the blend of two levels
+fn lerp8(a: u32, b: u32, f: u32) -> u32 {
+    var out = 0u;
+    for (var ch = 0u; ch < 32u; ch = ch + 8u) {
+        let x = (a >> ch) & 0xFFu;
+        let y = (b >> ch) & 0xFFu;
+        out = out | (((x * (256u - f) + y * f) >> 8u) << ch);
+    }
+    return out;
+}
+
+// Mip level `lv` of the texture: what differs from level 0 (decoded offset, size, base and width
+// from setup words 28-33; decoded levels lie one after the other, gpu.cpp plan_decodes).  Kept
+// apart from Setup: a Setup copy per level held the whole kernel's registers.
+struct Lv {
+    dec: u32,
+    tw: u32,
+    th: u32,
+    tbp: u32,
+    tbw: u32,
+    sh: u32,
+}
+
+fn lv_of(s: Setup, lv: u32) -> Lv {
+    if (lv == 0u) {
+        return Lv(s.dec, s.tw, s.th, s.tbp, s.tbw, 0u);
+    }
+    let w = data[s.at + 27u + lv];
+    var off = s.dec;
+    if (s.dec != 0xFFFFFFFFu) {
+        for (var i = 0u; i < lv; i = i + 1u) {
+            off = off + (1u << (select(0u, s.tw - i, s.tw > i) + select(0u, s.th - i, s.th > i)));
+        }
+    }
+    return Lv(off, select(0u, s.tw - lv, s.tw > lv), select(0u, s.th - lv, s.th > lv), w & 0x3FFFu, (w >> 14u) & 0x3Fu, lv);
+}
+
+fn fetch_lv(s: Setup, l: Lv, xi: i32, yi: i32, k: u32) -> u32 {
+    let x = u32(wrap_coord(xi, 1 << l.tw, mode(s, 24u, 2u), s.minu >> l.sh, s.maxu >> l.sh));
+    let y = u32(wrap_coord(yi, 1 << l.th, mode(s, 26u, 2u), s.minv >> l.sh, s.maxv >> l.sh));
+    if (DECODED != 0u || l.dec != 0xFFFFFFFFu) {
+        return decoded[l.dec + (y << l.tw) + x];
+    }
+    return convert(s, load_texel(addr(fmt_of(s.tpsm, l.tbp, l.tbw), x, y), k));
+}
+
+fn sample_level(s: Setup, lv: u32, uin: f32, vin: f32, k: u32, linear: bool) -> u32 {
+    let l = lv_of(s, lv);
+    let sc = 1.0 / f32(1u << lv);
+    if (!linear) {
+        return fetch_lv(s, l, i32(floor(uin * sc)), i32(floor(vin * sc)), k);
+    }
+    let u = uin * sc - 0.5;
+    let v = vin * sc - 0.5;
+    let x0 = i32(floor(u));
+    let y0 = i32(floor(v));
+    return blend4(fetch_lv(s, l, x0, y0, k), fetch_lv(s, l, x0 + 1, y0, k), fetch_lv(s, l, x0, y0 + 1, k), fetch_lv(s, l, x0 + 1, y0 + 1, k),
+                  u - f32(x0), v - f32(y0));
+}
+
+// LOD = log2(1/|Q|) * 2^L + K (K alone with LCM); LOD < 0 magnifies level 0 (MMAG), otherwise
+// MMIN picks the nearest level or blends two
+fn sample_mip(s: Setup, u: f32, v: f32, q: f32, k: u32) -> u32 {
+    let m = s.mip;
+    let mxl = m & 7u;
+    let mmin = (m >> 3u) & 7u;
+    let kk = f32(bitcast<i32>(((m >> 9u) & 0xFFFu) << 20u) >> 20u) / 16.0;
+    var lod = kk;
+    if (((m >> 6u) & 1u) == 0u) {
+        lod = log2(1.0 / max(abs(q), 1e-30)) * f32(1u << ((m >> 7u) & 3u)) + kk;
+    }
+    if (lod < 0.0) {
+        return sample_filter(s, u, v, k, has(s, F_BILINEAR));
+    }
+    let minlin = mmin == 4u || mmin == 5u;
+    if (mmin == 2u || mmin == 4u) {
+        return sample_level(s, min(u32(lod + 0.5), mxl), u, v, k, minlin);
+    }
+    let l0 = u32(lod);
+    if (l0 >= mxl) {
+        return sample_level(s, mxl, u, v, k, minlin);
+    }
+    let f = u32((lod - f32(l0)) * 256.0);
+    let c0 = sample_level(s, l0, u, v, k, minlin);
+    if (f == 0u) {
+        return c0;
+    }
+    return lerp8(c0, sample_level(s, l0 + 1u, u, v, k, minlin), f);
+}
+
+// prim word 11 bits 24-25 (gpu.cpp mip_range): 1 the whole primitive magnifies, 2 it is all on the
+// last level; 0 the LOD is worked out per pixel
+var<private> mip_fix: u32 = 0u;
 
 fn read_frame(s: Setup, l: Loc, k: u32) -> u32 {
     let raw = load_at(l, k);
@@ -822,7 +930,20 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
         }
         var t = 0x80808080u;
         if ((EXP & 4u) == 0u) {
-            t = sample(s, u, v, k);
+            if (MIPMAP != 0u && (s.mip & MIP_ON) != 0u && mip_fix != 1u) {
+                if (mip_fix == 2u) {
+                    let mmin = (s.mip >> 3u) & 7u;
+                    t = sample_level(s, s.mip & 7u, u, v, k, mmin == 4u || mmin == 5u);
+                } else {
+                    var lq = 1.0;
+                    if (!has(s, F_FST)) {
+                        lq = at.q;
+                    }
+                    t = sample_mip(s, u, v, lq, k);
+                }
+            } else {
+                t = sample(s, u, v, k);
+            }
         }
         let tr = i32(t & 0xFFu);
         let tg = i32((t >> 8u) & 0xFFu);
@@ -1001,7 +1122,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
 }
 
 const PRIM_WORDS: u32 = 28u;
-const SETUP_WORDS: u32 = 27u;
+const SETUP_WORDS: u32 = 34u;
 
 fn fat(i: u32) -> f32 {
     return bitcast<f32>(data[i]);
@@ -1150,6 +1271,7 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             at = Attr(c.x, c.y, c.z, c.w, t.x, t.y, t.z, t.w, data[p + 24u]);
         }
     }
+    mip_fix = (data[p + 11u] >> 24u) & 3u;
     plot(s, x, y, k, at);
 }
 
@@ -1160,9 +1282,10 @@ fn decode(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let s = load_setup(prm(0u));
-    let x = i & ((1u << s.tw) - 1u);
-    let y = i >> s.tw;
-    decoded[prm(1u) + i] = convert(s, load_at(addr(fmt_tex(s), x, y), 0u));
+    let l = lv_of(s, prm(3u));   // hp: mip level prm(3)
+    let x = i & ((1u << l.tw) - 1u);
+    let y = i >> l.tw;
+    decoded[prm(1u) + i] = convert(s, load_at(addr(fmt_of(s.tpsm, l.tbp, l.tbw), x, y), 0u));
 }
 
 @compute @workgroup_size(64)

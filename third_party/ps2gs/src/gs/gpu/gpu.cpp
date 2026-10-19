@@ -13,6 +13,9 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -40,7 +43,8 @@ constexpr std::uint32_t kParamStride = 256;
 constexpr std::uint32_t kClutSlots = 2048;
 constexpr std::uint32_t kClutEntries = 512;
 constexpr std::uint32_t kPrimWords = 28;
-constexpr std::uint32_t kSetupWords = 27;
+constexpr std::uint32_t kSetupWords = 34;
+constexpr std::uint32_t kMipOn = 0x80000000u;   // hp: setup word 27, per-pixel mipmapping (make_setup)
 constexpr std::uint32_t kDecodedWords = 4u << 20;
 constexpr std::uint32_t kDecodePrims = 64;
 
@@ -146,13 +150,14 @@ WGPUComputePipeline raster_variant(const std::uint32_t *setups, std::size_t coun
     if (!variants_on()) return nullptr;
     static const bool flags_on = !std::getenv("HP_GPUVARIANTS") || std::atoi(std::getenv("HP_GPUVARIANTS")) != 2;   // 2: formats only
     std::uint32_t all = 0xFFFFu, any = 0, mall = ~0u, many = 0, tpsm = 0xFFu;
-    bool decoded = true;
+    bool decoded = true, mip = false;
     for (std::size_t i = 0; i < count; ++i) {
         const std::uint32_t *w = setups + i * kSetupWords;
         all &= w[0];
         any |= w[0];
         mall &= w[7];
         many |= w[7];
+        mip = mip || (w[27] & kMipOn);
         if (w[0] & 2u) {
             decoded = decoded && w[24] != 0xFFFFFFFFu;
             tpsm = tpsm == 0xFFu || tpsm == w[14] ? w[14] : 0xFEu;
@@ -167,7 +172,8 @@ WGPUComputePipeline raster_variant(const std::uint32_t *setups, std::size_t coun
             dither_any = dither_any || d;
         }
         key.a |= (static_cast<std::uint64_t>(all & 0xFFFFu) << 16) | (static_cast<std::uint64_t>(~any & 0xFFFFu) << 32) | (static_cast<std::uint64_t>(decoded) << 48) |
-                 (static_cast<std::uint64_t>(tpsm & 0xFFu) << 49) | (static_cast<std::uint64_t>(dither_all) << 57) | (static_cast<std::uint64_t>(!dither_any) << 58);
+                 (static_cast<std::uint64_t>(tpsm & 0xFFu) << 49) | (static_cast<std::uint64_t>(dither_all) << 57) | (static_cast<std::uint64_t>(!dither_any) << 58) |
+                 (static_cast<std::uint64_t>(!mip) << 59);
         key.b = mall | (static_cast<std::uint64_t>(~many) << 32);
     } else {
         key.a |= 0xFFull << 49;
@@ -287,6 +293,8 @@ struct SetupCache {
     std::uint32_t flags = 0;
     std::uint64_t key = 0;
     Range tex;
+    int nlevels = 0;   // hp: per-pixel mipmapping: the memory of every level
+    Range levels[7];
 } g_setup_cache;
 
 struct PreOp {
@@ -613,9 +621,13 @@ bool rendered(const Range &r) {
 }
 
 struct Decode {
-    std::uint32_t setup, offset, words;
+    std::uint32_t setup, offset, words, level;
 };
 std::vector<Decode> g_decodes;
+// hp: per setup of the batch, the mip levels its primitives can sample (bit l = level l); only
+// those are checked against the batch's drawing and decoded (unused levels may point anywhere,
+// the frame buffer included)
+std::vector<std::uint8_t> g_setup_levels;
 
 // hp: textures decoded earlier in this submit, reused by later batches while none of their pages
 // has been written since (a frame drew the same textures in many batches and decoded each again,
@@ -623,9 +635,11 @@ std::vector<Decode> g_decodes;
 // slots are not reused within a submit, so the slot is part of the key.  Cleared with the decode
 // buffer at every submit.
 struct DecodeEntry {
-    std::uint32_t key[9];
+    std::uint32_t key[16];
     std::uint32_t offset, words;
     std::uint64_t time;
+    std::uint32_t levels;   // the mip levels decoded so far (bit l)
+    std::uint32_t from;     // levels below this one have no place (offset is level 0's virtual base)
 };
 std::vector<DecodeEntry> g_decode_cache;
 
@@ -648,11 +662,31 @@ std::uint32_t palette_key(const std::uint32_t *w) {
     if (t8) return si.eight && (si.csm == 0 || si.csa == 0) ? si.id : 0;
     return !si.eight && si.csa == w[17] ? si.id : 0;
 }
-bool decode_current(const DecodeEntry &e, const std::uint32_t *w) {
+// hp: the memory of each level of a texture (one level unless it is mipmapped per pixel)
+int texture_levels(const std::uint32_t *w, Range *out) {
     const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
-    const Range r = region(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1);
-    for (std::uint64_t at = r.lo & ~std::uint64_t(8191); at < r.hi; at += 8192)
-        if (g_page_time[(at >> 13) & 511u] > e.time) return false;
+    const int n = (w[27] & kMipOn) ? static_cast<int>(w[27] & 7u) + 1 : 1;
+    for (int l = 0; l < n; ++l) {
+        const std::uint32_t ul = static_cast<std::uint32_t>(l);
+        const std::uint32_t bp = l ? w[27 + l] & 0x3FFFu : w[12], bw = l ? (w[27 + l] >> 14) & 0x3Fu : w[13];
+        out[l] = region(bp, bw, w[14], 0, 0, (1 << (tw > ul ? tw - ul : 0u)) - 1, (1 << (th > ul ? th - ul : 0u)) - 1);
+    }
+    return n;
+}
+std::uint32_t texture_words(const std::uint32_t *w) {   // decoded size, all levels one after the other
+    const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8, n = (w[27] & kMipOn) ? (w[27] & 7u) + 1 : 1;
+    std::uint32_t words = 0;
+    for (std::uint32_t l = 0; l < n; ++l) words += 1u << ((tw > l ? tw - l : 0u) + (th > l ? th - l : 0u));
+    return words;
+}
+
+bool decode_current(const DecodeEntry &e, const std::uint32_t *w, std::uint32_t used) {
+    Range levels[7];
+    const int n = texture_levels(w, levels);
+    for (int l = 0; l < n; ++l)
+        if ((used >> l) & 1u)
+        for (std::uint64_t at = levels[l].lo & ~std::uint64_t(8191); at < levels[l].hi; at += 8192)
+            if (g_page_time[(at >> 13) & 511u] > e.time) return false;
     return true;
 }
 
@@ -663,59 +697,100 @@ void plan_decodes(std::uint32_t prims) {
     // a small batch does not pay for decoding a whole texture, but takes one decoded earlier
     const bool small = prims <= kDecodePrims;
     const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
-    static const int kKey[] = {12, 13, 14, 15, 16, 17, 20, 22};
+    static const int kKey[] = {12, 13, 14, 15, 16, 17, 20, 22, 27, 28, 29, 30, 31, 32, 33};
+    // setups of the batch that sample the same texture share one decode; a mipmapped one decodes
+    // the levels its primitives can reach, all levels having their place one after the other
+    struct Group { std::uint32_t first, used; std::int64_t offset; };   // offset: the setup's word 24, -1 none
+    static std::vector<Group> groups;
+    static std::vector<int> group_of;
+    groups.clear();
+    group_of.assign(setups, -1);
     for (std::uint32_t i = 0; i < setups; ++i) {
-        std::uint32_t *w = b.setups.data() + i * kSetupWords;
+        const std::uint32_t *w = b.setups.data() + i * kSetupWords;
         if (!(w[0] & 2u)) continue;
-        bool shared = false;
-        for (const Decode &d : g_decodes) {
-            const std::uint32_t *o = b.setups.data() + d.setup * kSetupWords;
+        const std::uint32_t used = (w[27] & kMipOn) ? (i < g_setup_levels.size() ? g_setup_levels[i] : 0u) | 0u : 1u;
+        int g = -1;
+        for (std::size_t k = 0; k < groups.size() && g < 0; ++k) {
+            const std::uint32_t *o = b.setups.data() + groups[k].first * kSetupWords;
             bool same = (o[0] & 32768u) == (w[0] & 32768u);
-            for (int k : kKey) same = same && o[k] == w[k];
-            if (same) {
-                w[24] = d.offset;
-                shared = true;
-                break;
-            }
+            for (int kk : kKey) same = same && o[kk] == w[kk];
+            if (same) g = static_cast<int>(k);
         }
-        if (shared) { ++g_hp_dec[5]; continue; }
+        if (g >= 0) {
+            groups[g].used |= used;
+            ++g_hp_dec[5];
+        } else {
+            g = static_cast<int>(groups.size());
+            groups.push_back({i, used, -1});
+        }
+        group_of[i] = g;
+    }
+    static const bool nocache = std::getenv("HP_NODECODECACHE") != nullptr;
+    // hp: a texture the size of the frame buffer (2^19..2^20 texels, read by screen effects over a
+    // small part) took a quarter of the decode buffer each time and left the textures the scene
+    // reads every frame undecoded; those large ones are sampled in place
+    static const std::uint32_t max_log2 = std::getenv("HP_DECODEMAX") ? std::atoi(std::getenv("HP_DECODEMAX")) : 16;
+    for (Group &g : groups) {
+        const std::uint32_t *w = b.setups.data() + g.first * kSetupWords;
         const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
         const std::uint32_t mu = (w[7] >> 24) & 3u, mv = (w[7] >> 26) & 3u;
         const auto inside = [](std::uint32_t mode, std::uint32_t region, std::uint32_t size) { return mode < 2 || ((region & 0x3FFu) < (1u << size) && (region >> 16) < (1u << size)); };
-        if (!inside(mu, w[18], tw) || !inside(mv, w[19], th)) { ++g_hp_dec[1]; continue; }
-        const std::uint32_t words = 1u << (tw + th);
-        // hp: a texture the size of the frame buffer (2^19..2^20 texels, read by screen effects
-        // over a small part) took a quarter of the decode buffer each time and left the textures
-        // the scene reads every frame undecoded; those large ones are sampled in place
-        static const std::uint32_t max_log2 = std::getenv("HP_DECODEMAX") ? std::atoi(std::getenv("HP_DECODEMAX")) : 16;
-        if (tw + th > max_log2) { ++g_hp_dec[1]; continue; }
-        std::uint32_t key[9];
-        for (int k = 0; k < 8; ++k) key[k] = w[kKey[k]];
+        if (!inside(mu, w[18], tw) || !inside(mv, w[19], th) || tw + th > max_log2 || !g.used) { ++g_hp_dec[1]; continue; }
+        const std::uint32_t nlev = (w[27] & kMipOn) ? (w[27] & 7u) + 1 : 1;
+        const auto level_size = [&](std::uint32_t l) { return 1u << ((tw > l ? tw - l : 0u) + (th > l ? th - l : 0u)); };
+        // place is made from the finest level the batch reaches: distant objects only reach the
+        // coarse levels (level 0 may not even be in memory), and level 0 is the largest.  `base`
+        // is level 0's virtual place (gs.wgsl lv_of adds the sizes of the levels before)
+        const std::uint32_t from = static_cast<std::uint32_t>(__builtin_ctz(g.used));
+        std::uint32_t words = 0, below = 0;
+        for (std::uint32_t l = 0; l < nlev; ++l) (l < from ? below : words) += level_size(l);
+        const auto decode_levels = [&](std::uint32_t base, std::uint32_t mask) {   // one decode per level
+            std::uint32_t at = base;
+            for (std::uint32_t l = 0; l < nlev; ++l) {
+                if ((mask >> l) & 1u) g_decodes.push_back({g.first, at, level_size(l), l});
+                at += level_size(l);
+            }
+        };
+        std::uint32_t key[16];
+        for (int k = 0; k < 15; ++k) key[k] = w[kKey[k]];
         key[7] = palette_key(w);   // kKey[7] is the CLUT slot
-        key[8] = w[0] & 32768u;
+        key[15] = w[0] & 32768u;
         DecodeEntry *hit = nullptr;
-        static const bool nocache = std::getenv("HP_NODECODECACHE") != nullptr;
-        if (key[7])
+        if (key[7] && !nocache)
             for (DecodeEntry &e : g_decode_cache)
-                if (!nocache && std::memcmp(e.key, key, sizeof key) == 0) { hit = &e; break; }
-        if (hit && decode_current(*hit, w)) {
+                if (std::memcmp(e.key, key, sizeof key) == 0) { hit = &e; break; }
+        if (hit && decode_current(*hit, w, hit->levels) && from >= hit->from) {
+            const std::uint32_t missing = g.used & ~hit->levels;
+            if (missing) {   // this batch reaches levels an earlier one did not: decode them into their places
+                if (small) { ++g_hp_dec[0]; continue; }
+                decode_levels(hit->offset, missing);
+                hit->levels |= missing;
+                hit->time = g_vram_time;
+            }
             ++g_hp_dec[6];
-            w[24] = hit->offset;
+            g.offset = hit->offset;
             continue;
         }
         if (small) { ++g_hp_dec[0]; continue; }
         if (g_decoded_used + words > kDecodedWords) { ++g_hp_dec[2]; continue; }
         if (g_scale > 1 && rendered(pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1))) { ++g_hp_dec[3]; continue; }
         ++g_hp_dec[4];
-        w[24] = g_decoded_used;
-        g_decodes.push_back({i, g_decoded_used, words});
+        std::uint32_t base = g_decoded_used - below;   // wraps like the shader's sum does
+        if (base == 0xFFFFFFFFu) {   // that value means "not decoded"
+            ++g_decoded_used;
+            ++base;
+        }
+        g.offset = base;
+        decode_levels(base, g.used);
         if (key[7]) {
-            if (hit) *hit = DecodeEntry{{}, g_decoded_used, words, g_vram_time};
-            else g_decode_cache.push_back(DecodeEntry{{}, g_decoded_used, words, g_vram_time});
+            if (hit) *hit = DecodeEntry{{}, base, words, g_vram_time, g.used, from};
+            else g_decode_cache.push_back(DecodeEntry{{}, base, words, g_vram_time, g.used, from});
             std::memcpy((hit ? hit : &g_decode_cache.back())->key, key, sizeof key);
         }
         g_decoded_used += words;
     }
+    for (std::uint32_t i = 0; i < setups; ++i)
+        if (group_of[i] >= 0 && groups[group_of[i]].offset >= 0) b.setups[i * kSetupWords + 24] = static_cast<std::uint32_t>(groups[group_of[i]].offset);
 }
 
 std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32_t &hi) {
@@ -780,7 +855,7 @@ void flush_batch() {
     plan_decodes(prims);
     const std::uint32_t prim_offset = arena_append(b.prims.data(), b.prims.size() * 4);
     const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
-    for (const Decode &d : g_decodes) dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words}));
+    for (const Decode &d : g_decodes) dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words, d.level}));
     std::uint32_t total = 0;
     for (std::uint32_t t : g_touched) total += g_tile_count[t];
     const std::uint32_t tiles = static_cast<std::uint32_t>(g_touched.size());
@@ -819,6 +894,7 @@ void flush_batch() {
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
     b.prims.clear();
     b.setups.clear();
+    g_setup_levels.clear();
     b.boxes.clear();
     b.wbits.clear();
     b.wbits_all = 0;
@@ -996,7 +1072,7 @@ WGPUComputePipeline make_pipeline(int entry, const VariantKey *variant) {
     cd.layout = g_pipeline_layout;
     cd.compute.module = g_module;
     cd.compute.entryPoint = view(kEntryPoints[entry]);
-    WGPUConstantEntry constants[10];
+    WGPUConstantEntry constants[11];
     for (WGPUConstantEntry &c : constants) c = WGPU_CONSTANT_ENTRY_INIT;
     constants[0].key = view("SCALE");
     constants[0].value = static_cast<double>(g_scale);
@@ -1018,7 +1094,9 @@ WGPUComputePipeline make_pipeline(int entry, const VariantKey *variant) {
     constants[8].value = static_cast<double>(modes & 0xFFFFFFFFu);
     constants[9].key = view("MODES_OFF");
     constants[9].value = static_cast<double>(modes >> 32);
-    cd.compute.constantCount = 10;
+    constants[10].key = view("MIPMAP");   // 0: no primitive of the batch mipmaps per pixel
+    constants[10].value = generic || !((key >> 59) & 1u) ? 1.0 : 0.0;
+    cd.compute.constantCount = 11;
     cd.compute.constants = constants;
     return wgpuDeviceCreateComputePipeline(g_device, &cd);
 }
@@ -1272,6 +1350,58 @@ int mip_level(const Context &c, std::uint64_t attr, const Vertex *v, int count) 
     return std::min(lv, mxl);
 }
 
+/* hp: per-pixel mipmapping (the default on macOS, PS2_MIPMAP=pixel|prim; per primitive on iOS
+   and with prim, one level for the whole primitive as before): TEX1 MMIN 2-5 with MXL > 0, as the GS and gs.c do it.  The shader works out the LOD per
+   pixel, LOD = log2(1/|Q|) * 2^L + K (K alone with LCM; Q = 1 for UV primitives), and blends two
+   levels for the MIPMAP_LINEAR filters.  mip_range bounds the levels a primitive can reach (the LOD
+   lies between the vertex LODs, Q being interpolated linearly); fix: 1 when every pixel
+   magnifies (level 0 with MMAG), 2 when every pixel is on the last level, and the shader then
+   skips the per-pixel LOD (prim word 11 bits 24-25).  From the render-audit-mip branch. */
+bool pixel_mipmap() {
+    static const bool on = [] {
+        if (const char *e = std::getenv("PS2_MIPMAP")) return std::strcmp(e, "prim") != 0;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        return false;   // ~+25% GPU time in mipmapped scenes: no room for it on the phone yet
+#else
+        return true;
+#endif
+    }();
+    return on;
+}
+
+std::uint32_t mip_range(std::uint32_t m, std::uint64_t attr, std::uint32_t prim, const Vertex *v, int count, int &lmin, int &lmax) {
+    const int mxl = static_cast<int>(m & 7u), mmin = static_cast<int>(m >> 3) & 7, lsh = static_cast<int>(m >> 7) & 3;
+    lmin = 0;
+    lmax = mxl;
+    const float k = static_cast<float>(static_cast<std::int32_t>(((m >> 9) & 0xFFFu) << 20) >> 20) / 16.0f;
+    float lo = k, hi = k;
+    if (!((m >> 6) & 1u)) {
+        lo = 1e30f;
+        hi = -1e30f;
+        bool pos = false, neg = false;
+        for (int i = prim == 6 ? count - 1 : 0; i < count; ++i) {
+            const float q = (attr & 0x100u) ? 1.0f : v[i].q;
+            pos = pos || q > 0.0f;
+            neg = neg || !(q > 0.0f);
+            const float l = std::log2(1.0f / std::max(std::fabs(q), 1e-30f)) * static_cast<float>(1 << lsh) + k;
+            lo = std::min(lo, l);
+            hi = std::max(hi, l);
+        }
+        if ((pos && neg) || !std::isfinite(lo) || !std::isfinite(hi) || lo > hi) return 0;   /* Q crosses 0: any level */
+    }
+    const bool nearest = mmin == 2 || mmin == 4;
+    const auto level = [&](float lod, bool upper) {
+        if (!(lod >= 0.0f)) return 0;
+        const int l = nearest ? static_cast<int>(lod + 0.5f) : static_cast<int>(lod) + (upper ? 1 : 0);
+        return std::min(l, mxl);
+    };
+    lmin = level(lo - 1.0f / 64.0f, false);
+    lmax = level(hi + 1.0f / 64.0f, true);
+    if (hi + 1.0f / 64.0f < 0.0f) return 1;
+    if (lo - 1.0f / 64.0f + (nearest ? 0.5f : 0.0f) >= static_cast<float>(mxl)) return 2;
+    return 0;
+}
+
 std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w, int level = 0) {
     const Context &c = st.ctx[(attr >> 9) & 1u];
     std::uint32_t flags = 0;
@@ -1325,6 +1455,35 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w, 
     w[24] = 0xFFFFFFFFu;
     w[25] = dither ? static_cast<std::uint32_t>(st.dimx) : 0u;   /* DIMX rows 0-1 */
     w[26] = dither ? static_cast<std::uint32_t>(st.dimx >> 32) : 0u;   /* rows 2-3 */
+    for (std::uint32_t i = 27; i < kSetupWords; ++i) w[i] = 0;
+    {   /* hp: word 27 the TEX1 fields of per-pixel mipmapping, words 28-33 levels 1-6 (base | width << 14) */
+        const std::uint32_t mxl = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex1 >> 2) & 7u, 6u), mmin = static_cast<std::uint32_t>(c.tex1 >> 6) & 7u;
+        if (pixel_mipmap() && (flags & 2u) && mmin >= 2 && mmin <= 5 && mxl > 0) {
+            w[27] = kMipOn | mxl | (mmin << 3) | ((static_cast<std::uint32_t>(c.tex1) & 1u) << 6) | ((static_cast<std::uint32_t>(c.tex1 >> 19) & 3u) << 7) |
+                    ((static_cast<std::uint32_t>(c.tex1 >> 32) & 0xFFFu) << 9);
+            static const std::uint32_t bpp[64] = {32, 32, 16, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 8, 4, 0, 0, 0, 0, 0, 0, 32,
+                                                  0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 32};
+            const bool mtba = (c.tex1 >> 9) & 1u;   /* levels 1-3 follow level 0 in memory */
+            std::uint32_t bp = w[12], bw = w[13], tw = 1u << (w[15] & 0xFFu), th = 1u << (w[15] >> 8), b = bpp[w[14] & 63] ? bpp[w[14] & 63] : 32;
+            for (std::uint32_t l = 1; l <= mxl; ++l) {
+                std::uint32_t tbp, tbw;
+                if (mtba && l <= 3) {
+                    bp += (tw * th * b / 8) >> 8;
+                    tw = std::max(tw >> 1, 1u);
+                    th = std::max(th >> 1, 1u);
+                    bw = std::max(bw >> 1, 1u);
+                    tbp = bp;
+                    tbw = bw;
+                } else {
+                    const std::uint64_t m = l <= 3 ? c.miptbp1 : c.miptbp2;
+                    const int sh = 20 * static_cast<int>((l - 1) % 3);
+                    tbp = static_cast<std::uint32_t>(m >> sh) & 0x3FFFu;
+                    tbw = static_cast<std::uint32_t>(m >> (sh + 14)) & 0x3Fu;
+                }
+                w[27 + l] = tbp | (tbw << 14);
+            }
+        }
+    }
     if (level > 0) {   /* mip level `level`: base and width from MIPTBP1/2 (or MTBA), halved size and region */
         std::uint32_t tbp = 0, tbw = 0;
         if (((c.tex1 >> 9) & 1u) && level <= 3) {
@@ -1669,7 +1828,7 @@ void draw(const State &st, const Vertex *v, int count) {
     const std::uint32_t prim = static_cast<std::uint32_t>(st.prim) & 7u;
     const Context &c = st.ctx[(attr >> 9) & 1u];
     SetupCache &cache = g_setup_cache;
-    const int level = mip_level(c, attr, v, count);
+    const int level = pixel_mipmap() ? 0 : mip_level(c, attr, v, count);
     if (cache.generation != g_setup_generation || cache.attr != attr || cache.clut != g_clut_slot || cache.level != level) {
         cache.generation = g_setup_generation;
         cache.attr = attr;
@@ -1683,6 +1842,8 @@ void draw(const State &st, const Vertex *v, int count) {
             const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
             const int tex_w = std::max(1 << tw, static_cast<int>(w[18] >> 16) + 1), tex_h = std::max(1 << th, static_cast<int>(w[19] >> 16) + 1);
             cache.tex = region(w[12], w[13], w[14], 0, 0, tex_w - 1, tex_h - 1);
+            cache.nlevels = (w[27] & kMipOn) ? texture_levels(w, cache.levels) : 0;
+            if (cache.nlevels) cache.levels[0] = cache.tex;
         }
     }
     const std::uint32_t *setup = cache.setup;
@@ -1779,6 +1940,9 @@ void draw(const State &st, const Vertex *v, int count) {
     maxx = std::min(maxx, 2047);
     maxy = std::min(maxy, 2047);
     if (minx > maxx || miny > maxy) return;
+    const bool mip = (flags & 2u) && (setup[27] & kMipOn);
+    int lmin = 0, lmax = 0;
+    if (mip) rec[11] |= mip_range(setup[27], attr, prim, v, count, lmin, lmax) << 24;
 
     Batch &b = g_batch;
     const bool zte = flags & 512u;
@@ -1790,7 +1954,12 @@ void draw(const State &st, const Vertex *v, int count) {
             batch_ranges();
             const auto written = [&](const Range &t) { return t.overlaps(b.fb_range.lo, b.fb_range.hi) || (b.zwrite && t.overlaps(b.z_range.lo, b.z_range.hi)); };
             int rect[4];
-            if (written(tex)) {
+            bool level_written = false;   // hp: drawing into a mipmapped texture is rare: no finer test
+            for (int l = std::max(lmin, 1); mip && l <= lmax && l < cache.nlevels; ++l) level_written = level_written || written(cache.levels[l]);
+            if (level_written) {
+                if (!g_batch.prims.empty()) hp_flush_note(__LINE__);
+                emit_all();
+            } else if ((!mip || lmin == 0) && written(tex)) {
                 static const bool loose = std::getenv("HP_GPULOOSETEX") != nullptr;   // the padded vertex span
                 const bool got = (prim == 6 && !loose) ? sprite_texels(setup, v, fst, sx(v[0]), sy(v[0]), sx(v[1]) - sx(v[0]), sy(v[1]) - sy(v[0]), minx, miny, maxx, maxy, rect)
                                                        : texel_rect(setup, v, count, prim, fst, rect);
@@ -1851,12 +2020,19 @@ void draw(const State &st, const Vertex *v, int count) {
         setup_index = static_cast<std::uint32_t>(setups);
         b.setups.insert(b.setups.end(), setup, setup + kSetupWords);
     }
+    if (mip) {
+        if (g_setup_levels.size() <= setup_index) g_setup_levels.resize(setup_index + 1, 0);
+        g_setup_levels[setup_index] |= static_cast<std::uint8_t>(((2u << lmax) - 1u) & ~((1u << lmin) - 1u));
+    }
     if (flags & 2u) {
-        if (g_batch_reads.empty() || g_batch_reads.back().lo != tex.lo || g_batch_reads.back().hi != tex.hi) {
+        const auto note_read = [](const Range &r) {
+            if (!g_batch_reads.empty() && g_batch_reads.back().lo == r.lo && g_batch_reads.back().hi == r.hi) return;
             bool known = false;
-            for (const Range &t : g_batch_reads) known = known || (t.lo <= tex.lo && tex.hi <= t.hi);
-            if (!known) g_batch_reads.push_back(tex);
-        }
+            for (const Range &t : g_batch_reads) known = known || (t.lo <= r.lo && r.hi <= t.hi);
+            if (!known) g_batch_reads.push_back(r);
+        };
+        if (!mip || lmin == 0) note_read(tex);
+        for (int l = std::max(lmin, 1); mip && l <= lmax && l < cache.nlevels; ++l) note_read(cache.levels[l]);
     }
     rec[0] = setup_index;
     rec[2] = static_cast<std::uint32_t>(minx) | (static_cast<std::uint32_t>(miny) << 16);
