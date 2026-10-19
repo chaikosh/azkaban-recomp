@@ -429,7 +429,11 @@ void hw_vblank(int start) {
         {   /* HP_EXITAT=vsync: end the run there (bounded debug runs) */
             extern unsigned long long g_vsyncs;
             static long long ea = -2; if (ea == -2) ea = getenv("HP_EXITAT") ? atoll(getenv("HP_EXITAT")) : -1;
-            if (ea >= 0 && (long long)g_vsyncs >= ea) { LOG("[exit] HP_EXITAT reached at vsync %llu\n", g_vsyncs); fflush(NULL); _exit(0); }
+            if (ea >= 0 && (long long)g_vsyncs >= ea) {
+                extern void gs_census_report(void);
+                gs_census_report();   /* HP_GSSTATS */
+                LOG("[exit] HP_EXITAT reached at vsync %llu\n", g_vsyncs); fflush(NULL); _exit(0);
+            }
         }
         { extern void fastboot_vblank(void); fastboot_vblank(); }   /* HP_FASTBOOT pad in headless runs */
         if (iopb_enabled()) iopb_vblank(1);

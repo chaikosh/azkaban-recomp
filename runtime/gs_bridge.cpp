@@ -38,6 +38,9 @@ namespace ps2::gs::gpu {
 extern std::uint64_t g_hp_image_calls, g_hp_image_bytes, g_hp_emits, g_hp_pre_total, g_hp_pre_max;
 }
 
+extern "C" int gsb_mirror(void);
+extern "C" int display_pcrtc_merge(std::uint64_t pmode);
+
 namespace {
 std::mutex g_lock;   // the vendored GS
 bool g_ready = false;
@@ -123,16 +126,7 @@ void render_batch(Batch &b) {   // g_lock held
 }
 
 bool source_of(const Show &r, ps2::gs::gpu::DisplaySource &src) {
-    const int circuit = (r.pmode & 2u) ? 1 : (r.pmode & 1u) ? 0 : -1;
-    if (circuit < 0) return false;
-    const std::uint64_t fb = r.dispfb[circuit], disp = r.display[circuit];
-    const std::uint32_t magh = (static_cast<std::uint32_t>(disp >> 23) & 0xFu) + 1, magv = (static_cast<std::uint32_t>(disp >> 27) & 3u) + 1;
-    const std::uint32_t sw = ((static_cast<std::uint32_t>(disp >> 32) & 0xFFFu) + 1) / magh, sh = ((static_cast<std::uint32_t>(disp >> 44) & 0x7FFu) + 1) / magv;
-    if (!sw || !sh || sw > 2048 || sh > 2048) return false;
-    src = ps2::gs::gpu::DisplaySource{(static_cast<std::uint32_t>(fb) & 0x1FFu) * 32, static_cast<std::uint32_t>(fb >> 9) & 0x3Fu,
-                                      static_cast<std::uint32_t>(fb >> 15) & 0x1Fu, static_cast<std::uint32_t>(fb >> 32) & 0x7FFu,
-                                      static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, sw, sh, (r.smode2 & 3u) == 3u};
-    return true;
+    return ps2::gs::gpu::display_source(r.pmode, r.smode2, r.dispfb, r.display, static_cast<std::uint32_t>(display_pcrtc_merge(r.pmode)), src);
 }
 
 void publish(const std::vector<std::uint32_t> &rgba, std::uint32_t w, std::uint32_t h) {
@@ -157,8 +151,8 @@ void show_frame(const Show &r) {   // g_lock held
         std::uint32_t w = 0, h = 0;
         // The asynchronous readback keeps up to three copies in flight and waits for the oldest when
         // all are busy (gpu.cpp), which bounds the GPU queue; HP_GSSYNC=1 reads every frame exactly
-        // (the GS thread then waits for the GPU each time: slower).
-        static const bool sync = std::getenv("HP_GSSYNC") != nullptr;
+        // (the GS thread then waits for the GPU each time: slower), as does HP_GS=both.
+        static const bool sync = std::getenv("HP_GSSYNC") != nullptr || gsb_mirror();
         const bool ok = sync ? ps2::gs::gpu::display(src, rgba, w, h) : ps2::gs::gpu::display_async(src, rgba, w, h);
         if (ok) publish(rgba, w, h);
     }
@@ -257,7 +251,18 @@ int gsb_enabled(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = std::getenv("HP_GS");
-        on = e && std::string(e) == "gpu";
+        on = e && (std::string(e) == "gpu" || std::string(e) == "both");
+    }
+    return on;
+}
+
+/* HP_GS=both: the software GS draws and is shown; the GPU renderer gets the same packets on the
+   calling thread, and the screenshots (HP_SHOT) also save its exact frame, for comparisons. */
+int gsb_mirror(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = std::getenv("HP_GS");
+        on = e && std::string(e) == "both";
     }
     return on;
 }
@@ -275,7 +280,7 @@ int gsb_init(void) {
     ps2::gif::reset();
     g_ready = true;
     const char *t = std::getenv("HP_GSTHREAD");
-    g_threaded = !t || std::string(t) != "0";
+    g_threaded = (!t || std::string(t) != "0") && !gsb_mirror();
     if (g_threaded) std::thread(gs_thread).detach();
     std::fprintf(stderr, "[gsgpu] GPU renderer active%s\n", g_threaded ? " (GS thread)" : "");
     return 1;

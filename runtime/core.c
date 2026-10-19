@@ -220,6 +220,7 @@ void rt_usr1_work(void) {
     { extern int iopb_enabled(void); extern void iopb_dump(void); if (iopb_enabled()) iopb_dump(); }
     if (g_wrange_len) wrange_dump();
     rt_callhist_dump();
+    { extern void gs_census_report(void); gs_census_report(); }   /* HP_GSSTATS */
     const char *vd = getenv("HP_VRAMDUMP");
     if (vd) {
         extern uint8_t *g_vram;

@@ -237,6 +237,9 @@ a diagnostic dump.
 | `HP_GPUVARIANTS`, `HP_FRAMEPOLL` | gpu.cpp, gs_bridge.cpp | `HP_GPUVARIANTS=0` draws with the generic raster kernel only (`2`: specialise on frame/Z formats only); `HP_FRAMEPOLL=0` hands frames on at the next request only |
 | `HP_GPUFLUSHLOG`, `HP_GPULOOSETEX`, `HP_DECODEMAX`, `HP_NOCLUTSKIP`, `HP_NODECODECACHE` | gpu.cpp | Batch-end causes and texture decode census; the old padded texel test; largest decoded texture (log2 texels, 16); load every CLUT; no decode reuse |
 | `HP_EXP` | gs.wgsl | Switch parts of the raster kernel off (bits, see the shader) to measure what they cost on a trace |
+| `HP_PCRTC=single` | display.c, gs_bridge.cpp | Show one read circuit only instead of merging both (PMODE MMOD/ALP; the game's deflicker: the same buffer one line apart, blended 50/50) |
+| `HP_GS=both` | gs_bridge.cpp, display.c | The software GS draws and is shown, the GPU renderer gets the same packets; with `HP_SHOT` every screenshot `frame_<v>.ppm` gets a `gpu_<v>.ppm` of the same frame (exact renderer comparisons) |
+| `HP_GSSTATS` | gs.c | Census of the distinct GS drawing states (prim type, formats, TEST, ALPHA, DTHE, texture modes, render-to-texture): each new one is logged when first drawn, all with primitive counts at `HP_EXITAT` / `SIGUSR1`; both renderers |
 | `HP_CDLAT`, `HP_CDSEEK` | iop_servers.c | Emulated disc read latency / seek time |
 | `HP_ISO` | iop_servers.c | Path to the ISO image |
 

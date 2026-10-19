@@ -419,16 +419,35 @@ fn display(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= w || gid.y >= h) {
         return;
     }
-    let psm = prm(2u);
     var sy = gid.y;
     if (prm(7u) != 0u) {
         sy = gid.y / 2u;
     }
-    var c = read_sample(psm, prm(0u), prm(1u), prm(3u) + gid.x / SCALE, prm(4u) + sy / SCALE, (sy % SCALE) * SCALE + gid.x % SCALE);
+    let k = (sy % SCALE) * SCALE + gid.x % SCALE;
+    var c = display_texel(prm(2u), prm(0u), prm(1u), prm(3u) + gid.x / SCALE, prm(4u) + sy / SCALE, k);
+    if (prm(9u) != 0u) {   // PCRTC merge with the second circuit (params 9-18, gpu.cpp display_param)
+        let alp = prm(9u) - 1u;
+        let u = i32(gid.x / SCALE) - bitcast<i32>(prm(17u));
+        let v = i32(sy / SCALE) - bitcast<i32>(prm(18u));
+        if (u >= 0 && v >= 0 && u32(u) < prm(15u) && u32(v) < prm(16u)) {
+            let c2 = display_texel(prm(12u), prm(10u), prm(11u), prm(13u) + u32(u), prm(14u) + u32(v), k);
+            var m = 0u;
+            for (var ch = 0u; ch < 24u; ch = ch + 8u) {
+                let v8 = (((c >> ch) & 0xFFu) * alp + ((c2 >> ch) & 0xFFu) * (255u - alp)) / 255u;
+                m = m | (v8 << ch);
+            }
+            c = m;
+        }
+    }
+    scratch[prm(8u) + gid.y * w + gid.x] = c | 0xFF000000u;
+}
+
+fn display_texel(psm: u32, fbp: u32, fbw: u32, x: u32, y: u32, k: u32) -> u32 {
+    var c = read_sample(psm, fbp, fbw, x, y, k);
     if (psm == PSMCT16 || psm == PSMCT16S) {
         c = ((c & 0x1Fu) << 3u) | ((c & 0x3E0u) << 6u) | ((c & 0x7C00u) << 9u);
     }
-    scratch[prm(8u) + gid.y * w + gid.x] = c | 0xFF000000u;
+    return c & 0xFFFFFFu;
 }
 
 struct Setup {
@@ -481,6 +500,7 @@ const F_FBA: u32 = 4096u;
 const F_TCC: u32 = 8192u;
 const F_BILINEAR: u32 = 16384u;
 const F_AEM: u32 = 32768u;
+const F_DTHE: u32 = 65536u;
 
 fn load_setup(at: u32) -> Setup {
     var s: Setup;
@@ -534,6 +554,16 @@ fn mode(s: Setup, shift: u32, bits: u32) -> u32 {
 
 fn clamp255(v: i32) -> i32 {
     return clamp(v, 0, 255);
+}
+
+// DIMX entry DMyx for pixel (x, y): a signed 3-bit value at bit 16 * (y & 3) + 4 * (x & 3), from
+// setup words 25-26 of the primitive's setup (read only when the setup dithers).
+var<private> setup_at: u32 = 0u;
+
+fn dither_value(x: i32, y: i32) -> i32 {
+    let sh = (u32(y) & 3u) * 16u + (u32(x) & 3u) * 4u;
+    let w = data[setup_at + 25u + sh / 32u];
+    return bitcast<i32>(w << (29u - (sh & 31u))) >> 29u;
 }
 
 fn expand16(c: u32, s: Setup) -> u32 {
@@ -645,16 +675,21 @@ fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
     return blend4(fetch(s, x0, y0, k), fetch(s, x0 + 1, y0, k), fetch(s, x0, y0 + 1, k), fetch(s, x0 + 1, y0 + 1, k), u - f32(x0), v - f32(y0));
 }
 
+// Bilinear filter in fixed point like the software GS (runtime/gs.c tex_sample): 8-bit weights,
+// a horizontal then a vertical lerp, each truncated, (a * (256 - f) + b * f) >> 8.  Computed in
+// float, which is exact here (integers below 2^24, divided by a power of two).
 fn blend4(c00: u32, c10: u32, c01: u32, c11: u32, fx: f32, fy: f32) -> u32 {
+    let fu = floor(clamp(fx * 256.0, 0.0, 255.0));
+    let fv = floor(clamp(fy * 256.0, 0.0, 255.0));
     var out = 0u;
     for (var ch = 0u; ch < 32u; ch = ch + 8u) {
         let a = f32((c00 >> ch) & 0xFFu);
         let b = f32((c10 >> ch) & 0xFFu);
         let c = f32((c01 >> ch) & 0xFFu);
         let d = f32((c11 >> ch) & 0xFFu);
-        let top = a + (b - a) * fx;
-        let bottom = c + (d - c) * fx;
-        out = out | (u32(clamp(top + (bottom - top) * fy + 0.5, 0.0, 255.0)) << ch);
+        let top = floor((a * (256.0 - fu) + b * fu) * (1.0 / 256.0));
+        let bottom = floor((c * (256.0 - fu) + d * fu) * (1.0 / 256.0));
+        out = out | (u32(floor((top * (256.0 - fv) + bottom * fv) * (1.0 / 256.0))) << ch);
     }
     return out;
 }
@@ -927,16 +962,25 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
             } else if (bd == 1u) {
                 dv = cd;
             }
-            var o = (((av - bv) * cc) >> vec3<u32>(7u)) + dv;
-            if (colclamp) {
-                o = clamp(o, vec3<i32>(0), vec3<i32>(255));
-            } else {
-                o = o & vec3<i32>(0xFF);
-            }
+            let o = (((av - bv) * cc) >> vec3<u32>(7u)) + dv;
             r = o.x;
             g = o.y;
             b = o.z;
-        } else if (!colclamp) {
+        }
+        // like the GS: dither after blending, then COLCLAMP (clamp or keep the low 8 bits);
+        // the 16-bit format keeps the top 5 bits (pack16)
+        // (F_DTHE is folded into the kernels of batches that all dither or none does: FLAGS_ON/OFF)
+        if (has(s, F_DTHE)) {
+            let dm = dither_value(x, y);
+            r = r + dm;
+            g = g + dm;
+            b = b + dm;
+        }
+        if (colclamp) {
+            r = clamp255(r);
+            g = clamp255(g);
+            b = clamp255(b);
+        } else {
             r = r & 0xFF;
             g = g & 0xFF;
             b = b & 0xFF;
@@ -957,7 +1001,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
 }
 
 const PRIM_WORDS: u32 = 28u;
-const SETUP_WORDS: u32 = 25u;
+const SETUP_WORDS: u32 = 27u;
 
 fn fat(i: u32) -> f32 {
     return bitcast<f32>(data[i]);
@@ -1171,7 +1215,8 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
         }
         // hp: the setup is loaded for each primitive that covers the pixel instead of kept from
         // the last one: ~46 values live across the whole loop held the kernel's occupancy down
-        let s = load_setup(setups + data[p] * SETUP_WORDS);
+        setup_at = setups + data[p] * SETUP_WORDS;
+        let s = load_setup(setup_at);
         shade_at(p, s, x, y, k, px, py);
     }
 }

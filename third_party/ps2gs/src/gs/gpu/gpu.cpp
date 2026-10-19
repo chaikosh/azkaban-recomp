@@ -40,7 +40,7 @@ constexpr std::uint32_t kParamStride = 256;
 constexpr std::uint32_t kClutSlots = 2048;
 constexpr std::uint32_t kClutEntries = 512;
 constexpr std::uint32_t kPrimWords = 28;
-constexpr std::uint32_t kSetupWords = 25;
+constexpr std::uint32_t kSetupWords = 27;
 constexpr std::uint32_t kDecodedWords = 4u << 20;
 constexpr std::uint32_t kDecodePrims = 64;
 
@@ -88,7 +88,8 @@ WGPUShaderModule g_module = nullptr;
 // The key also carries the setup flags every primitive of the batch has (FLAGS_ON) or lacks
 // (FLAGS_OFF), whether all its textures are decoded (DECODED), the texture format if all share
 // one (TPSM) and the bits of the modes word all setups agree on (MODES_ON/OFF):
-// a = fpsm | zpsm << 8 | on << 16 | off << 32 | decoded << 48 | tpsm << 49, b = modes on | off << 32.
+// a = fpsm | zpsm << 8 | on << 16 | off << 32 | decoded << 48 | tpsm << 49 | dither on << 57 | dither off << 58
+// (setup flag 65536, DTHE into a 16-bit frame), b = modes on | off << 32.
 struct VariantKey {
     std::uint64_t a, b;
     bool operator==(const VariantKey &o) const { return a == o.a && b == o.b; }
@@ -159,8 +160,14 @@ WGPUComputePipeline raster_variant(const std::uint32_t *setups, std::size_t coun
     }
     VariantKey key{fpsm | (zpsm << 8), 0};
     if (flags_on) {
+        bool dither_all = count > 0, dither_any = false;
+        for (std::size_t i = 0; i < count; ++i) {
+            const bool d = (setups[i * kSetupWords] & 65536u) != 0;
+            dither_all = dither_all && d;
+            dither_any = dither_any || d;
+        }
         key.a |= (static_cast<std::uint64_t>(all & 0xFFFFu) << 16) | (static_cast<std::uint64_t>(~any & 0xFFFFu) << 32) | (static_cast<std::uint64_t>(decoded) << 48) |
-                 (static_cast<std::uint64_t>(tpsm & 0xFFu) << 49);
+                 (static_cast<std::uint64_t>(tpsm & 0xFFu) << 49) | (static_cast<std::uint64_t>(dither_all) << 57) | (static_cast<std::uint64_t>(!dither_any) << 58);
         key.b = mall | (static_cast<std::uint64_t>(~many) << 32);
     } else {
         key.a |= 0xFFull << 49;
@@ -357,6 +364,12 @@ std::uint32_t push_params(const std::initializer_list<std::uint32_t> values) {
     for (std::uint32_t v : values) record[i++] = v;
     g_param_records.push_back(record);
     return static_cast<std::uint32_t>(g_param_records.size() - 1);
+}
+
+// parameters of the display pass (gs.wgsl display): the source, the scratch offset, the PCRTC merge
+std::uint32_t display_param(const DisplaySource &src, std::uint32_t base) {
+    return push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u, base, src.merge, src.fbp2,
+                        src.fbw2, src.psm2, src.dbx2, src.dby2, src.width2, src.height2, static_cast<std::uint32_t>(src.ox), static_cast<std::uint32_t>(src.oy)});
 }
 
 void dispatch_linear(Pipeline p, std::uint32_t items, std::uint32_t param) {
@@ -994,9 +1007,9 @@ WGPUComputePipeline make_pipeline(int entry, const VariantKey *variant) {
     constants[3].key = view("ZPSM");
     constants[3].value = generic ? 4294967295.0 : static_cast<double>((key >> 8) & 0xFFu);
     constants[4].key = view("FLAGS_ON");
-    constants[4].value = generic ? 0.0 : static_cast<double>((key >> 16) & 0xFFFFu);
+    constants[4].value = generic ? 0.0 : static_cast<double>(((key >> 16) & 0xFFFFu) | (((key >> 57) & 1u) << 16));
     constants[5].key = view("FLAGS_OFF");
-    constants[5].value = generic ? 0.0 : static_cast<double>((key >> 32) & 0xFFFFu);
+    constants[5].value = generic ? 0.0 : static_cast<double>(((key >> 32) & 0xFFFFu) | (((key >> 58) & 1u) << 16));
     constants[6].key = view("DECODED");
     constants[6].value = generic ? 0.0 : static_cast<double>((key >> 48) & 1u);
     constants[7].key = view("TPSM");
@@ -1278,6 +1291,9 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w, 
     if ((c.tex0 >> 34) & 1u) flags |= 8192u;
     if ((c.tex1 >> 5) & 1u) flags |= 16384u;
     if ((st.texa >> 15) & 1u) flags |= 32768u;
+    const std::uint32_t fpsm = static_cast<std::uint32_t>(c.frame >> 24) & 0x3Fu;
+    const bool dither = (st.dthe & 1u) && (fpsm == PSMCT16 || fpsm == PSMCT16S || fpsm == PSMZ16 || fpsm == PSMZ16S);
+    if (dither) flags |= 65536u;   /* DTHE: only drawing into a 16-bit frame buffer dithers */
     const std::uint32_t zpsm = 0x30u | (static_cast<std::uint32_t>(c.zbuf >> 24) & 0xFu);
     w[0] = flags;
     w[1] = (static_cast<std::uint32_t>(c.frame) & 0x1FFu) * 32u;
@@ -1307,6 +1323,8 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w, 
     w[22] = g_clut_slot;
     w[23] = z_max(zpsm);
     w[24] = 0xFFFFFFFFu;
+    w[25] = dither ? static_cast<std::uint32_t>(st.dimx) : 0u;   /* DIMX rows 0-1 */
+    w[26] = dither ? static_cast<std::uint32_t>(st.dimx >> 32) : 0u;   /* rows 2-3 */
     if (level > 0) {   /* mip level `level`: base and width from MIPTBP1/2 (or MTBA), halved size and region */
         std::uint32_t tbp = 0, tbw = 0;
         if (((c.tex1 >> 9) & 1u) && level <= 3) {
@@ -2219,7 +2237,7 @@ bool present(const DisplaySource &src) {
     const std::uint32_t current = field_base(g_field), previous = field_base(g_field + 1);
     static const bool weave_off = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
     const bool blend = src.halved && g_have_previous && g_last_width == src.width && g_last_height == src.height && !weave_off;
-    const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u, current});
+    const std::uint32_t param = display_param(src, current);
     g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
     const float sw = static_cast<float>(g_surface_width), sh = static_cast<float>(g_surface_height);
     const float vw = std::min(sw, sh * 4.0f / 3.0f), vh = vw * 3.0f / 4.0f;
@@ -2387,7 +2405,7 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
             slot->buffer = make_buffer(bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
         }
         { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); flush_all(); }
-        const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u});
+        const std::uint32_t param = display_param(src, 0);
         g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
         submit();
         WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
@@ -2419,7 +2437,7 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
 
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
     { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); flush_all(); }
-    const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u});
+    const std::uint32_t param = display_param(src, 0);
     g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
     submit();
     width = src.width * g_scale;

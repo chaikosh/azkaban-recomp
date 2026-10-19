@@ -20,6 +20,24 @@ unsigned g_pace[5];   /* new frames shown after 1, 2, 3, 4+ vblanks (index 0 unu
 
 static inline uint64_t fld(uint64_t v, int lo, int n) { return (v >> lo) & ((1ull << n) - 1); }
 
+/* PCRTC merge: with both read circuits on, PMODE.MMOD = 1 (fixed alpha ALP) and SLBG = 0 the GS
+   outputs circuit 1 * ALP/255 + circuit 2 * (1 - ALP/255), each circuit placed by its DISPLAY
+   DX/DY.  This game shows the same buffer on both, circuit 2 one line lower, ALP = 0x80: the
+   deflicker filter, which also averages its ordered dither (DIMX) between neighbouring lines.
+   Returns ALP + 1, or 0 when the circuits are not merged (HP_PCRTC=single: only one circuit is
+   shown, as before; MMOD = 0, alpha from circuit 1's pixels, is not implemented). */
+int display_pcrtc_merge(uint64_t pmode) {
+    static int single = -1;
+    if (single < 0) { const char *e = getenv("HP_PCRTC"); single = e && !strcmp(e, "single"); }
+    if (single || (pmode & 3) != 3 || !((pmode >> 5) & 1) || ((pmode >> 7) & 1)) return 0;
+    return (int)fld(pmode, 8, 8) + 1;
+}
+
+static inline uint32_t to_rgb(uint32_t v, uint32_t psm) {
+    if (psm == PSMCT16 || psm == PSMCT16S) return ((v & 0x1f) << 3) | (((v >> 5) & 0x1f) << 11) | (((v >> 10) & 0x1f) << 19);
+    return v & 0xffffff;
+}
+
 void display_vsync(void) {
     g_vsyncs++;
     uint64_t pmode = hw_gs_priv(0x0000);
@@ -35,26 +53,8 @@ void display_vsync(void) {
     if (h > MAXH) h = MAXH;
     if (w <= 0 || h <= 0) return;
     pthread_mutex_lock(&fm);
-    extern int g_gs_gpu;
+    extern int g_gs_gpu, g_gs_mirror;
     extern int gsb_display(uint64_t, uint64_t, const uint64_t *, const uint64_t *, uint32_t *, uint32_t, int *, int *);
-    if (g_gs_gpu) {   /* the GPU renderer hands back the displayed frame */
-        uint64_t fb2[2] = {hw_gs_priv(0x0070), hw_gs_priv(0x0090)}, disp2[2] = {hw_gs_priv(0x0080), hw_gs_priv(0x00a0)};
-        if (!gsb_display(pmode, hw_gs_priv(0x0020), fb2, disp2, frame_buf, MAXW * MAXH, &w, &h)) { pthread_mutex_unlock(&fm); return; }
-        {   /* frame pacing: vblanks between the frames handed to the window (HP_FPSLOG prints it) */
-            extern unsigned g_pace[5]; static unsigned long long last;
-            unsigned long long d = g_vsyncs - last; last = g_vsyncs;
-            g_pace[d >= 4 ? 4 : d]++;
-        }
-    } else
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++) {
-            uint32_t v = gs_read_raw(fbp, fbw, psm, dbx + (uint32_t)x, dby + (uint32_t)y), c;
-            if (psm == PSMCT16 || psm == PSMCT16S)
-                c = ((v & 0x1f) << 3) | (((v >> 5) & 0x1f) << 11) | (((v >> 10) & 0x1f) << 19);
-            else c = v & 0xffffff;
-            frame_buf[y * w + x] = c | 0xff000000u;
-        }
-    frame_w = w; frame_h = h; frame_new = 1;
     /* HP_SHOT=dir: write frame_<vsync>.ppm every 60 vsyncs */
     static const char *shot = (const char *)1;
     if (shot == (const char *)1) shot = getenv("HP_SHOT");
@@ -63,6 +63,47 @@ void display_vsync(void) {
     static unsigned long long next_shot;
     static int every = -1;
     if (every < 0) { every = getenv("HP_SHOTEVERY") ? atoi(getenv("HP_SHOTEVERY")) : 60; if (every <= 0) every = 60; next_shot = every; }
+    /* HP_GS=both: both renderers' frames of a screenshot are taken with the GS input held, so that
+       a buffer being drawn into (loading screens) shows the same packets in both */
+    extern pthread_mutex_t g_gs_lock;
+    const int mirror_shot = g_gs_mirror && shot && g_vsyncs >= next_shot;
+    if (mirror_shot) pthread_mutex_lock(&g_gs_lock);
+    if (g_gs_gpu) {   /* the GPU renderer hands back the displayed frame */
+        uint64_t fb2[2] = {hw_gs_priv(0x0070), hw_gs_priv(0x0090)}, disp2[2] = {hw_gs_priv(0x0080), hw_gs_priv(0x00a0)};
+        if (!gsb_display(pmode, hw_gs_priv(0x0020), fb2, disp2, frame_buf, MAXW * MAXH, &w, &h)) { pthread_mutex_unlock(&fm); return; }
+        {   /* frame pacing: vblanks between the frames handed to the window (HP_FPSLOG prints it) */
+            extern unsigned g_pace[5]; static unsigned long long last;
+            unsigned long long d = g_vsyncs - last; last = g_vsyncs;
+            g_pace[d >= 4 ? 4 : d]++;
+        }
+    } else if (display_pcrtc_merge(pmode)) {   /* both circuits, blended (circuit 1's rectangle) */
+        const uint32_t alp = (uint32_t)display_pcrtc_merge(pmode) - 1;
+        const uint64_t fb1 = hw_gs_priv(0x0070), d1 = hw_gs_priv(0x0080), fb2 = hw_gs_priv(0x0090), d2 = hw_gs_priv(0x00a0);
+        const uint32_t p1 = fld(fb1, 0, 9) * 32, w1 = fld(fb1, 9, 6), s1 = fld(fb1, 15, 5), x1 = fld(fb1, 32, 11), y1 = fld(fb1, 43, 11);
+        const uint32_t p2 = fld(fb2, 0, 9) * 32, w2 = fld(fb2, 9, 6), s2 = fld(fb2, 15, 5), x2 = fld(fb2, 32, 11), y2 = fld(fb2, 43, 11);
+        const int mh1 = (int)fld(d1, 23, 4) + 1, mv1 = (int)fld(d1, 27, 2) + 1, mh2 = (int)fld(d2, 23, 4) + 1, mv2 = (int)fld(d2, 27, 2) + 1;
+        w = (int)((fld(d1, 32, 12) + 1) / mh1); h = (int)((fld(d1, 44, 11) + 1) / mv1);
+        if (w > MAXW) w = MAXW;
+        if (h > MAXH) h = MAXH;
+        const int cw2 = (int)((fld(d2, 32, 12) + 1) / mh2), ch2 = (int)((fld(d2, 44, 11) + 1) / mv2);
+        const int ox = ((int)fld(d2, 0, 12) - (int)fld(d1, 0, 12)) / mh2, oy = ((int)fld(d2, 12, 11) - (int)fld(d1, 12, 11)) / mv2;
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) {
+                uint32_t c1 = to_rgb(gs_read_raw(p1, w1, s1, x1 + (uint32_t)x, y1 + (uint32_t)y), s1), c = c1;
+                const int u = x - ox, v = y - oy;
+                if (u >= 0 && v >= 0 && u < cw2 && v < ch2) {
+                    const uint32_t c2 = to_rgb(gs_read_raw(p2, w2, s2, x2 + (uint32_t)u, y2 + (uint32_t)v), s2);
+                    c = 0;
+                    for (int k = 0; k < 24; k += 8)
+                        c |= ((((c1 >> k) & 0xff) * alp + ((c2 >> k) & 0xff) * (255 - alp)) / 255) << k;
+                }
+                frame_buf[y * w + x] = c | 0xff000000u;
+            }
+    } else
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            frame_buf[y * w + x] = to_rgb(gs_read_raw(fbp, fbw, psm, dbx + (uint32_t)x, dby + (uint32_t)y), psm) | 0xff000000u;
+    frame_w = w; frame_h = h; frame_new = 1;
     if (shot && g_vsyncs >= next_shot) {
         next_shot = (g_vsyncs / every + 1) * every;
         char path[1100];
@@ -73,7 +114,21 @@ void display_vsync(void) {
             for (int i = 0; i < w * h; i++) { uint32_t c = frame_buf[i]; uint8_t px[3] = {(uint8_t)c, (uint8_t)(c >> 8), (uint8_t)(c >> 16)}; fwrite(px, 1, 3, f); }
             fclose(f);
         }
+        if (g_gs_mirror) {   /* HP_GS=both: the GPU renderer's frame from the same packets, gpu_<vsync>.ppm */
+            static uint32_t gbuf[MAXW * MAXH];
+            int gw = 0, gh = 0;
+            uint64_t fb2[2] = {hw_gs_priv(0x0070), hw_gs_priv(0x0090)}, disp2[2] = {hw_gs_priv(0x0080), hw_gs_priv(0x00a0)};
+            if (gsb_display(pmode, hw_gs_priv(0x0020), fb2, disp2, gbuf, MAXW * MAXH, &gw, &gh)) {
+                snprintf(path, sizeof path, "%s/gpu_%05llu.ppm", shot, g_vsyncs / every * every);
+                if ((f = fopen(path, "wb"))) {
+                    fprintf(f, "P6\n%d %d\n255\n", gw, gh);
+                    for (int i = 0; i < gw * gh; i++) { uint32_t c = gbuf[i]; uint8_t px[3] = {(uint8_t)c, (uint8_t)(c >> 8), (uint8_t)(c >> 16)}; fwrite(px, 1, 3, f); }
+                    fclose(f);
+                }
+            }
+        }
     }
+    if (mirror_shot) pthread_mutex_unlock(&g_gs_lock);
     /* HP_SHOTFB=fbp,fbw,psm,w,h (hex fbp in 2048-word pages): also dump that buffer */
     static const char *fb = (const char *)1;
     if (fb == (const char *)1) fb = getenv("HP_SHOTFB");
