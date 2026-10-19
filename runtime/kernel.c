@@ -215,6 +215,30 @@ void rt_irq_poll(EE *c) {
     pthread_mutex_unlock(&km);
 }
 
+/* A busy-wait loop of the game (recomp/hooks.txt "@idle"): instead of spinning, wait until an
+   interrupt is pending (at most 2 ms, so a missed wake-up only costs a little), then deliver it.
+   HP_NOIDLE=1 keeps spinning. */
+unsigned long long g_idle_ns;
+void rt_idle_poll(EE *c) {
+    static int off = -1;
+    if (off < 0) off = getenv("HP_NOIDLE") != NULL;
+    if (!off && !g_irq_pending && irq_enabled && my_tid >= 0) {
+        pthread_mutex_lock(&km);
+        if (!in_irq && cur == my_tid && !g_irq_pending) {
+            struct timespec a, ts;
+            clock_gettime(CLOCK_UPTIME_RAW, &a);
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 2 * 1000000;
+            if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+            pthread_cond_timedwait(&idle_cv, &km, &ts);
+            struct timespec b; clock_gettime(CLOCK_UPTIME_RAW, &b);
+            g_idle_ns += (uint64_t)(b.tv_sec - a.tv_sec) * 1000000000ull + (uint64_t)(b.tv_nsec - a.tv_nsec);
+        }
+        pthread_mutex_unlock(&km);
+    }
+    if (g_irq_pending) rt_irq_poll(c);
+}
+
 void kern_raise_intc(int line) {
     pthread_mutex_lock(&km);
     if (!(intc_stat & (1u << line))) intc_seq[line] = ++irq_seq;

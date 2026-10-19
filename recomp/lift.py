@@ -584,7 +584,7 @@ class FuncEmitter:
         ds = self.ds_code(pc)
         if k in (BRANCH, BRANCH_L):
             cond = cond_expr(i)
-            back = "POLL(); " if i.target <= pc else ""
+            back = ("IDLE_POLL(); " if i.target in IDLE_LOOPS else "POLL(); ") if i.target <= pc else ""
             if i.link:
                 call = self.call_expr(i.target)
                 if k == BRANCH:
@@ -601,7 +601,7 @@ class FuncEmitter:
         if k == JUMP:
             if i.target in f.tailcalls or i.target not in f.insns:
                 return [f"{{ {ds} {self.call_expr(i.target)} return; }}"], None
-            back = "POLL(); " if i.target <= pc else ""
+            back = ("IDLE_POLL(); " if i.target in IDLE_LOOPS else "POLL(); ") if i.target <= pc else ""
             self.need_labels.add(i.target)
             return [f"{{ {ds} {back}goto L_{i.target:08x}; }}"], None
         if k == CALL:
@@ -656,6 +656,12 @@ class FuncEmitter:
         return [f"st32({a}, RW({rt}));"], nx.pc + 4
 
 
+# Busy-wait loops (hooks.txt lines "<loop pc> @idle"): a backward branch to one of these sleeps
+# until the next interrupt (IDLE_POLL) instead of spinning on POLL, which on a phone with two
+# performance cores took one away from the GS.
+IDLE_LOOPS = set()
+
+
 def load_hooks():
     hooks = {}
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks.txt")
@@ -663,6 +669,9 @@ def load_hooks():
         for line in open(path):
             line = line.split("#")[0].split()
             if len(line) >= 2:
+                if line[1] == "@idle":
+                    IDLE_LOOPS.add(int(line[0], 16))
+                    continue
                 hooks[int(line[0], 16)] = line[1]
     return hooks
 

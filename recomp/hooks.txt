@@ -21,3 +21,4 @@
 003480d0          hle_runtime_get   NRuntime::Get(option): HP_FASTBOOT / HP_ARGS add game options (runtime/fastboot.c)
 0010d2e0          hle_fscommand     Apt FSCommand dispatch (HP_FSLOG logs them; runtime/fastboot.c)
 0017ab48          hle_orc_play_scene  Orchestrator PlayScene: HP_FASTBOOT makes cutscenes skippable (runtime/fastboot.c)
+0013c870          @idle             frame wait: the main loop polls a flag the VIF1/vblank handlers clear (sleep until an interrupt)

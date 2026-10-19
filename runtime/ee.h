@@ -241,3 +241,5 @@ void rt_ei(EE *c); void rt_di(EE *c); void rt_eret(EE *c, uint32_t pc);
 void rt_unimpl(EE *c, uint32_t pc, const char *op) __attribute__((noreturn));
 
 #define POLL() do { if (UNLIKELY(g_irq_pending)) rt_irq_poll(c); } while (0)
+void rt_idle_poll(EE *c);
+#define IDLE_POLL() rt_idle_poll(c)   /* a known busy-wait loop: sleep until an interrupt */

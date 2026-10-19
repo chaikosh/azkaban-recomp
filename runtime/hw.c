@@ -400,6 +400,13 @@ void hw_vblank(int start) {
                     (g_frames_queued - lf) / wall, 300 / wall, g_pace[1], g_pace[2], g_pace[3], g_pace[4], mb,
                     (g_audio_frames - laf) / wall, g_audio_qmin == (1 << 30) ? 0 : g_audio_qmin / 192, g_audio_qmax / 192, g_audio_dropped - lad, g_audio_underruns);
                 laf = g_audio_frames; lad = g_audio_dropped; g_audio_qmin = 1 << 30; g_audio_qmax = 0;
+                {   /* where the time goes: per-thread CPU, and how long the EE slept in its frame wait */
+                    extern unsigned long long g_idle_ns; static unsigned long long li;
+                    extern void hp_thread_report(double wall);
+                    LOG("[fps] EE idle in frame wait %.0f%%; ", 100.0 * (g_idle_ns - li) / 1e9 / wall);
+                    li = g_idle_ns;
+                    hp_thread_report(wall);
+                }
                 memset(g_pace, 0, sizeof g_pace);
                 lf = g_frames_queued; lt = t;
             }
