@@ -100,6 +100,22 @@ int main(int argc, char **argv) {
             static const bool async = std::getenv("HP_REPLAYASYNC") != nullptr;
             if (!(async ? ps2::gs::gpu::display_async(src, rgba, w, h) : ps2::gs::gpu::display(src, rgba, w, h))) continue;
             t_show += secs() - ts;
+            {   // HP_VRAMDUMPAT=frame: the whole local memory after that frame, as outdir/vram_<frame>.bin (kernel comparisons)
+                static const char *dump_list = std::getenv("HP_VRAMDUMPAT");   // "5" or "1,2,4,8"
+                bool dump_now = false;
+                for (const char *q = dump_list; q && *q; ) {
+                    if (std::atol(q) == n) dump_now = true;
+                    q = std::strchr(q, ',');
+                    if (q) ++q;
+                }
+                if (outdir && dump_now) {
+                    static std::vector<std::uint8_t> vram(4u << 20);
+                    ps2::gs::gpu::download(vram.data(), 0, 4u << 20);
+                    char path[1200];
+                    std::snprintf(path, sizeof path, "%s/vram_%05ld.bin", outdir, n);
+                    if (FILE *o = std::fopen(path, "wb")) { std::fwrite(vram.data(), 1, vram.size(), o); std::fclose(o); }
+                }
+            }
             if (outdir && n >= first && n <= last && w && h) {
                 char path[1200];
                 std::snprintf(path, sizeof path, "%s/frame_%05ld.ppm", outdir, n);
@@ -131,6 +147,7 @@ int main(int argc, char **argv) {
     }
     const double t = secs() - t0;
     std::fprintf(stderr, "gsreplay: GS passes on the GPU %.0f ms\n", ps2::gs::gpu::busy_ms());
+    ps2::gs::gpu::upload_report();
     std::fprintf(stderr, "gsreplay: %ld frames (%ld written), %.1f MB GIF, %.2f s (%.2f ms/frame, readback %.2f s)\n", frames, written,
                  static_cast<double>(bytes) / (1 << 20), t, frames ? t * 1000 / static_cast<double>(frames) : 0.0, t_show);
     return 0;

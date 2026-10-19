@@ -10,6 +10,9 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> scratch: array<u32>;
 @group(0) @binding(6) var<storage, read> cache: array<u32>;
 @group(0) @binding(7) var<storage, read_write> decoded: array<u32>;
+// hp: the hidden-surface prepass's per-pixel skip counts; the last 64 words are census counters
+@group(0) @binding(8) var<storage, read_write> hsr: array<atomic<u32>>;
+const HSR_WORDS: u32 = 4194368u;
 
 override SCALE: u32 = 1u;
 // hp: HP_EXP=bits switches parts of the raster kernel off, to measure what they cost on a GS trace
@@ -54,6 +57,16 @@ const T_OFFZ16: u32 = 12288u;
 const T_OFFZ16S: u32 = 16384u;
 const T_OFF8: u32 = 20480u;
 const T_OFF4: u32 = 28672u;
+// hp: inverse tables (gs.cpp swizzle_tables): the texels of every word of a page
+const T_INV32: u32 = 45056u;
+const T_INVZ32: u32 = 47104u;
+const T_INV16: u32 = 49152u;
+const T_INV16S: u32 = 53248u;
+const T_INVZ16: u32 = 57344u;
+const T_INVZ16S: u32 = 61440u;
+const T_INV8: u32 = 65536u;
+const T_INV4: u32 = 73728u;
+const REC_WORDS: u32 = 16u;   // hp: words per upload / CLUT record (gpu.cpp PreOp)
 
 const CLUT_ENTRIES: u32 = 512u;
 
@@ -307,13 +320,13 @@ fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
     var hi = prm(1u);
     while (hi - lo > 1u) {
         let mid = (lo + hi) / 2u;
-        if (data[records + mid * 12u + 11u] <= i) {
+        if (data[records + mid * REC_WORDS + 11u] <= i) {
             lo = mid;
         } else {
             hi = mid;
         }
     }
-    let r = records + lo * 12u;
+    let r = records + lo * REC_WORDS;
     let k = i - data[r + 11u];
     let rrw = data[r + 5u];
     let p = data[r + 6u] + k;
@@ -335,6 +348,109 @@ fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
         v = bits_at(data[r + 8u], data[r + 9u] + k * bpp, bpp);
     }
     write_pixel(data[r + 2u], data[r], data[r + 1u], x, y, v);
+}
+
+// hp: the upload a word of local memory at a time.  The texel kernel above gave every texel a
+// lane that located its word and merged its bits with two atomics; an 8-bit texture upload was
+// eight atomics per word (sixteen for 4-bit), all contending.  Here a lane takes one word of one
+// page of the rectangle's page grid (record words 12-14: the grid origin, its width, the first
+// and last row), reads the texels that word holds from the inverse tables, fetches their bits
+// from the source, and writes the word once (merging with the old word only where the rectangle
+// or the chunk leaves bits untouched).  The same bits land as before.
+@compute @workgroup_size(64)
+fn upload_words(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + gid.y * 64u * 1024u;
+    if (i >= prm(2u)) {
+        return;
+    }
+    let records = prm(0u);
+    var lo = 0u;
+    var hi = prm(1u);
+    while (hi - lo > 1u) {
+        let mid = (lo + hi) / 2u;
+        if (data[records + mid * REC_WORDS + 11u] <= i) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let r = records + lo * REC_WORDS;
+    let k = i - data[r + 11u];
+    let cell = k / 2048u;
+    let word = k % 2048u;
+    let psm = data[r + 2u];
+    var pws = 6u;
+    var phs = 5u;
+    var per = 1u;
+    var bits = 32u;
+    var inv = T_INV32;
+    var fixed = 0u;
+    var mask = 0xFFFFFFFFu;
+    switch psm {
+        case 0x30u { inv = T_INVZ32; }
+        case 0x31u { inv = T_INVZ32; mask = 0xFFFFFFu; bits = 24u; }
+        case 0x01u { mask = 0xFFFFFFu; bits = 24u; }
+        case 0x02u { phs = 6u; per = 2u; bits = 16u; mask = 0xFFFFu; inv = T_INV16; }
+        case 0x0Au { phs = 6u; per = 2u; bits = 16u; mask = 0xFFFFu; inv = T_INV16S; }
+        case 0x32u { phs = 6u; per = 2u; bits = 16u; mask = 0xFFFFu; inv = T_INVZ16; }
+        case 0x3Au { phs = 6u; per = 2u; bits = 16u; mask = 0xFFFFu; inv = T_INVZ16S; }
+        case 0x13u { pws = 7u; phs = 6u; per = 4u; bits = 8u; mask = 0xFFu; inv = T_INV8; }
+        case 0x14u { pws = 7u; phs = 7u; per = 8u; bits = 4u; mask = 0xFu; inv = T_INV4; }
+        case 0x1Bu { fixed = 24u; mask = 0xFFu; bits = 8u; }
+        case 0x24u { fixed = 24u; mask = 0xFu; bits = 4u; }
+        case 0x2Cu { fixed = 28u; mask = 0xFu; bits = 4u; }
+        default { }
+    }
+    let grid = data[r + 12u];
+    let npx = data[r + 13u];
+    let px = (grid & 0xFFFFu) + cell % npx;
+    let py = (grid >> 16u) + cell / npx;
+    let per_row = max(1u, (data[r + 1u] * 64u) >> pws);
+    let page = data[r] * 256u + (px + py * per_row) * 8192u;
+    let w = ((page & 0x3FFFFFu) >> 2u) + word;
+    let dsax = data[r + 3u];
+    let dsay = data[r + 4u];
+    let rrw = data[r + 5u];
+    let done = data[r + 6u];
+    let pixels = data[r + 7u];
+    let rows = data[r + 14u];
+    let y0 = rows & 0xFFFFu;
+    let y1 = rows >> 16u;
+    let bpp = data[r + 10u] & 0xFFu;
+    let cached = (data[r + 10u] & 0x80000000u) != 0u;
+    var value = 0u;
+    var written = 0u;
+    for (var s = 0u; s < per; s = s + 1u) {
+        let e = tables[inv + word * per + s];
+        let x = (px << pws) + (e & 0xFFu);
+        let y = (py << phs) + (e >> 8u);
+        var t = 0xFFFFFFFFu;
+        if (x >= dsax && x < dsax + rrw && y >= y0 && y <= y1) {
+            t = (y - dsay) * rrw + (x - dsax);
+        }
+        if (t >= done && t < done + pixels) {
+            let kk = t - done;
+            var v = 0u;
+            if (cached) {
+                v = cache_bits_at(data[r + 8u], data[r + 9u] + kk * bpp, bpp);
+            } else {
+                v = bits_at(data[r + 8u], data[r + 9u] + kk * bpp, bpp);
+            }
+            let shift = fixed + s * bits;
+            value = value | ((v & mask) << shift);
+            written = written | (mask << shift);
+        }
+    }
+    if (written == 0u) {
+        return;
+    }
+    if (written == 0xFFFFFFFFu) {   // every texel of the word is in this chunk: nobody else writes it
+        atomicStore(&vram[w], value);
+        return;
+    }
+    // a word shared with another chunk of the same image (its lane may be writing it right now)
+    atomicAnd(&vram[w], ~written);
+    atomicOr(&vram[w], value);
 }
 
 @compute @workgroup_size(64)
@@ -379,7 +495,7 @@ fn copy_write(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn load_clut(@builtin(local_invocation_index) k: u32) {
     let count = prm(1u);
     for (var n = 0u; n < count; n = n + 1u) {
-        let r = prm(0u) + n * 12u;
+        let r = prm(0u) + n * REC_WORDS;
         let src = data[r] * CLUT_ENTRIES;
         let dst = data[r + 1u] * CLUT_ENTRIES;
         clut[dst + k] = clut[src + k];
@@ -685,6 +801,9 @@ fn sample_filter(s: Setup, uin: f32, vin: f32, k: u32, linear: bool) -> u32 {
     let v = vin - 0.5;
     let x0 = i32(floor(u));
     let y0 = i32(floor(v));
+    if ((EXP & 4096u) != 0u) {   // hp: the four fetches without the filter arithmetic (what the loads cost)
+        return fetch(s, x0, y0, k) ^ fetch(s, x0 + 1, y0, k) ^ fetch(s, x0, y0 + 1, k) ^ fetch(s, x0 + 1, y0 + 1, k);
+    }
     return blend4(fetch(s, x0, y0, k), fetch(s, x0 + 1, y0, k), fetch(s, x0, y0 + 1, k), fetch(s, x0 + 1, y0 + 1, k), u - f32(x0), v - f32(y0));
 }
 
@@ -801,6 +920,8 @@ fn sample_mip(s: Setup, u: f32, v: f32, q: f32, k: u32) -> u32 {
 // prim word 11 bits 24-25 (gpu.cpp mip_range): 1 the whole primitive magnifies, 2 it is all on the
 // last level; 0 the LOD is worked out per pixel
 var<private> mip_fix: u32 = 0u;
+// hp: EXP 8192 census: what plot did for the pixel (0 nothing, 1 wrote, 2 wrote every bit and Z)
+var<private> plot_did: u32 = 0u;
 
 fn read_frame(s: Setup, l: Loc, k: u32) -> u32 {
     let raw = load_at(l, k);
@@ -902,7 +1023,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
             return;
         }
         zl = addr(fmt_of(s.zpsm, s.zbp, s.fbw), ux, uy);
-        if (ztst != 1u) {
+        if (ztst != 1u && (EXP & 1024u) == 0u) {
             let old = load_at(zl, k) & s.zmax;
             if ((ztst == 2u && z < old) || (ztst == 3u && z <= old)) {
                 return;
@@ -1046,9 +1167,15 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
         }
     }
 
+    if ((EXP & 8192u) != 0u) {
+        plot_did = 1u;
+        if (write_fb && write_z && zte && !has(s, F_ABE) && !has(s, F_ATE) && !has(s, F_DATE) && s.fbmsk == 0u && scanmsk == 0u) {
+            plot_did = 2u;
+        }
+    }
     if (write_fb) {
         let colclamp = has(s, F_COLCLAMP);
-        if (has(s, F_ABE) && (!has(s, F_PABE) || (a & 0x80) != 0)) {
+        if (has(s, F_ABE) && (!has(s, F_PABE) || (a & 0x80) != 0) && (EXP & 2048u) == 0u) {
             if (!have_dst) {
                 dst = read_frame(s, fl, k);
             }
@@ -1116,7 +1243,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
         }
         write_frame(s, fl, k, u32(r) | (u32(g) << 8u) | (u32(b) << 16u) | (out_a << 24u), mask);
     }
-    if (write_z && zte) {
+    if (write_z && zte && (EXP & 256u) == 0u) {
         store(zl, k, z);
     }
 }
@@ -1328,6 +1455,8 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
     let setups = prm(2u);
     snapshot_lo = prm(5u);
     snapshot_hi = prm(6u);
+    var shaded = 0u;
+    var last_full = 0u;
     for (var i = 0u; i < count; i = i + 1u) {
         let h = first + i;
         let p = prims + ((data[lists + (h >> 1u)] >> ((h & 1u) * 16u)) & 0xFFFFu) * PRIM_WORDS;
@@ -1340,6 +1469,108 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
         // the last one: ~46 values live across the whole loop held the kernel's occupancy down
         setup_at = setups + data[p] * SETUP_WORDS;
         let s = load_setup(setup_at);
+        plot_did = 0u;
         shade_at(p, s, x, y, k, px, py);
+        if ((EXP & 8192u) != 0u && plot_did != 0u) {
+            shaded = shaded + 1u;
+            if (plot_did == 2u) {
+                last_full = shaded;
+            }
+        }
+    }
+    if ((EXP & 8192u) != 0u) {   // hp: census: pixel writes, and those before the last full replace (hidden)
+        atomicAdd(&hsr[HSR_WORDS - 64u], shaded);
+        atomicAdd(&hsr[HSR_WORDS - 63u], select(0u, last_full - 1u, last_full > 0u));
+    }
+}
+
+// hp: raster_simd -- the same drawing, organised for the SIMD width.  One subgroup of 32 lanes
+// takes a 16x16 tile; for each primitive of the tile's list the lanes first find the pixels it
+// covers (each lane tests its 8 pixels of one row), pack their indices with a prefix sum, and then
+// shade them 32 at a time, every lane on a covered pixel of the same primitive.  The tile kernel
+// above gives every pixel its own lane for the whole list, so a primitive covering 20 pixels of
+// the tile shaded with 236 lanes idle, and the texture fetches of the few busy lanes had little
+// company to hide their latency behind.  The order of the primitives per pixel is unchanged: one
+// primitive at a time, pixels distinct within it.  Coverage uses the formulas of shade_at, which
+// still makes the exact decision.
+var<workgroup> cov_list: array<u32, 512>;   // two halves, alternating per primitive
+
+@compute @workgroup_size(32)
+fn raster_simd(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
+    let index = wid.x + wid.y * 1024u;
+    if (index >= prm(3u)) {
+        return;
+    }
+    let tile = prm(0u) + index * 2u;
+    let origin = data[tile];
+    let tx0 = i32((origin & 0xFFFFu) * 16u);
+    let ty0 = i32((origin >> 16u) * 16u);
+    let first = data[tile + 1u];
+    let count = data[tile + 3u] - first;
+    let lists = prm(4u);
+    let prims = prm(1u);
+    let setups = prm(2u);
+    snapshot_lo = prm(5u);
+    snapshot_hi = prm(6u);
+    // this lane's pixels: row lane / 2 of the tile, columns (lane & 1) * 8 .. + 7
+    let ly = i32(lane >> 1u);
+    let lx = i32((lane & 1u) * 8u);
+    let y = ty0 + ly;
+    let xs = tx0 + lx;
+    let py = f32(y);
+    var half = 0u;
+    for (var i = 0u; i < count; i = i + 1u) {
+        let h = first + i;
+        let p = prims + ((data[lists + (h >> 1u)] >> ((h & 1u) * 16u)) & 0xFFFFu) * PRIM_WORDS;
+        let lo = data[p + 2u];
+        let hi = data[p + 3u];
+        var mask = 0u;
+        if (y >= i32(lo >> 16u) && y <= i32(hi >> 16u)) {
+            let j0 = max(i32(lo & 0xFFFFu) - xs, 0);
+            let j1 = min(i32(hi & 0xFFFFu) - xs, 7);
+            if (data[p + 1u] == 0u) {
+                let x0 = fat(p + 4u);
+                let y0 = fat(p + 5u);
+                let x1 = fat(p + 6u);
+                let y1 = fat(p + 7u);
+                let x2 = fat(p + 8u);
+                let y2 = fat(p + 9u);
+                let inv = fat(p + 10u);
+                let inclusive = data[p + 27u];
+                for (var j = j0; j <= j1; j = j + 1) {
+                    let px = f32(xs + j);
+                    let w0 = ((x1 - px) * (y2 - py) - (x2 - px) * (y1 - py)) * inv;
+                    let w1 = ((x2 - px) * (y0 - py) - (x0 - px) * (y2 - py)) * inv;
+                    let c2 = ((x0 - px) * (y1 - py) - (x1 - px) * (y0 - py)) * inv;
+                    if (edge_in(w0, inclusive & 1u) && edge_in(w1, inclusive & 2u) && edge_in(c2, inclusive & 4u)) {
+                        mask = mask | (1u << u32(j));
+                    }
+                }
+            } else if (j0 <= j1) {   // sprites, lines and points: the box (shade_at drops the misses of a line)
+                mask = ((2u << u32(j1)) - 1u) & ~((1u << u32(j0)) - 1u);
+            }
+        }
+        let n = countOneBits(mask);
+        let total = subgroupAdd(n);
+        var at = half * 256u + subgroupExclusiveAdd(n);
+        var m = mask;
+        while (m != 0u) {
+            let j = firstTrailingBit(m);
+            cov_list[at] = (u32(ly) << 4u) | u32(lx + i32(j));
+            at = at + 1u;
+            m = m & (m - 1u);
+        }
+        workgroupBarrier();
+        if (total != 0u) {
+            setup_at = setups + data[p] * SETUP_WORDS;
+            let s = load_setup(setup_at);
+            for (var c = lane; c < total; c = c + 32u) {
+                let e = cov_list[half * 256u + c];
+                let x = tx0 + i32(e & 15u);
+                let yy = ty0 + i32(e >> 4u);
+                shade_at(p, s, x, yy, 0u, f32(x), f32(yy));
+            }
+        }
+        half = 1u - half;
     }
 }

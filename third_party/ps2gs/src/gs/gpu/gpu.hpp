@@ -98,6 +98,7 @@ void resize_surface(std::uint32_t width, std::uint32_t height);
 bool has_surface();
 bool present(const DisplaySource &src);
 double busy_ms();
+void upload_report();   // hp
 void stats();
 
 }

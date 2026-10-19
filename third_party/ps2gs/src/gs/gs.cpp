@@ -346,6 +346,29 @@ void load_clut(std::uint64_t tex0) {
 
 std::uint8_t *memory() { return g_memory; }
 
+// hp: the 256-byte block (0..31) of a page that holds its texel (x, y) in format psm, and the
+// texel size of a block (the upload memo in gpu.cpp tracks memory by block)
+std::uint32_t block_index(std::uint32_t psm, std::uint32_t x, std::uint32_t y) {
+    switch (psm) {
+    case PSMCT16: return static_cast<std::uint32_t>(kBlock16[(y / 8) & 7][(x / 16) & 3]);
+    case PSMCT16S: return static_cast<std::uint32_t>(kBlock16S[(y / 8) & 7][(x / 16) & 3]);
+    case PSMZ16: return static_cast<std::uint32_t>(kBlockZ16[(y / 8) & 7][(x / 16) & 3]);
+    case PSMZ16S: return static_cast<std::uint32_t>(kBlockZ16S[(y / 8) & 7][(x / 16) & 3]);
+    case PSMT8: return static_cast<std::uint32_t>(kBlock32[(y / 16) & 3][(x / 16) & 7]);
+    case PSMT4: return static_cast<std::uint32_t>(kBlock16[(y / 16) & 7][(x / 32) & 3]);
+    case PSMZ32: case PSMZ24: return static_cast<std::uint32_t>(kBlockZ32[(y / 8) & 3][(x / 8) & 7]);
+    default: return static_cast<std::uint32_t>(kBlock32[(y / 8) & 3][(x / 8) & 7]);
+    }
+}
+void block_size(std::uint32_t psm, std::uint32_t &bw, std::uint32_t &bh) {
+    switch (psm) {
+    case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: bw = 16; bh = 8; break;
+    case PSMT8: bw = 16; bh = 16; break;
+    case PSMT4: bw = 32; bh = 16; break;
+    default: bw = 8; bh = 8; break;
+    }
+}
+
 void swizzle_tables(std::vector<std::uint32_t> &out) {
     out.clear();
     for (auto &row : g_off32) out.insert(out.end(), std::begin(row), std::end(row));
@@ -356,6 +379,30 @@ void swizzle_tables(std::vector<std::uint32_t> &out) {
     for (auto &row : g_offz16s) out.insert(out.end(), std::begin(row), std::end(row));
     for (auto &row : g_off8) out.insert(out.end(), std::begin(row), std::end(row));
     for (auto &row : g_off4) out.insert(out.end(), std::begin(row), std::end(row));
+    // hp: the inverse tables for the per-word upload (gpu/gs.wgsl upload_words): for every 32-bit
+    // word of a page, the texels it holds as x | y << 8 in page coordinates, lowest bits first
+    const auto inverse = [&out](const auto &table, int rows, int cols, std::uint32_t per_word, auto sub_of) {
+        std::vector<std::uint32_t> inv(2048 * per_word, 0);
+        for (int y = 0; y < rows; ++y)
+            for (int x = 0; x < cols; ++x) {
+                std::uint32_t word = 0, sub = 0;
+                sub_of(table[y][x], word, sub);
+                inv[word * per_word + sub] = static_cast<std::uint32_t>(x) | (static_cast<std::uint32_t>(y) << 8);
+            }
+        out.insert(out.end(), inv.begin(), inv.end());
+    };
+    const auto w32 = [](std::uint32_t off, std::uint32_t &word, std::uint32_t &sub) { word = off / 4; sub = 0; };
+    const auto w16 = [](std::uint32_t off, std::uint32_t &word, std::uint32_t &sub) { word = off / 4; sub = (off & 2) / 2; };
+    const auto w8 = [](std::uint32_t off, std::uint32_t &word, std::uint32_t &sub) { word = off / 4; sub = off & 3; };
+    const auto w4 = [](std::uint32_t n, std::uint32_t &word, std::uint32_t &sub) { word = n / 8; sub = n & 7; };   // n = byte * 2 + nibble
+    inverse(g_off32, 32, 64, 1, w32);
+    inverse(g_offz32, 32, 64, 1, w32);
+    inverse(g_off16, 64, 64, 2, w16);
+    inverse(g_off16s, 64, 64, 2, w16);
+    inverse(g_offz16, 64, 64, 2, w16);
+    inverse(g_offz16s, 64, 64, 2, w16);
+    inverse(g_off8, 64, 128, 4, w8);
+    inverse(g_off4, 128, 128, 8, w4);
 }
 
 std::uint32_t address32(std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y) {

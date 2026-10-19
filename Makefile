@@ -22,7 +22,7 @@ DEBUGFLAGS ?= -DWATCH
 OPT      ?= -O1
 CHECKS   := -DRA_CHECK -DTRACE_PC $(DEBUGFLAGS)
 endif
-CFLAGS   := $(OPT) -g -fno-strict-aliasing -fwrapv -w -Iruntime -I$(GEN) -I/opt/homebrew/include $(CHECKS)
+CFLAGS   := $(OPT) -g -fno-strict-aliasing -fno-math-errno -fwrapv -w -Iruntime -I$(GEN) -I/opt/homebrew/include $(CHECKS)
 LDFLAGS  := -L/opt/homebrew/lib -lSDL3
 
 RT_SRC   := $(wildcard runtime/*.c)

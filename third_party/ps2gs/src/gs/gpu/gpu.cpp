@@ -30,14 +30,18 @@ extern const char kBlitShader[];
 
 namespace ps2::gs {
 void swizzle_tables(std::vector<std::uint32_t> &out);
+std::uint32_t block_index(std::uint32_t psm, std::uint32_t x, std::uint32_t y);
+void block_size(std::uint32_t psm, std::uint32_t &bw, std::uint32_t &bh);
 }
 
 namespace ps2::gs::gpu {
 
 namespace {
 
-enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kDecode, kPipelines };
-const char *const kEntryPoints[kPipelines] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot", "decode"};
+enum Pipeline { kUpload, kUploadWords, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kDecode, kPipelines };
+const char *const kEntryPoints[kPipelines] = {"upload", "upload_words", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot", "decode"};
+constexpr std::uint32_t kRecWords = 16;   // hp: words per upload / CLUT record (gs.wgsl REC_WORDS)
+bool g_upload_words = false;   // hp: HP_UPLOAD=words uploads 4/8/16-bit images a word at a time (gs.wgsl upload_words); it won in isolation, not in the traces
 
 constexpr std::uint32_t kParamStride = 256;
 constexpr std::uint32_t kClutSlots = 2048;
@@ -45,10 +49,12 @@ constexpr std::uint32_t kClutEntries = 512;
 constexpr std::uint32_t kPrimWords = 28;
 constexpr std::uint32_t kSetupWords = 34;
 constexpr std::uint32_t kMipOn = 0x80000000u;   // hp: setup word 27, per-pixel mipmapping (make_setup)
-constexpr std::uint32_t kDecodedWords = 4u << 20;
+constexpr std::uint32_t kDecodedWords = 8u << 20;   // hp: 32 MB, kept across frames (plan_decodes)
 constexpr std::uint32_t kDecodePrims = 64;
 
 Mode g_mode = Mode::off;
+bool g_simd = false;   // hp: raster_simd (gs.wgsl) instead of the tile kernel
+bool g_subgroups = false;   // hp: the device has subgroup operations
 std::uint64_t g_dispatches[kPipelines] = {}, g_submits = 0;
 
 WGPUInstance g_instance = nullptr;
@@ -74,6 +80,8 @@ std::uint64_t g_measured_ns = 0, g_measured = 0, g_total_passes = 0;
 WGPUDevice g_device = nullptr;
 WGPUQueue g_queue = nullptr;
 WGPUBuffer g_vram = nullptr, g_tables = nullptr, g_params = nullptr, g_data = nullptr, g_clut = nullptr, g_scratch = nullptr, g_readback = nullptr, g_decoded = nullptr;
+WGPUBuffer g_hsr = nullptr;   // hp: per-pixel skip counts of the hidden-surface prepass, and census counters at its end
+constexpr std::uint32_t kHsrWords = (4u << 20) + 64;
 std::uint32_t g_decoded_used = 0;
 bool g_rendered[512] = {};
 bool g_decode = true;
@@ -233,6 +241,7 @@ struct Image {
 } g_image;
 std::uint32_t g_image_ids = 0;
 
+
 struct Range {
     std::uint64_t lo = ~0ull, hi = 0;
     bool overlaps(std::uint64_t a, std::uint64_t b) const { return lo < b && a < hi; }
@@ -241,6 +250,179 @@ struct Range {
         hi = std::max(hi, b);
     }
 };
+
+// hp: the game streams its textures into local memory again every frame, mostly the same bytes
+// to the same place.  Every complete image is remembered by its destination; when the same bytes
+// come again and each 256-byte block they fill was last written by that very upload (nothing
+// drew, copied or uploaded there since), the memory still holds them and the upload is skipped:
+// no copy, no GPU pass, and the pages keep their time, so the textures decoded from them and the
+// CLUTs loaded from them stay valid too (plan_decodes, load_clut).  HP_NOUPLOADSKIP=1 uploads
+// everything.
+struct Memo {
+    std::vector<std::uint8_t> bytes;
+    std::uint32_t id = 0, content = 0;   // content: the same for the same bytes wherever they go
+    std::uint64_t used = 0;
+    std::uint32_t bp = 0, bw = 0, psm = 0, dsax = 0, dsay = 0, rrw = 0, rows = 0;
+};
+std::unordered_map<std::uint64_t, Memo> g_memos;
+std::unordered_map<std::uint32_t, Memo *> g_memo_of_id;   // (the map's nodes do not move)
+std::unordered_map<std::uint64_t, std::uint32_t> g_content_ids;
+std::uint32_t g_next_content = 1;
+// a 64-bit hash of the bytes (wyhash-like folding multiplies: collisions are not a practical concern)
+std::uint64_t strong_hash(const std::uint8_t *p, std::size_t n) {
+    const std::uint64_t k0 = 0xa0761d6478bd642full, k1 = 0xe7037ed1a0b428dbull, k2 = 0x8ebc6af09c88c6e3ull;
+    const auto mix = [](std::uint64_t a, std::uint64_t b) { const unsigned __int128 r = static_cast<unsigned __int128>(a) * b; return static_cast<std::uint64_t>(r) ^ static_cast<std::uint64_t>(r >> 64); };
+    std::uint64_t h = k0 ^ n, a = 0, b = 0;
+    std::size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        std::memcpy(&a, p + i, 8);
+        std::memcpy(&b, p + i + 8, 8);
+        h = mix(h ^ a ^ k1, b ^ k2);
+    }
+    a = b = 0;
+    if (i < n) {
+        std::uint8_t tail[16] = {};
+        std::memcpy(tail, p + i, n - i);
+        std::memcpy(&a, tail, 8);
+        std::memcpy(&b, tail + 8, 8);
+        h = mix(h ^ a ^ k1, b ^ k2);
+    }
+    return mix(h, k0);
+}
+std::uint32_t g_next_memo = 1;
+std::uint64_t g_memo_clock = 0;
+std::size_t g_memo_bytes = 0;
+constexpr std::size_t kMemoBytesMax = 48u << 20;
+std::uint32_t g_block_owner[16384];   // the memo whose upload last wrote the block, 0 = anything else
+bool g_skip_uploads = true;
+std::uint64_t g_hp_up_skipped_calls, g_hp_up_skipped_bytes, g_hp_dec_resets, g_hp_dec_bycontent;
+std::uint64_t g_hp_memo_whole, g_hp_memo_partial, g_hp_cu[6];   // hp: diagnostics (upload_report)
+void page_size(std::uint32_t psm, std::uint32_t &pw, std::uint32_t &ph);
+
+void disown(const Range &r) {   // page-granular: every block of the pages a write touched
+    for (std::uint64_t at = r.lo & ~std::uint64_t(8191); at < r.hi; at += 8192) {
+        const std::uint32_t b0 = static_cast<std::uint32_t>((at >> 8) & 16383u);
+        for (std::uint32_t b = 0; b < 32; ++b) g_block_owner[(b0 + b) & 16383u] = 0;
+    }
+}
+// the blocks an image fills: every cell of the format's block grid its rectangle covers
+template <typename F>
+void image_blocks(const Image &im, F &&f) {
+    std::uint32_t pw, ph, bw, bh;
+    page_size(im.dpsm, pw, ph);
+    ps2::gs::block_size(im.dpsm, bw, bh);
+    const std::uint32_t rows = im.rrw ? im.total / im.rrw : 0;
+    if (!rows) return;
+    const std::uint32_t per_row = std::max<std::uint32_t>(1, im.dbw * 64 / pw);
+    const std::uint32_t x1 = im.dsax + im.rrw - 1, y1 = im.dsay + rows - 1;
+    for (std::uint32_t y = im.dsay / bh * bh; y <= y1; y += bh)
+        for (std::uint32_t x = im.dsax / bw * bw; x <= x1; x += bw) {
+            const std::uint32_t page = im.dbp * 256 + ((x / pw) + (y / ph) * per_row) * 8192;
+            f(((page >> 8) + ps2::gs::block_index(im.dpsm, x % pw, y % ph)) & 16383u);
+        }
+}
+std::uint64_t memo_key(const Image &im) {
+    std::uint64_t h = 0x9E3779B97F4A7C15ull;
+    for (std::uint32_t v : {im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.total}) {
+        h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+        h *= 0xBF58476D1CE4E5B9ull;
+    }
+    return h;
+}
+std::size_t image_bytes(const Image &im) { return (static_cast<std::size_t>(im.total) * im.bpp + 7) / 8; }
+// the whole image is in im.pending; true when the memory already holds exactly these bytes
+bool image_already_there() {
+    Image &im = g_image;
+    if (!g_skip_uploads || im.done != 0 || im.lead_bits != 0) return false;
+    const std::size_t bytes = image_bytes(im);
+    if (im.pending.size() < bytes) return false;
+    static const long long at = std::getenv("HP_UPLOADLOG") ? std::atoll(std::getenv("HP_UPLOADLOG")) : -1;
+    const bool log = at >= 0 && frame_count() >= static_cast<std::uint64_t>(at) && frame_count() < static_cast<std::uint64_t>(at) + 2;
+    auto it = g_memos.find(memo_key(im));
+    if (it == g_memos.end()) { if (log) std::fprintf(stderr, "[skip?] bp %04x psm %02x %ux%u: no memo\n", im.dbp, im.dpsm, im.rrw, im.total / im.rrw); return false; }
+    Memo &m = it->second;
+    bool same = m.bytes.size() == bytes && std::memcmp(m.bytes.data(), im.pending.data(), bytes) == 0;
+    if (!same) { if (log) std::fprintf(stderr, "[skip?] bp %04x psm %02x %ux%u: bytes differ\n", im.dbp, im.dpsm, im.rrw, im.total / im.rrw); return false; }
+    std::uint32_t other = 0, nblocks = 0, bad = 0;
+    image_blocks(im, [&](std::uint32_t b) { ++nblocks; if (g_block_owner[b] != m.id) { ++bad; other = g_block_owner[b]; } });
+    if (bad) {
+        if (log) std::fprintf(stderr, "[skip?] bp %04x psm %02x %ux%u: %u of %u blocks owned by %u (memo %u)\n", im.dbp, im.dpsm, im.rrw, im.total / im.rrw, bad, nblocks, other, m.id);
+        return false;
+    }
+    if (log) std::fprintf(stderr, "[skip!] bp %04x psm %02x %ux%u\n", im.dbp, im.dpsm, im.rrw, im.total / im.rrw);
+    m.used = ++g_memo_clock;
+    ++g_hp_up_skipped_calls;
+    g_hp_up_skipped_bytes += bytes;
+    return true;
+}
+void remember_image() {   // the whole image was just queued from im.pending
+    Image &im = g_image;
+    if (!g_skip_uploads) return;
+    const std::size_t bytes = image_bytes(im);
+    Memo &m = g_memos[memo_key(im)];
+    if (!m.id) {
+        m.id = g_next_memo++;
+        if (!m.id) m.id = g_next_memo++;
+        g_memo_of_id[m.id] = &m;
+    }
+    // the same bytes as last time at this place keep their content id; new ones are hashed
+    const bool same = m.bytes.size() == bytes && std::memcmp(m.bytes.data(), im.pending.data(), bytes) == 0;
+    if (!same) {
+        g_memo_bytes -= m.bytes.size();
+        m.bytes.assign(im.pending.begin(), im.pending.begin() + static_cast<std::ptrdiff_t>(bytes));
+        g_memo_bytes += bytes;
+        const std::uint64_t h = strong_hash(m.bytes.data(), bytes);
+        auto it = g_content_ids.find(h);
+        if (it == g_content_ids.end()) it = g_content_ids.emplace(h, g_next_content++).first;
+        m.content = it->second;
+    }
+    m.bp = im.dbp; m.bw = im.dbw; m.psm = im.dpsm; m.dsax = im.dsax; m.dsay = im.dsay; m.rrw = im.rrw; m.rows = im.rrw ? im.total / im.rrw : 0;
+    m.used = ++g_memo_clock;
+    image_blocks(im, [&](std::uint32_t b) { g_block_owner[b] = m.id; });
+    while (g_memo_bytes > kMemoBytesMax && g_memos.size() > 1) {   // the least recently used go
+        auto victim = g_memos.begin();
+        for (auto jt = g_memos.begin(); jt != g_memos.end(); ++jt)
+            if (jt->second.used < victim->second.used) victim = jt;
+        g_memo_bytes -= victim->second.bytes.size();
+        g_memo_of_id.erase(victim->second.id);
+        g_memos.erase(victim);
+    }
+    if (g_content_ids.size() > 65536) g_content_ids.clear();   // ids only need to be distinct while in use; a stale map just makes new ones
+}
+// hp: the content id of the upload whose image lies exactly under level l of texture setup w
+// (every block of the level last written by that upload, placed so texel (x, y) is the image's
+// texel (x, y)), or 0 when the level's memory is not one known image
+std::uint64_t content_under_image(const Image &im, std::uint32_t tag) {
+    std::uint32_t id = 0;
+    bool one = true;
+    image_blocks(im, [&](std::uint32_t b) {
+        const std::uint32_t o = g_block_owner[b];
+        if (!o || (id && o != id)) one = false;
+        id = o;
+    });
+    if (!one || !id) { ++g_hp_cu[id ? 1 : 0]; return 0; }
+    const auto it = g_memo_of_id.find(id);
+    if (it == g_memo_of_id.end()) { ++g_hp_cu[2]; return 0; }
+    const Memo &m = *it->second;
+    // every block the level reads was written by this one upload, so its texels are a function
+    // of the upload's bytes and layout (width, format, origin) and of where the level starts in it
+    // (the game uploads 8-bit textures as 32-bit images and samples them as PSMT8: same bytes,
+    // other format)
+    ++g_hp_cu[5];
+    const std::uint32_t parts[12] = {m.content, m.bw, m.psm, m.rrw, m.rows, m.dsax, m.dsay, im.dbp - m.bp, im.dbw, im.dpsm, im.dsax | (im.dsay << 16), tag};
+    return strong_hash(reinterpret_cast<const std::uint8_t *>(parts), sizeof parts) | 1ull;
+}
+std::uint64_t content_under(const std::uint32_t *w, std::uint32_t l) {   // level l of texture setup w
+    const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+    Image im{};
+    im.dbp = l ? w[27 + l] & 0x3FFFu : w[12];
+    im.dbw = l ? (w[27 + l] >> 14) & 0x3Fu : w[13];
+    im.dpsm = w[14];
+    im.rrw = 1u << (tw > l ? tw - l : 0u);
+    im.total = im.rrw << (th > l ? th - l : 0u);
+    return content_under_image(im, l);
+}
+std::unordered_map<std::uint64_t, std::uint32_t> g_palette_ids;   // hp: palette identity (its bytes and layout) -> id
 
 struct Batch {
     std::vector<std::uint32_t> prims;
@@ -299,7 +481,7 @@ struct SetupCache {
 
 struct PreOp {
     bool clut = false;
-    std::uint32_t rec[12] = {};
+    std::uint32_t rec[16] = {};
     Range range;
     std::uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0, image = 0;
 };
@@ -612,6 +794,7 @@ void mark_rendered(const Range &r) {
     for (std::uint64_t at = r.lo; at < r.hi; at += 8192) g_rendered[(at >> 13) & 511u] = true;
     if (g_watch.overlaps(r.lo, r.hi)) g_watch_dirty = true;
     mark_written(r);
+    disown(r);
 }
 
 bool rendered(const Range &r) {
@@ -642,6 +825,15 @@ struct DecodeEntry {
     std::uint32_t from;     // levels below this one have no place (offset is level 0's virtual base)
 };
 std::vector<DecodeEntry> g_decode_cache;
+std::unordered_multimap<std::uint64_t, std::uint32_t> g_decode_index;   // hp: key hash -> entry (the cache lives across frames now)
+std::uint64_t decode_hash(const std::uint32_t *key) {
+    std::uint64_t h = 0x9E3779B97F4A7C15ull;
+    for (int k = 0; k < 16; ++k) {
+        h ^= key[k] + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+        h *= 0xBF58476D1CE4E5B9ull;
+    }
+    return h;
+}
 
 // hp: what each CLUT slot holds, as an id shared by loads that write the same entries (same
 // parameters, source pages not written in between).  A T8 texture's colours are the 256 loaded
@@ -694,6 +886,15 @@ void plan_decodes(std::uint32_t prims) {
     Batch &b = g_batch;
     g_decodes.clear();
     if (!g_decode) return;
+    // hp: the decode buffer and its cache live across submits (frames); when the buffer is nearly
+    // full everything starts over (the dispatches of this submit run in order, so the regions of
+    // earlier batches are read before they are overwritten)
+    if (kDecodedWords - g_decoded_used < (1u << 20)) {
+        g_decoded_used = 0;
+        g_decode_cache.clear();
+        g_decode_index.clear();
+        ++g_hp_dec_resets;
+    }
     // a small batch does not pay for decoding a whole texture, but takes one decoded earlier
     const bool small = prims <= kDecodePrims;
     const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
@@ -755,11 +956,45 @@ void plan_decodes(std::uint32_t prims) {
         for (int k = 0; k < 15; ++k) key[k] = w[kKey[k]];
         key[7] = palette_key(w);   // kKey[7] is the CLUT slot
         key[15] = w[0] & 32768u;
+        // hp: when every level the batch reaches lies under a remembered upload, the key names
+        // the uploads' content instead of their place: the decoded texture then survives the game
+        // streaming other textures through the same memory, and is found again whenever the same
+        // bytes are uploaded anywhere.  Such entries need no page-time check (content never
+        // changes; the ids are new for new bytes).
+        bool by_content = key[7] != 0 && !nocache && !g_memos.empty();
+        if (by_content) {
+            std::uint64_t ids[7] = {};
+            for (std::uint32_t l = 0; l < nlev && l < 7 && by_content; ++l) {
+                if (!((g.used >> l) & 1u)) continue;
+                ids[l] = content_under(w, l);
+                if (!ids[l]) by_content = false;
+            }
+            if (by_content) {
+                std::uint32_t ckey[16] = {};
+                const std::uint64_t h = strong_hash(reinterpret_cast<const std::uint8_t *>(ids), sizeof ids);
+                ckey[0] = static_cast<std::uint32_t>(h);
+                ckey[1] = static_cast<std::uint32_t>(h >> 32);
+                ckey[7] = key[7];
+                ckey[8] = w[14];
+                ckey[9] = w[15];
+                ckey[10] = w[16];
+                ckey[11] = w[17];
+                ckey[12] = w[20];
+                ckey[13] = w[27];
+                ckey[14] = g.used;
+                ckey[15] = (w[0] & 32768u) | 0x80000000u;
+                std::memcpy(key, ckey, sizeof key);
+                ++g_hp_dec_bycontent;
+            }
+        }
         DecodeEntry *hit = nullptr;
-        if (key[7] && !nocache)
-            for (DecodeEntry &e : g_decode_cache)
-                if (std::memcmp(e.key, key, sizeof key) == 0) { hit = &e; break; }
-        if (hit && decode_current(*hit, w, hit->levels) && from >= hit->from) {
+        const std::uint64_t kh = decode_hash(key);
+        if (key[7] && !nocache) {
+            const auto [first, last] = g_decode_index.equal_range(kh);
+            for (auto it = first; it != last && !hit; ++it)
+                if (std::memcmp(g_decode_cache[it->second].key, key, sizeof key) == 0) hit = &g_decode_cache[it->second];
+        }
+        if (hit && (by_content || decode_current(*hit, w, hit->levels)) && from >= hit->from) {
             const std::uint32_t missing = g.used & ~hit->levels;
             if (missing) {   // this batch reaches levels an earlier one did not: decode them into their places
                 if (small) { ++g_hp_dec[0]; continue; }
@@ -784,7 +1019,10 @@ void plan_decodes(std::uint32_t prims) {
         decode_levels(base, g.used);
         if (key[7]) {
             if (hit) *hit = DecodeEntry{{}, base, words, g_vram_time, g.used, from};
-            else g_decode_cache.push_back(DecodeEntry{{}, base, words, g_vram_time, g.used, from});
+            else {
+                g_decode_cache.push_back(DecodeEntry{{}, base, words, g_vram_time, g.used, from});
+                g_decode_index.emplace(kh, static_cast<std::uint32_t>(g_decode_cache.size() - 1));
+            }
             std::memcpy((hit ? hit : &g_decode_cache.back())->key, key, sizeof key);
         }
         g_decoded_used += words;
@@ -941,7 +1179,8 @@ void emit_pre() {
     while (i < g_pre.size()) {
         const bool clut = g_pre[i].clut;
         std::size_t j = i + 1;
-        while (j < g_pre.size() && g_pre[j].clut == clut) {
+        const bool words = !clut && g_pre[i].rec[15] != 0;
+        while (j < g_pre.size() && g_pre[j].clut == clut && (clut || (g_pre[j].rec[15] != 0) == words)) {
             bool overlap = false;
             if (!clut)
                 for (std::size_t k = i; k < j && !overlap; ++k) overlap = uploads_overlap(g_pre[k], g_pre[j]);
@@ -949,18 +1188,18 @@ void emit_pre() {
             ++j;
         }
         const std::uint32_t count = static_cast<std::uint32_t>(j - i);
-        std::uint32_t *records = g_arena.grow(count * 12u);
+        std::uint32_t *records = g_arena.grow(count * kRecWords);
         const std::uint32_t offset = static_cast<std::uint32_t>(records - g_arena.data());
         std::uint32_t total = 0;
         for (std::size_t k = i; k < j; ++k) {
-            std::memcpy(records + (k - i) * 12, g_pre[k].rec, sizeof g_pre[k].rec);
+            std::memcpy(records + (k - i) * kRecWords, g_pre[k].rec, sizeof g_pre[k].rec);
             if (!clut) {
-                records[(k - i) * 12 + 11] = total;
-                total += g_pre[k].rec[7];
+                records[(k - i) * kRecWords + 11] = total;
+                total += words ? g_pre[k].rec[15] : g_pre[k].rec[7];   // lanes: words of the page grid, or texels
             }
         }
         if (clut) g_commands.push_back({kLoadClut, 1, 1, push_params({offset, count})});
-        else dispatch_linear(kUpload, total, push_params({offset, count, total}));
+        else dispatch_linear(words ? kUploadWords : kUpload, total, push_params({offset, count, total}));
         i = j;
     }
     g_pre.clear();
@@ -978,6 +1217,7 @@ void queue_pre(const PreOp &op) {
     g_pre.push_back(op);
 }
 
+std::uint64_t g_hp_up_calls, g_hp_up_bytes, g_hp_up_hit_calls, g_hp_up_hit_bytes, g_hp_up_fmt[64];
 std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uint32_t lead_bits) {
     Image &im = g_image;
     const std::uint64_t bits = static_cast<std::uint64_t>(size) * 8;
@@ -990,13 +1230,35 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     std::uint32_t offset = 0, source = 0;
     if (n >= kCacheMinBytes) {
         const std::uint64_t key = content_key(bytes, n);
+        {   // hp: HP_UPLOADLOG: the chunk's content key, to see whether frames re-send the same data
+            static const long long at = std::getenv("HP_UPLOADLOG") ? std::atoll(std::getenv("HP_UPLOADLOG")) : -1;
+            if (at >= 0 && frame_count() >= static_cast<std::uint64_t>(at) && frame_count() < static_cast<std::uint64_t>(at) + 2)
+                std::fprintf(stderr, "[upload f%llu]   chunk %u texels at %u, %zu bytes, key %016llx, seen %u\n", (unsigned long long)frame_count(), pixels, im.done, n,
+                             (unsigned long long)key, g_cache_seen.count(key) ? g_cache_seen[key] : 0u);
+        }
         if (cache_find(key, bytes, n, offset) || (++g_cache_seen[key] >= 2 && cache_insert(key, bytes, n, offset))) source = 0x80000000u;
         if (g_cache_seen.size() > 65536) g_cache_seen.clear();
     }
     if (!source) offset = arena_append(bytes, n);
+    g_hp_up_calls++; g_hp_up_bytes += n; if (source) { g_hp_up_hit_calls++; g_hp_up_hit_bytes += n; }
+    g_hp_up_fmt[im.dpsm & 63] += n;
     const std::uint32_t rec[11] = {im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, offset, lead_bits, im.bpp | source};
     std::memcpy(op.rec, rec, sizeof rec);
     const std::uint32_t first = im.done / im.rrw, last = (im.done + pixels - 1) / im.rrw;
+    {   // hp: upload_words: the page grid the chunk's rows cover (words 12-14) and its lane count (15)
+        std::uint32_t pw, ph;
+        page_size(im.dpsm, pw, ph);
+        const std::uint32_t x0 = im.dsax, x1 = im.dsax + im.rrw - 1, y0 = im.dsay + first, y1 = im.dsay + last;
+        const std::uint32_t px0 = x0 / pw, px1 = x1 / pw, py0 = y0 / ph, py1 = y1 / ph;
+        const std::uint32_t npx = px1 - px0 + 1, cells = npx * (py1 - py0 + 1);
+        op.rec[12] = px0 | (py0 << 16);
+        op.rec[13] = npx;
+        op.rec[14] = y0 | (y1 << 16);
+        // the word kernel pays off for 4/8/16-bit formats (several texels a word) of some size;
+        // 32-bit images and small ones keep the texel kernel (rec[15] = 0)
+        const bool words = g_upload_words && im.bpp <= 16 && pixels >= 2048;
+        op.rec[15] = words ? cells * 2048 : 0;
+    }
     op.range = region(im.dbp, im.dbw, im.dpsm, static_cast<int>(im.dsax), static_cast<int>(im.dsay + first), static_cast<int>(im.dsax + im.rrw - 1),
                       static_cast<int>(im.dsay + last));
     op.x0 = im.dsax;
@@ -1005,6 +1267,12 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     op.y1 = im.dsay + last;
     op.image = im.id;
     queue_pre(op);
+    {   // the blocks this chunk writes belong to nobody until the whole image is remembered
+        Image chunk = im;
+        chunk.dsay = im.dsay + first;
+        chunk.total = im.rrw * (last - first + 1);
+        image_blocks(chunk, [](std::uint32_t b) { g_block_owner[b] = 0; });
+    }
     im.done += pixels;
     return used;
 }
@@ -1027,8 +1295,16 @@ void finish_image_if_done() {
 void flush_image() {
     Image &im = g_image;
     if (!im.active || im.pending.empty()) return;
+    if (image_already_there()) {   // hp: the memory holds these bytes already
+        im.done = im.total;
+        im.pending.clear();
+        finish_image_if_done();
+        return;
+    }
+    const bool whole = im.done == 0 && im.lead_bits == 0 && static_cast<std::uint64_t>(im.pending.size()) * 8 >= static_cast<std::uint64_t>(im.total) * im.bpp;
     const std::uint64_t used = queue_upload(im.pending.data(), im.pending.size(), im.lead_bits);
     if (!used) return;
+    if (whole && im.done >= im.total) { remember_image(); ++g_hp_memo_whole; } else ++g_hp_memo_partial;
     im.pending.erase(im.pending.begin(), im.pending.begin() + static_cast<std::ptrdiff_t>(used / 8));
     im.lead_bits = static_cast<std::uint32_t>(used % 8);
     finish_image_if_done();
@@ -1071,7 +1347,7 @@ WGPUComputePipeline make_pipeline(int entry, const VariantKey *variant) {
     WGPUComputePipelineDescriptor cd = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
     cd.layout = g_pipeline_layout;
     cd.compute.module = g_module;
-    cd.compute.entryPoint = view(kEntryPoints[entry]);
+    cd.compute.entryPoint = view(entry == kRaster && g_simd ? "raster_simd" : kEntryPoints[entry]);
     WGPUConstantEntry constants[11];
     for (WGPUConstantEntry &c : constants) c = WGPU_CONSTANT_ENTRY_INIT;
     constants[0].key = view("SCALE");
@@ -1103,9 +1379,9 @@ WGPUComputePipeline make_pipeline(int entry, const VariantKey *variant) {
 
 void rebuild_group() {
     if (g_group) wgpuBindGroupRelease(g_group);
-    WGPUBindGroupEntry e[8] = {};
-    WGPUBuffer buffers[8] = {g_vram, g_tables, g_params, g_data, g_clut, g_scratch, g_cache, g_decoded};
-    for (int i = 0; i < 8; ++i) {
+    WGPUBindGroupEntry e[9] = {};
+    WGPUBuffer buffers[9] = {g_vram, g_tables, g_params, g_data, g_clut, g_scratch, g_cache, g_decoded, g_hsr};
+    for (int i = 0; i < 9; ++i) {
         e[i] = WGPU_BIND_GROUP_ENTRY_INIT;
         e[i].binding = static_cast<std::uint32_t>(i);
         e[i].buffer = buffers[i];
@@ -1113,7 +1389,7 @@ void rebuild_group() {
     }
     WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     d.layout = g_layout;
-    d.entryCount = 8;
+    d.entryCount = 9;
     d.entries = e;
     g_group = wgpuDeviceCreateBindGroup(g_device, &d);
 }
@@ -1201,8 +1477,6 @@ void profile_submit() {
     ++g_serial;
     g_param_records.clear();
     g_arena.clear();
-    g_decoded_used = 0;
-    g_decode_cache.clear();
     g_clut_loads = 0;
 }
 
@@ -1301,8 +1575,6 @@ void submit(WGPUTextureView present_view = nullptr) {
     ++g_serial;
     g_param_records.clear();
     g_arena.clear();
-    g_decoded_used = 0;
-    g_decode_cache.clear();
     g_clut_loads = 0;
 }
 
@@ -1706,7 +1978,7 @@ bool init(Mode m) {
     // hp: left undefined, wgpu-native falls back to its downlevel limits on iOS (4 storage buffers
     // per stage; the GS binds 7), so ask for the WebGPU defaults where the adapter has them.
     auto want = [](std::uint32_t &field, std::uint32_t have, std::uint32_t standard) { field = have < standard ? have : standard; };
-    want(limits.maxStorageBuffersPerShaderStage, supported.maxStorageBuffersPerShaderStage, 8);
+    want(limits.maxStorageBuffersPerShaderStage, supported.maxStorageBuffersPerShaderStage, 9);   // hp: + the hsr buffer
     want(limits.maxStorageTexturesPerShaderStage, supported.maxStorageTexturesPerShaderStage, 4);
     want(limits.maxUniformBuffersPerShaderStage, supported.maxUniformBuffersPerShaderStage, 12);
     want(limits.maxSampledTexturesPerShaderStage, supported.maxSampledTexturesPerShaderStage, 16);
@@ -1723,12 +1995,24 @@ bool init(Mode m) {
     want(limits.maxComputeWorkgroupsPerDimension, supported.maxComputeWorkgroupsPerDimension, 65535);
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
     dd.requiredLimits = &limits;
-    const WGPUFeatureName timestamp_feature = WGPUFeatureName_TimestampQuery;
+    WGPUFeatureName features[2];
+    std::uint32_t nfeat = 0;
     g_timestamps = wgpuAdapterHasFeature(adapter, WGPUFeatureName_TimestampQuery);
-    if (g_timestamps) {
-        dd.requiredFeatureCount = 1;
-        dd.requiredFeatures = &timestamp_feature;
+    if (g_timestamps) features[nfeat++] = WGPUFeatureName_TimestampQuery;
+    // hp: the SIMD raster kernel (gs.wgsl raster_simd) needs subgroup operations; HP_RASTER=tile
+    // keeps the kernel with a lane per pixel
+    {
+        const char *rk = std::getenv("HP_RASTER");
+        g_subgroups = wgpuAdapterHasFeature(adapter, static_cast<WGPUFeatureName>(WGPUNativeFeature_Subgroup));
+        g_simd = (!rk || std::string(rk) != "tile") && g_subgroups;
+        if (g_subgroups) features[nfeat++] = static_cast<WGPUFeatureName>(WGPUNativeFeature_Subgroup);
+        std::fprintf(stderr, "[gpu] raster kernel: %s\n", g_simd ? "simd (a subgroup per tile)" : "tile (a lane per pixel)");
+        const char *up = std::getenv("HP_UPLOAD");
+        g_upload_words = up && std::string(up) == "words";
+        g_skip_uploads = !std::getenv("HP_NOUPLOADSKIP");
     }
+    dd.requiredFeatureCount = nfeat;
+    dd.requiredFeatures = features;
     dd.uncapturedErrorCallbackInfo.callback = on_error;
     bool device_done = false;
     WGPURequestDeviceCallbackInfo dcb = WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
@@ -1756,6 +2040,7 @@ bool init(Mode m) {
         }
     }
     if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 3u);
+    if (g_scale > 1) g_upload_words = false;   // the texel kernel writes every sample copy
     g_copy_words = (1u << 20) * g_scale * g_scale;
     g_tiles_per_row = (2048 * static_cast<int>(g_scale) + 15) / 16;
     g_tile_count.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row, 0);
@@ -1770,6 +2055,7 @@ bool init(Mode m) {
     g_scratch = make_buffer((static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
     g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
     g_decoded = make_buffer(static_cast<std::uint64_t>(kDecodedWords) * 4, WGPUBufferUsage_Storage);
+    g_hsr = make_buffer(static_cast<std::uint64_t>(kHsrWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
     g_cache_copy.assign(kCacheWords, 0);
     g_readback = make_buffer(static_cast<std::uint64_t>(g_copy_words) * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
@@ -1782,11 +2068,11 @@ bool init(Mode m) {
         g_query_read = make_buffer(16, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     }
 
-    WGPUBindGroupLayoutEntry le[8] = {};
-    const WGPUBufferBindingType types[8] = {WGPUBufferBindingType_Storage, WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Uniform,
+    WGPUBindGroupLayoutEntry le[9] = {};
+    const WGPUBufferBindingType types[9] = {WGPUBufferBindingType_Storage, WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Uniform,
                                             WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Storage, WGPUBufferBindingType_Storage,
-                                            WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Storage};
-    for (int i = 0; i < 8; ++i) {
+                                            WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Storage, WGPUBufferBindingType_Storage};
+    for (int i = 0; i < 9; ++i) {
         le[i] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
         le[i].binding = static_cast<std::uint32_t>(i);
         le[i].visibility = WGPUShaderStage_Compute;
@@ -1795,7 +2081,7 @@ bool init(Mode m) {
         le[i].buffer.minBindingSize = i == 2 ? kParamStride : 0;
     }
     WGPUBindGroupLayoutDescriptor ld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
-    ld.entryCount = 8;
+    ld.entryCount = 9;
     ld.entries = le;
     g_layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
     WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
@@ -1804,7 +2090,13 @@ bool init(Mode m) {
     g_pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
 
     WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
-    source.code = view(kGsShader);
+    static std::string shader_src;
+    shader_src = kGsShader;   // (naga 29 takes the subgroup functions without an `enable subgroups;` line)
+    if (!g_subgroups) {   // without subgroup operations the SIMD kernel cannot be compiled: cut it off
+        const auto at = shader_src.find("// hp: raster_simd");
+        if (at != std::string::npos) shader_src.resize(at);
+    }
+    source.code = view(shader_src.c_str());
     WGPUShaderModuleDescriptor md = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
     md.nextInChain = &source.chain;
     WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_device, &md);
@@ -1819,6 +2111,25 @@ bool init(Mode m) {
     ensure_capacity();
     g_mode = m;
     return true;
+}
+
+void upload_report() {   // hp: the uploads so far and how many were content-cache hits (gsreplay)
+    if (std::getenv("HP_EXP") && (std::atoi(std::getenv("HP_EXP")) & 8192)) {   // the census of gs.wgsl EXP 8192 (two words at the top of local memory)
+        std::uint32_t c[2] = {0, 0};
+        { if (!g_batch.prims.empty()) hp_flush_note(__LINE__); flush_all(); }
+        submit();
+        read_back(g_hsr, 8, c, static_cast<std::uint64_t>(kHsrWords - 64) * 4);
+        std::fprintf(stderr, "[gpu] census: pixel writes %u, of them before the last full replace of the pixel (hidden) %u (%.1f%%)\n", c[0], c[1], c[0] ? 100.0 * c[1] / c[0] : 0.0);
+    }
+    std::fprintf(stderr, "[gpu] uploads: %llu calls %.1f MB, cache hits %llu calls %.1f MB, skipped (already there) %llu images %.1f MB, decode resets %llu; by format:",
+                 (unsigned long long)g_hp_up_calls, g_hp_up_bytes / 1048576.0, (unsigned long long)g_hp_up_hit_calls, g_hp_up_hit_bytes / 1048576.0,
+                 (unsigned long long)g_hp_up_skipped_calls, g_hp_up_skipped_bytes / 1048576.0, (unsigned long long)g_hp_dec_resets);
+    std::fprintf(stderr, " decoded %llu reused %llu skipped-small %llu; decode groups by content %llu; images whole %llu partial %llu; content_under: unowned %llu mixed %llu nomemo %llu place %llu geom %llu ok %llu;",
+                 (unsigned long long)g_hp_dec[4], (unsigned long long)g_hp_dec[6], (unsigned long long)g_hp_dec[0],
+                 (unsigned long long)g_hp_dec_bycontent, (unsigned long long)g_hp_memo_whole, (unsigned long long)g_hp_memo_partial, (unsigned long long)g_hp_cu[0],
+                 (unsigned long long)g_hp_cu[1], (unsigned long long)g_hp_cu[2], (unsigned long long)g_hp_cu[3], (unsigned long long)g_hp_cu[4], (unsigned long long)g_hp_cu[5]);
+    for (int f = 0; f < 64; ++f) if (g_hp_up_fmt[f]) std::fprintf(stderr, " %02x:%.1fMB", f, g_hp_up_fmt[f] / 1048576.0);
+    std::fprintf(stderr, "\n");
 }
 
 void draw(const State &st, const Vertex *v, int count) {
@@ -2066,6 +2377,12 @@ void image_begin(const State &s) {
     im.bpp = bits_per_pixel(im.dpsm);
     im.id = ++g_image_ids ? g_image_ids : ++g_image_ids;
     im.active = im.total != 0;
+    {   // hp: HP_UPLOADLOG=frame: every host->local transfer of that frame and the next
+        static const long long at = std::getenv("HP_UPLOADLOG") ? std::atoll(std::getenv("HP_UPLOADLOG")) : -1;
+        if (at >= 0 && frame_count() >= static_cast<std::uint64_t>(at) && frame_count() < static_cast<std::uint64_t>(at) + 2)
+            std::fprintf(stderr, "[upload f%llu] bp %04x bw %u psm %02x at %u,%u size %ux%u (%u bytes)\n", (unsigned long long)frame_count(), im.dbp, im.dbw, im.dpsm,
+                         im.dsax, im.dsay, im.rrw, im.rrw ? im.total / im.rrw : 0u, im.total * im.bpp / 8);
+    }
 }
 
 void image_data(const std::uint8_t *data, std::size_t bytes) {
@@ -2073,15 +2390,10 @@ void image_data(const std::uint8_t *data, std::size_t bytes) {
     ++g_hp_image_calls;
     g_hp_image_bytes += bytes;
     if (!im.active) return;
-    if (im.pending.empty() && !im.lead_bits) {
-        const std::uint64_t used = queue_upload(data, bytes, 0);
-        const std::size_t whole = static_cast<std::size_t>(used / 8);
-        if (im.done < im.total && whole < bytes) im.pending.assign(data + whole, data + bytes);
-        im.lead_bits = static_cast<std::uint32_t>(used % 8);
-        finish_image_if_done();
-        return;
-    }
+    // hp: the data waits until the image is complete (or something else needs it queued,
+    // flush_image), so a repeat of a whole image can be recognised and skipped
     im.pending.insert(im.pending.end(), data, data + bytes);
+    if (static_cast<std::uint64_t>(im.pending.size()) * 8 >= static_cast<std::uint64_t>(im.total - im.done) * im.bpp + im.lead_bits) flush_image();
 }
 
 void local_copy(const State &s) {
@@ -2127,7 +2439,33 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     static std::uint64_t last_time = 0;
     static bool have_last = false;
     static const bool noskip = std::getenv("HP_NOCLUTSKIP") != nullptr;
-    if (!noskip && have_last && std::memcmp(last, rec + 2, sizeof last) == 0) {
+    // hp: when the palette lies under a remembered upload, its id follows its bytes (the game
+    // streams other textures through the palette's memory every frame, which made the time-based
+    // id below new each frame, and with it every decode key); a slot that already holds it is kept
+    std::uint32_t content_id = 0;
+    if (!noskip && g_skip_uploads) {
+        const bool eight = rec[6] != 0;
+        Image src{};
+        src.dbp = cbp;
+        src.dbw = csm ? cbw : 1;
+        src.dpsm = cpsm;
+        src.dsax = csm ? cou * 16 : 0;
+        src.dsay = csm ? cov : 0;
+        src.rrw = csm ? (eight ? 256u : 16u) : (eight ? 16u : 8u);
+        src.total = src.rrw * (csm ? 1u : (eight ? 16u : 2u));
+        const std::uint64_t ident = content_under_image(src, 0x50414Cu);
+        if (ident) {
+            auto it = g_palette_ids.find(ident);
+            if (it == g_palette_ids.end()) it = g_palette_ids.emplace(ident, g_next_palette++).first;
+            content_id = it->second;
+            if (g_palette_ids.size() > 65536) g_palette_ids.clear();
+            if (g_slot_info.size() > g_clut_slot) {
+                const SlotInfo &si = g_slot_info[g_clut_slot];
+                if (si.id == content_id && si.csa == rec[5] && si.csm == rec[4] && si.eight == eight) { ++g_hp_dec[7]; return; }
+            }
+        }
+    }
+    if (!noskip && !content_id && have_last && std::memcmp(last, rec + 2, sizeof last) == 0) {
         bool clean = true;
         for (std::uint64_t at = op.range.lo & ~std::uint64_t(8191); at < op.range.hi && clean; at += 8192) clean = g_page_time[(at >> 13) & 511u] <= last_time;
         if (clean) {
@@ -2140,8 +2478,8 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     last_time = g_vram_time;
     have_last = true;
     {   // the palette id of what this load leaves in the slot
-        std::uint32_t id = 0;
-        for (ClutLoad &l : g_clut_recent) {
+        std::uint32_t id = content_id;
+        if (!id) for (ClutLoad &l : g_clut_recent) {
             if (std::memcmp(l.params, rec + 2, sizeof l.params)) continue;
             bool clean = true;
             for (std::uint64_t at = op.range.lo & ~std::uint64_t(8191); at < op.range.hi && clean; at += 8192) clean = g_page_time[(at >> 13) & 511u] <= l.time;

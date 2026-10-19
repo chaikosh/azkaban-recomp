@@ -407,9 +407,10 @@ void hw_vblank(int start) {
                     static double lg; static unsigned long long ls;
                     const double gb = g_gs_gpu ? gsb_gpu_busy_ms() : 0;
                     const unsigned long long sh = g_gs_gpu ? gsb_shows() : 0;
-                    LOG("[fps] EE idle in frame wait %.0f%%, GS passes on the GPU %.0f%% (%.0f frame requests/s); ", 100.0 * (g_idle_ns - li) / 1e9 / wall,
-                        (gb - lg) / 10.0 / wall, (sh - ls) / wall);
-                    li = g_idle_ns; lg = gb; ls = sh;
+                    extern unsigned long long g_render_wait_ns; static unsigned long long lrw;
+                    LOG("[fps] EE idle in frame wait %.0f%%, blocked on the render thread %.0f%%, GS passes on the GPU %.0f%% (%.0f frame requests/s); ",
+                        100.0 * (g_idle_ns - li) / 1e9 / wall, 100.0 * (g_render_wait_ns - lrw) / 1e9 / wall, (gb - lg) / 10.0 / wall, (sh - ls) / wall);
+                    li = g_idle_ns; lg = gb; ls = sh; lrw = g_render_wait_ns;
                     hp_thread_report(wall);
                 }
                 memset(g_pace, 0, sizeof g_pace);

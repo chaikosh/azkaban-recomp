@@ -270,9 +270,18 @@ int render_idle(void) {
     return idle;
 }
 
+/* How long the EE thread spent waiting for the render thread here (the kernel baton is held
+   meanwhile: no other guest thread or alarm handler runs), reported in the [fps] line. */
+unsigned long long g_render_wait_ns;
 void render_wait_idle(void) {
     pthread_mutex_lock(&rq_m);
-    while (rq_head != rq_tail || r_busy) pthread_cond_wait(&rq_cv, &rq_m);
+    if (rq_head != rq_tail || r_busy) {
+        struct timespec a, b;
+        clock_gettime(CLOCK_UPTIME_RAW, &a);
+        while (rq_head != rq_tail || r_busy) pthread_cond_wait(&rq_cv, &rq_m);
+        clock_gettime(CLOCK_UPTIME_RAW, &b);
+        g_render_wait_ns += (uint64_t)(b.tv_sec - a.tv_sec) * 1000000000ull + (uint64_t)(b.tv_nsec - a.tv_nsec);
+    }
     pthread_mutex_unlock(&rq_m);
 }
 
